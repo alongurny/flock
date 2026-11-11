@@ -336,7 +336,7 @@ pub fn types() -> Vec<Type> {
         Type {
             alias: "directory",
             head: None,
-            list: Some((rec(vec![key(false, 3)], vec![], vec![], true), Order::Sorted)),
+            list: Some((rec(vec![key(false, 4)], vec![], vec![], true), Order::Sorted)),
             nonempty: false,
             text: None,
         },
