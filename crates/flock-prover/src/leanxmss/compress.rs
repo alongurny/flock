@@ -50,9 +50,14 @@ pub const STEP_LO: usize = 61;
 pub const STEP_HI: usize = 62;
 
 /// The control word: BLAKE3 `flags` in bits 0..32, the block length in bits
-/// 32..64 (the counter is always zero).
+/// 32..64, the counter zero.
 pub fn ctl(flags: u32, block_len: u32) -> F128 {
-    F128::new(flags as u64 | (block_len as u64) << 32, 0)
+    ctl_at(flags, block_len, 0)
+}
+
+/// [`ctl`] with BLAKE3's counter (a chunk's index) in bits 64..128.
+pub fn ctl_at(flags: u32, block_len: u32, counter: u64) -> F128 {
+    F128::new(flags as u64 | (block_len as u64) << 32, counter)
 }
 
 /// `m1` with its step advanced: `(s0, s1) ↦ (¬s0, s1 ⊕ s0)`.
@@ -120,7 +125,7 @@ fn compile(pad: usize) -> (BooleanCircuit, Vec<SchemaOperation>) {
             &out,
             cv,
             message,
-            [[zero; 32]; 2],
+            [word(ctl, 2), word(ctl, 3)],
             word(ctl, 1),
             word(ctl, 0),
         );
@@ -171,7 +176,7 @@ fn native(inputs: &[F128], outputs: &mut Vec<F128>) {
     cv[4..].copy_from_slice(&u32s(inputs[1]));
     let m: [u32; 16] = std::array::from_fn(|i| u32s(inputs[M + i / 4])[i % 4]);
     let ctl = inputs[6];
-    let out = flock_hash::blake3_compress(&cv, &m, 0, (ctl.lo >> 32) as u32, ctl.lo as u32);
+    let out = flock_hash::blake3_compress(&cv, &m, ctl.hi, (ctl.lo >> 32) as u32, ctl.lo as u32);
     let word = |w: &[u32]| {
         F128::new(
             w[0] as u64 | (w[1] as u64) << 32,
@@ -300,6 +305,7 @@ impl CompressPacker {
             for (i, w) in r[..6].iter().enumerate() {
                 (args[2 * i], args[2 * i + 1]) = (w.lo, w.hi);
             }
+            args[12] = r[6].hi;
             args[13] = r[6].lo.rotate_left(32);
             args
         });

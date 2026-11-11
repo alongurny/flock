@@ -156,3 +156,15 @@ workspace = true
 [[bench]]
 name = "fs_challenger"
 harness = false
+
+[[bench]]
+name = "cas_runs"
+harness = false
+
+[[bench]]
+name = "cas_typed"
+harness = false
+
+[[bench]]
+name = "cas_commits"
+harness = false

@@ -916,17 +916,17 @@ impl XmssCircuit {
 }
 
 #[cfg(target_arch = "aarch64")]
-type CircuitProof = flock_core::proof::R1csProofCircuitMergedAg;
+pub type CircuitProof = flock_core::proof::R1csProofCircuitMergedAg;
 #[cfg(not(target_arch = "aarch64"))]
-type CircuitProof = flock_core::proof::R1csProofCircuitMerged;
+pub type CircuitProof = flock_core::proof::R1csProofCircuitMerged;
 
 #[cfg(not(target_arch = "aarch64"))]
-use {
+pub(crate) use {
     crate::prover::prove_fast_ligerito_union_circuit as prove_circuit,
     flock_core::verifier::verify_ligerito_union_circuit as verify_circuit,
 };
 #[cfg(target_arch = "aarch64")]
-use {
+pub(crate) use {
     crate::prover::prove_fast_ligerito_union_circuit_ag as prove_circuit,
     flock_core::verifier::verify_ligerito_union_circuit_ag as verify_circuit,
 };
