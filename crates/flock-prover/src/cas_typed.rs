@@ -37,10 +37,10 @@ use crate::{
     r1cs_hashes::blake3::BLAKE3_IV,
 };
 
-const CHUNK_START: u32 = 1;
-const CHUNK_END: u32 = 2;
-const PARENT: u32 = 4;
-const ROOT: u32 = 8;
+pub(crate) const CHUNK_START: u32 = 1;
+pub(crate) const CHUNK_END: u32 = 2;
+pub(crate) const PARENT: u32 = 4;
+pub(crate) const ROOT: u32 = 8;
 
 /// Compressions to hash a blob of `blocks` blocks: its blocks, and a parent
 /// for each chunk after the first.
@@ -105,7 +105,7 @@ pub fn lower(c: &Circuit) -> BooleanCircuit {
 }
 
 /// The compression gate and its packer, built once for each table size.
-fn compression(nu: usize) -> (BooleanGate, Arc<CompressPacker>) {
+pub(crate) fn compression(nu: usize) -> (BooleanGate, Arc<CompressPacker>) {
     static GATES: Mutex<Option<HashMap<usize, (BooleanGate, Arc<CompressPacker>)>>> = Mutex::new(None);
     if let Some(g) = GATES.lock().unwrap().get_or_insert_default().get(&nu) {
         return g.clone();
@@ -145,14 +145,14 @@ fn gate(t: &Type, kind: Kind, nu: usize, native: bool) -> (BooleanGate, usize, u
     (g, inputs, ands)
 }
 
-fn words(block: &[u8]) -> [F128; 4] {
+pub(crate) fn words(block: &[u8]) -> [F128; 4] {
     std::array::from_fn(|i| {
         let w = |o: usize| u64::from_le_bytes(block[16 * i + o..16 * i + o + 8].try_into().unwrap());
         F128::new(w(0), w(8))
     })
 }
 
-fn key_words(key: &[u8; 32]) -> [F128; 2] {
+pub(crate) fn key_words(key: &[u8; 32]) -> [F128; 2] {
     let w = |o: usize| u64::from_le_bytes(key[o..o + 8].try_into().unwrap());
     [F128::new(w(0), w(8)), F128::new(w(16), w(24))]
 }
@@ -182,17 +182,17 @@ pub struct TypedProof {
 
 /// A table's rows must be a multiple of this: this Flock revision fails its
 /// own check on other counts.
-const ROWS: usize = 4;
+pub(crate) const ROWS: usize = 4;
 
 /// The words a circuit fixes, each once.
 #[derive(Default)]
-struct Consts {
-    values: Vec<F128>,
-    index: HashMap<(u64, u64), usize>,
+pub(crate) struct Consts {
+    pub(crate) values: Vec<F128>,
+    pub(crate) index: HashMap<(u64, u64), usize>,
 }
 
 impl Consts {
-    fn add(&mut self, v: F128) {
+    pub(crate) fn add(&mut self, v: F128) {
         let n = self.values.len();
         if let std::collections::hash_map::Entry::Vacant(e) = self.index.entry((v.lo, v.hi)) {
             e.insert(n);
@@ -203,7 +203,7 @@ impl Consts {
 
 /// The control word of block `j` of the `n` blocks of chunk `chunk` of a
 /// blob of `len` bytes.
-fn block_ctl(len: usize, chunk: usize, j: usize, n: usize) -> F128 {
+pub(crate) fn block_ctl(len: usize, chunk: usize, j: usize, n: usize) -> F128 {
     let last = j + 1 == n;
     let end = (64 * (16 * chunk + j + 1)).min(len);
     let bytes = end - 64 * (16 * chunk + j);
@@ -221,7 +221,7 @@ fn block_ctl(len: usize, chunk: usize, j: usize, n: usize) -> F128 {
     ctl_at(flags, bytes as u32, chunk as u64)
 }
 
-fn iv() -> [F128; 2] {
+pub(crate) fn iv() -> [F128; 2] {
     let iv = |i: usize| {
         F128::new(
             BLAKE3_IV[i] as u64 | (BLAKE3_IV[i + 1] as u64) << 32,
