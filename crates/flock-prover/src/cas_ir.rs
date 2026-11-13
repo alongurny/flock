@@ -157,6 +157,23 @@ fn tag_bad(t: &[B], n: u8) -> B {
     any(&t[..5]).or(any(&hot[1..=n as usize]).not())
 }
 
+/// The code of the type a key names, eight bits, least significant first:
+/// fixed for one target, else read from its tag byte (`tag`, which the
+/// row checks is 1..=n).
+fn key_code(k: &KeyF, tag: Option<&[B]>) -> Vec<B> {
+    (0..8)
+        .map(|b| match tag {
+            None => if k.targets[0] >> b & 1 == 1 { T } else { F },
+            Some(t) => k
+                .targets
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| *c >> b & 1 == 1)
+                .fold(F, |acc, (n, _)| acc.xor(eq_const(t, n as u8 + 1))),
+        })
+        .collect()
+}
+
 // The types.
 
 #[derive(Clone, Copy)]
@@ -164,6 +181,10 @@ pub struct KeyF {
     pub optional: bool,
     /// 0: one target; n: one of n, with a tag byte.
     pub union: u8,
+    /// The code of each target, in tag order: the manifest's tag byte of a
+    /// type a proof covers, 0 for a file or a link to a parent (a commit or
+    /// a release), which the key lookup leaves alone.
+    pub targets: &'static [u8],
 }
 #[derive(Clone)]
 pub struct Rec {
@@ -404,8 +425,23 @@ impl Rec {
     }
 }
 
-fn key(optional: bool, union: u8) -> KeyF {
-    KeyF { optional, union }
+fn key(optional: bool, targets: &'static [u8]) -> KeyF {
+    let union = if targets.len() > 1 { targets.len() as u8 } else { 0 };
+    KeyF { optional, union, targets }
+}
+
+/// The codes of the types a key may name (the manifest's tag bytes).
+pub mod code {
+    pub const DIRECTORY: u8 = 1;
+    pub const ANNOTATION: u8 = 3;
+    pub const LINES: u8 = 4;
+    pub const RUNS: u8 = 5;
+    pub const NOTE: u8 = 7;
+    pub const AUTHOR: u8 = 8;
+    pub const PROSE: u8 = 9;
+    pub const TAG: u8 = 10;
+    /// A file, or a parent: not looked up.
+    pub const NONE: u8 = 0;
 }
 fn rec(keys: Vec<KeyF>, choices: Vec<u8>, ints: Vec<bool>, name: bool) -> Rec {
     Rec { keys, choices, ints, name }
@@ -413,32 +449,40 @@ fn rec(keys: Vec<KeyF>, choices: Vec<u8>, ints: Vec<bool>, name: bool) -> Rec {
 
 /// The formats of cas `version/src/typed.rs`, in the same words.
 pub fn types() -> Vec<Type> {
-    let (must, may) = (key(false, 0), key(true, 0));
+    use code::*;
+    let one = |optional: bool, c: &'static [u8]| key(optional, c);
     vec![
         Type {
             alias: "directory",
             head: None,
-            list: Some((rec(vec![key(false, 4)], vec![], vec![], true), Order::Sorted)),
+            // raw | symlink | directory | exec
+            list: Some((rec(vec![key(false, &[NONE, NONE, DIRECTORY, NONE])], vec![], vec![], true), Order::Sorted)),
             nonempty: false,
             text: None,
         },
         Type {
             alias: "commit",
-            head: Some(rec(vec![must, must, may], vec![], vec![false], false)),
-            list: Some((rec(vec![must, may], vec![], vec![], false), Order::Sorted)),
+            head: Some(rec(
+                vec![one(false, &[DIRECTORY]), one(false, &[AUTHOR]), one(true, &[ANNOTATION])],
+                vec![],
+                vec![false],
+                false,
+            )),
+            // A parent commit has a proof of its own.
+            list: Some((rec(vec![one(false, &[NONE]), one(true, &[ANNOTATION])], vec![], vec![], false), Order::Sorted)),
             nonempty: false,
             text: None,
         },
         Type {
             alias: "annotation",
-            head: Some(rec(vec![may], vec![], vec![], false)),
-            list: Some((rec(vec![key(false, 2)], vec![], vec![], true), Order::Sorted)),
+            head: Some(rec(vec![one(true, &[NOTE])], vec![], vec![], false)),
+            list: Some((rec(vec![key(false, &[ANNOTATION, LINES])], vec![], vec![], true), Order::Sorted)),
             nonempty: false,
             text: None,
         },
         Type {
             alias: "lines",
-            head: Some(rec(vec![may, may, may], vec![], vec![], false)),
+            head: Some(rec(vec![one(true, &[NOTE]), one(true, &[RUNS]), one(true, &[RUNS])], vec![], vec![], false)),
             list: None,
             nonempty: false,
             text: None,
@@ -449,14 +493,15 @@ pub fn types() -> Vec<Type> {
         Type {
             alias: "runs",
             head: None,
-            list: Some((rec(vec![may], vec![], vec![true], false), Order::Runs)),
+            list: Some((rec(vec![one(true, &[NOTE])], vec![], vec![true], false), Order::Runs)),
             nonempty: true,
             text: None,
         },
         Type {
             alias: "release",
-            head: Some(rec(vec![must, must], vec![], vec![], false)),
-            list: Some((rec(vec![must, must], vec![4], vec![], false), Order::Sorted)),
+            head: Some(rec(vec![one(false, &[DIRECTORY]), one(false, &[TAG])], vec![], vec![], false)),
+            // A release it follows has a proof of its own.
+            list: Some((rec(vec![one(false, &[NONE]), one(false, &[PROSE])], vec![4], vec![], false), Order::Sorted)),
             nonempty: false,
             text: None,
         },
@@ -556,7 +601,8 @@ fn rec_bad(r: &Rec, x: &[B]) -> B {
 /// The row for a head record (`head`), or for one record of a list of
 /// records with no name. Inputs: the record's blocks, four words each;
 /// for a list record also the two words of the record before's first key
-/// and a word whose lowest bit says there is none before.
+/// and a word whose lowest bit says there is none before. Outputs: the code
+/// of the type each key names ([`key_code`]), one word each.
 pub fn rec_circuit(t: &Type, head: bool) -> Circuit {
     let (r, order) = match (head, &t.head, &t.list) {
         (true, Some(h), _) => (h, None),
@@ -565,8 +611,19 @@ pub fn rec_circuit(t: &Type, head: bool) -> Circuit {
     };
     let s = r.blocks();
     let inputs = 4 * s + if head { 0 } else { 3 };
-    build(format!("cas.{}.{}", t.alias, if head { "head" } else { "rec" }), inputs, 0, |inp| {
+    let outputs = r.keys.len();
+    build(format!("cas.{}.{}", t.alias, if head { "head" } else { "rec" }), inputs, outputs, |inp| {
         let x = bytes(inp, 0, 64 * s);
+        let mut codes = Vec::new();
+        let mut tag = 256 * r.keys.len();
+        for k in &r.keys {
+            let mut c = key_code(k, (k.union > 0).then(|| &x[tag..tag + 8]));
+            if k.union > 0 {
+                tag += 8;
+            }
+            c.resize(128, F);
+            codes.extend(c);
+        }
         let mut zero = vec![rec_bad(r, &x)];
         if let Some(order) = order {
             let prev = bytes(inp, 4 * s, 32);
@@ -575,7 +632,7 @@ pub fn rec_circuit(t: &Type, head: bool) -> Circuit {
             let wrong = if order == Order::Sorted { gt.not() } else { eq };
             zero.push(wrong.and(first.not()));
         }
-        (zero, Vec::new())
+        (zero, codes)
     })
 }
 
@@ -640,12 +697,13 @@ impl State {
 /// The row for one block of a list of records that end in a name (key,
 /// tag, length, name). Inputs: the block's four words, the state's
 /// [`STATE`] words, and a word whose lowest bit says this is the blob's
-/// last block. Outputs: the next state.
+/// last block. Outputs: the next state, and the code of the type the
+/// entry's key names when the block is an entry's first (0 when not).
 pub fn step_circuit(t: &Type) -> Circuit {
     let (r, _) = t.list.as_ref().expect("a list");
     assert!(r.name && r.keys.len() == 1 && r.choices.is_empty() && r.ints.is_empty());
     let k = r.keys[0];
-    build(format!("cas.{}.step", t.alias), 4 + STATE + 1, STATE, |inp| {
+    build(format!("cas.{}.step", t.alias), 4 + STATE + 1, STATE + 1, |inp| {
         let blk = bytes(inp, 0, 64);
         let s = State::read(inp, 4);
         let last = inp[(4 + STATE) * 128];
@@ -717,7 +775,10 @@ pub fn step_circuit(t: &Type) -> Circuit {
             dots: B::mux(is_head, hdots, cdots),
         };
         let zero = vec![B::mux(is_head, hbad, cbad), last.and(any(&next.left).or(next.gt.not()))];
-        (zero, next.write())
+        let mut out = next.write();
+        out.resize(STATE * 128, F);
+        out.extend(key_code(&k, (k.union > 0).then(|| tag)).into_iter().map(|b| b.and(is_head)));
+        (zero, out)
     })
 }
 
@@ -850,7 +911,15 @@ pub fn words(block: &[u8]) -> [u128; 4] {
 
 /// Whether `blob` is valid, by its rows.
 pub fn check(t: &Type, c: &Circuits, blob: &[u8]) -> bool {
-    let Some(rows) = plan(t, blob.len()) else { return false };
+    keys(t, c, blob).is_some()
+}
+
+/// The keys `blob` holds, row by row, each with the code of the type it
+/// names ([`key_code`]; a step row that is not an entry's first holds its
+/// block's first 32 bytes with code 0), or `None` when it is not valid.
+pub fn keys(t: &Type, c: &Circuits, blob: &[u8]) -> Option<Vec<Vec<([u8; 32], u8)>>> {
+    let rows = plan(t, blob.len())?;
+    let mut held = Vec::with_capacity(rows.len());
     let mut padded = blob.to_vec();
     padded.resize(blob.len().next_multiple_of(64), 0);
     let blob = &padded[..];
@@ -881,12 +950,43 @@ pub fn check(t: &Type, c: &Circuits, blob: &[u8]) -> bool {
                 c.step.as_ref().unwrap().eval(&inputs)
             }
         };
-        match out {
-            None => return false,
-            Some(o) if r.kind == Kind::Text => text = o[0],
-            Some(o) if r.kind == Kind::Step => state = o,
-            Some(_) => prev = m,
-        }
+        let o = out?;
+        let at = |i: usize| -> [u8; 32] {
+            let p = 64 * r.block + 32 * i;
+            blob[p..p + 32].try_into().unwrap()
+        };
+        held.push(match r.kind {
+            Kind::Text => {
+                text = o[0];
+                Vec::new()
+            }
+            Kind::Step => {
+                state = o[..STATE].to_vec();
+                vec![(at(0), o[STATE] as u8)]
+            }
+            Kind::Head | Kind::Rec => {
+                prev = m;
+                o.iter().enumerate().map(|(i, &c)| (at(i), c as u8)).collect()
+            }
+        });
     }
-    true
+    Some(held)
+}
+
+/// The row of one key the lookup sees. Inputs: the key's two words, the
+/// code of its type, a word whose lowest bit says the key must be found
+/// (it is held by a blob the proof brings, or names a blob that has to be
+/// reached from a parent), then `bits` words: how many times it is found
+/// here, least significant bit first, which must be 0 for a key that must
+/// be found. Output: the word 1 when the key is looked up (it must be
+/// found, its code is not 0 and it is not all zeros, which is no key),
+/// else 0.
+pub fn key_circuit(bits: usize) -> Circuit {
+    build(format!("cas.key.{bits}"), 4 + bits, 1, |inp| {
+        let w = |i: usize| &inp[128 * i..128 * i + 128];
+        let must = w(3)[0];
+        let zero = (0..bits).map(|i| w(4 + i)[0].and(must)).collect();
+        let named = any(&w(2)[..8]).and(any(w(0)).or(any(w(1))));
+        (zero, vec![must.and(named)])
+    })
 }
