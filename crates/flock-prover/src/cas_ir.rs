@@ -239,6 +239,87 @@ pub fn text_grammar() -> Grammar {
     Grammar { classes, delta: d, accept }
 }
 
+/// `prose`: UTF-8 with no control character but the line feed.
+pub fn prose_grammar() -> Grammar {
+    let mut g = text_grammar();
+    g.classes[0] = vec![(0x0a, 0x0a), (0x20, 0x7e)];
+    g
+}
+
+/// `semver`: a version as Semantic Versioning 2.0.0 writes it. Three numbers
+/// without leading zeros joined by dots; then maybe `-` and dot-separated
+/// identifiers of letters, digits and hyphens, an identifier of digits alone
+/// having no leading zero; then maybe `+` and such identifiers, any digits.
+pub fn semver_grammar() -> Grammar {
+    // Classes: 0 `0`, 1 `1`-`9`, 2 letters, 3 `-`, 4 `.`, 5 `+`.
+    let classes = vec![
+        vec![(b'0', b'0')],
+        vec![(b'1', b'9')],
+        vec![(b'A', b'Z'), (b'a', b'z')],
+        vec![(b'-', b'-')],
+        vec![(b'.', b'.')],
+        vec![(b'+', b'+')],
+    ];
+    // States: 0 start; 1 major `0`; 2 major digits; 3 after the first dot;
+    // 4 minor `0`; 5 minor digits; 6 after the second dot; 7 patch `0`;
+    // 8 patch digits; 9 start of a pre-release identifier; 10 identifier
+    // `0`; 11 digits after a leading `0`; 12 digits from `1`-`9`; 13 an
+    // identifier with a letter or hyphen; 14 start of a build identifier;
+    // 15 in a build identifier.
+    let mut d = vec![vec![None; 6]; 16];
+    let number = |d: &mut Vec<Vec<Option<usize>>>, from: usize, zero: usize, digits: usize| {
+        d[from][0] = Some(zero);
+        d[from][1] = Some(digits);
+        d[digits][0] = Some(digits);
+        d[digits][1] = Some(digits);
+    };
+    number(&mut d, 0, 1, 2);
+    number(&mut d, 3, 4, 5);
+    number(&mut d, 6, 7, 8);
+    for s in [1, 2] {
+        d[s][4] = Some(3);
+    }
+    for s in [4, 5] {
+        d[s][4] = Some(6);
+    }
+    for s in [7, 8] {
+        d[s][3] = Some(9);
+        d[s][5] = Some(14);
+    }
+    // Pre-release identifiers.
+    d[9][0] = Some(10);
+    d[9][1] = Some(12);
+    d[9][2] = Some(13);
+    d[9][3] = Some(13);
+    for s in [10, 11] {
+        d[s][0] = Some(11);
+        d[s][1] = Some(11);
+    }
+    for s in [10, 11, 12, 13] {
+        d[s][2] = Some(13);
+        d[s][3] = Some(13);
+    }
+    d[12][0] = Some(12);
+    d[12][1] = Some(12);
+    d[13][0] = Some(13);
+    d[13][1] = Some(13);
+    for s in [10, 12, 13] {
+        d[s][4] = Some(9);
+        d[s][5] = Some(14);
+    }
+    // Build identifiers.
+    for c in 0..4 {
+        d[14][c] = Some(15);
+        d[15][c] = Some(15);
+    }
+    d[15][4] = Some(14);
+    let mut accept = vec![false; 16];
+    for s in [7, 8, 10, 12, 13, 15] {
+        accept[s] = true;
+    }
+    Grammar { classes, delta: d, accept }
+}
+
 impl Grammar {
     /// Whether the automaton accepts `b`.
     pub fn accepts(&self, b: &[u8]) -> bool {
@@ -362,6 +443,8 @@ pub fn types() -> Vec<Type> {
             text: None,
         },
         Type { alias: "text", head: None, list: None, nonempty: false, text: Some(text_grammar()) },
+        Type { alias: "prose", head: None, list: None, nonempty: false, text: Some(prose_grammar()) },
+        Type { alias: "tag", head: None, list: None, nonempty: false, text: Some(semver_grammar()) },
         Type {
             alias: "runs",
             head: None,
@@ -663,7 +746,12 @@ pub struct Row {
 /// The rows that check a blob of `len` bytes, or `None` when no blob of
 /// that length is valid.
 pub fn plan(t: &Type, len: usize) -> Option<Vec<Row>> {
-    if t.text.is_some() {
+    if let Some(g) = &t.text {
+        // No block is read of an empty text: it is valid only if the
+        // automaton accepts at its start.
+        if len == 0 && !g.accept[0] {
+            return None;
+        }
         let n = len.div_ceil(64);
         return Some(
             (0..n)
