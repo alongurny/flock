@@ -110,7 +110,7 @@ fn below(hot: &[B], n: usize) -> Vec<B> {
     }
     out
 }
-/// A byte a name may hold: a letter, a digit, `.`, `-`, `_` or a space.
+/// A byte a name may hold: a letter, a digit, `+`, `.`, `-`, `_` or a space.
 fn name_byte(b: &[B]) -> B {
     let (h, l) = (&b[..4], &b[4..]);
     let l32 = l[0].and(l[1]);
@@ -119,8 +119,9 @@ fn name_byte(b: &[B]) -> B {
     let le10 = l[0].not().or(l[1].not().and(l[2].and(l[3]).not()));
     // 0x41..=0x4f and 0x50..=0x5a and 0x5f, the same with 0x20 added.
     let letter = B::mux(h[3], le10, ge1).or(h[2].not().and(h[3]).and(l32).and(l[2]).and(l[3]));
-    // 0x30..=0x39, and 0x20, 0x2d, 0x2e.
-    let other = B::mux(h[3], le9, ge1.not().or(l32.and(l[2].xor(l[3]))));
+    // 0x30..=0x39, and 0x20, 0x2b, 0x2d, 0x2e.
+    let plus = l[0].and(l[1].not()).and(l[2]).and(l[3]);
+    let other = B::mux(h[3], le9, ge1.not().or(l32.and(l[2].xor(l[3]))).or(plus));
     h[0].not().and(B::mux(h[1], letter, h[2].and(other)))
 }
 /// Whether name bytes are wrong, and whether the last is a dot: a byte
