@@ -38,9 +38,42 @@
 //! live rows. The prover sends one gather value per committed word used —
 //! the same packed-direct claims the wiring's gather produces, bound to the
 //! commitment by the opening — and the verifier rebuilds both sides.
+//!
+//! ## Multiplicities
+//!
+//! A port may count each row `m(j) = Σ_i 2^i·m_i(j)` times, the bits `m_i`
+//! being committed words of the row ([`BusPort::mult`]); a lookup table then
+//! supplies each entry once with the number of requests. LogUp would sum
+//! `m/(β + t)`, which in characteristic 2 only sees `m mod 2`, so the bus
+//! stays a product and multiplies `f^m = ∏_i (f^{2^i})^{m_i}` instead, with
+//! `f = β + Σ_k γ_k·t_k`. Such a port fills one group per bit, row `j` of
+//! group `i` holding the leaf `1 + m_i·(1 + f^{2^i})`: `f^{2^i}` when the
+//! bit is set, 1 when not.
+//!
+//! That leaf is not affine in the committed words, so the verifier does not
+//! rebuild it. The prover sends each such group's `S = Σ_j eq(ρ_row, j)·
+//! m_i(j)·(1 + F_i(j))` (`F_i = f^{2^i}`), which enters the side in place
+//! of the affine bracket, and proves all of them, together with
+//! `Σ_j eq(ρ_row, j)·m_i(j)·(1 + m_i(j)) = 0` (each bit is 0 or 1: the zero
+//! check of `m² + m` at the random `ρ_row`), in one degree-3 sumcheck over
+//! the rows, batched by fresh `λ_g, μ_g`. It ends at a row point `r` and
+//! needs `m̂_i(r)` and `F̂_i(r)`. Frobenius is additive and fixes the
+//! Boolean cube, so `eq(σ, j)^{2^i} = eq(σ^{2^i}, j)` and
+//!
+//! ```text
+//! F̂_i(r) = Σ_j eq(r, j)·f(j)^{2^i} = f̂(σ_i)^{2^i},   σ_i = r^{2^{-i}}
+//! ```
+//!
+//! coordinate-wise, where `f̂` is affine in the words' MLEs. So the prover
+//! opens each bit at `r` and each word of the port at every `σ_i`, all of
+//! them packed-direct claims like the gather's. A bit that is not 0 or 1
+//! would let the prover set a leaf to anything; the zero check is what
+//! stops that. The fingerprint's degree in `β` grows to `Σ m`, which
+//! [`live_entries`] counts for grinding.
 
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    ParallelSliceMut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +159,12 @@ pub struct BusPort {
     pub ty: usize,
     pub dir: BusDirection,
     pub terms: Vec<BusTerm>,
+    /// The row's multiplicity, as bits, least significant first: cell-slots
+    /// of the port's type, each holding 0 or 1 (the bus proves it). Row `j`
+    /// then counts `Σ_i 2^i·m_i(j)` times, so 0 leaves it out. Empty: every
+    /// live row counts once. See the module's "Multiplicities" section.
+    #[serde(default)]
+    pub mult: Vec<usize>,
 }
 
 /// A circuit's bus: every port's tuple has `width` coordinates.
@@ -143,6 +182,22 @@ pub struct BusProof {
     pub gkr: ProductGkrLeavesProof,
     pub gather: Vec<F128>,
     pub fingerprint_nonce: Vec<u64>,
+    /// The multiplicity groups' sumcheck, when a port has multiplicities.
+    #[serde(default)]
+    pub mult: Option<MultProof>,
+}
+
+/// The multiplicity groups' half of a [`BusProof`]: each group's `S` (in
+/// [`Bus::mult_groups`] order), the sumcheck's rounds (`s(0), s(x), s(x+1)`
+/// for the generator `x`; `s(1)` follows from the claim), the bits at the
+/// end point `r` ([`Bus::mult_bits`] order) and the words at each `σ_i`
+/// ([`Bus::mult_words`] order).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultProof {
+    pub sums: Vec<F128>,
+    pub rounds: Vec<[F128; 3]>,
+    pub bits: Vec<F128>,
+    pub words: Vec<F128>,
 }
 
 /// A static column of the bus's leaf reconstruction: a port type's live-row
@@ -214,6 +269,18 @@ impl Bus {
             if port.terms.len() != self.width {
                 return bad("a port's tuple has the wrong width");
             }
+            if port.mult.len() > 63 {
+                return bad("a multiplicity has at most 63 bits");
+            }
+            for (i, iota) in port.mult.iter().enumerate() {
+                if port.mult[..i].contains(iota) {
+                    return bad("a multiplicity names a bit twice");
+                }
+                match slots.get(*iota) {
+                    Some(CellSlot::Gate { ty, .. }) if *ty == port.ty => {}
+                    _ => return bad("a multiplicity bit is outside its port's type"),
+                }
+            }
             for term in &port.terms {
                 if term.row.is_some_and(|t| t.div == 0) {
                     return bad("a row tag divides by zero");
@@ -258,13 +325,25 @@ impl Bus {
                 }
             }
         }
+        // The bus is the digest's last part, so a trailer only when some
+        // port counts rows keeps every earlier digest.
+        if self.ports.iter().any(|p| !p.mult.is_empty()) {
+            buf.extend_from_slice(b"multiplicities");
+            for port in &self.ports {
+                buf.extend_from_slice(&(port.mult.len() as u32).to_le_bytes());
+                for &iota in &port.mult {
+                    buf.extend_from_slice(&(iota as u32).to_le_bytes());
+                }
+            }
+        }
     }
 
     /// The static columns the leaf reconstruction reads, each once: per port
-    /// in declaration order, its type's live indicator, then each row tag.
+    /// without multiplicities, in declaration order, its type's live
+    /// indicator, then each row tag.
     pub fn structure_columns(&self) -> Vec<BusColumn> {
         let mut cols = Vec::new();
-        for port in &self.ports {
+        for port in self.ports.iter().filter(|p| p.mult.is_empty()) {
             let live = BusColumn::Live { ty: port.ty };
             let tags = port
                 .terms
@@ -285,11 +364,13 @@ impl Bus {
         cols.iter().position(|&c| c == col).expect("a bus column")
     }
 
-    /// The cell-slots the ports read, ascending — the gather order.
+    /// The cell-slots the ports without multiplicities read, ascending — the
+    /// gather order.
     pub fn words(&self) -> Vec<usize> {
         let mut words: Vec<usize> = self
             .ports
             .iter()
+            .filter(|p| p.mult.is_empty())
             .flat_map(|p| p.terms.iter().filter_map(|t| t.word))
             .collect();
         words.sort_unstable();
@@ -302,12 +383,69 @@ impl Bus {
         self.ports.iter().filter(|p| p.dir == dir).collect()
     }
 
+    /// Whether some port counts its rows.
+    pub fn has_mult(&self) -> bool {
+        self.ports.iter().any(|p| !p.mult.is_empty())
+    }
+
+    /// One side's product groups, in order: a port without multiplicities
+    /// is one group (`None`), a port with `b` bits is `b` groups, bit `i`
+    /// holding `f^{2^i}` where it is set (`Some(i)`).
+    pub fn groups(&self, dir: BusDirection) -> Vec<(usize, Option<usize>)> {
+        let mut out = Vec::new();
+        for (p, port) in self.ports.iter().enumerate().filter(|(_, p)| p.dir == dir) {
+            if port.mult.is_empty() {
+                out.push((p, None));
+            } else {
+                out.extend((0..port.mult.len()).map(|i| (p, Some(i))));
+            }
+        }
+        out
+    }
+
+    /// The multiplicity groups `(port, bit)` in proof order: the send side's,
+    /// then the receive side's.
+    pub fn mult_groups(&self) -> Vec<(usize, usize)> {
+        [BusDirection::Send, BusDirection::Recv]
+            .into_iter()
+            .flat_map(|d| self.groups(d))
+            .filter_map(|(p, i)| i.map(|i| (p, i)))
+            .collect()
+    }
+
+    /// The multiplicity bits' cell-slots, ascending: opened at `r`.
+    pub fn mult_bits(&self) -> Vec<usize> {
+        let mut bits: Vec<usize> = self.ports.iter().flat_map(|p| p.mult.clone()).collect();
+        bits.sort_unstable();
+        bits.dedup();
+        bits
+    }
+
+    /// `(i, cell-slot)` for each word a port with at least `i + 1` bits
+    /// reads, by `i` then cell-slot: opened at `σ_i`.
+    pub fn mult_words(&self) -> Vec<(usize, usize)> {
+        let most = self.ports.iter().map(|p| p.mult.len()).max().unwrap_or(0);
+        let mut out = Vec::new();
+        for i in 0..most {
+            let mut words: Vec<usize> = self
+                .ports
+                .iter()
+                .filter(|p| p.mult.len() > i)
+                .flat_map(|p| p.terms.iter().filter_map(|t| t.word))
+                .collect();
+            words.sort_unstable();
+            words.dedup();
+            out.extend(words.into_iter().map(|w| (i, w)));
+        }
+        out
+    }
+
     /// Port-group bits: both sides share a `2^c` grid of port groups.
     pub fn c_bits(&self) -> usize {
         let most = self
-            .side(BusDirection::Send)
+            .groups(BusDirection::Send)
             .len()
-            .max(self.side(BusDirection::Recv).len())
+            .max(self.groups(BusDirection::Recv).len())
             .max(1);
         most.next_power_of_two().trailing_zeros() as usize
     }
@@ -319,17 +457,23 @@ struct Challenges {
     gamma: Vec<F128>,
 }
 
+/// The fingerprint product's degree in `β`: one per live row, `2^b − 1` for
+/// a row of a port with `b` multiplicity bits.
 fn live_entries(bus: &Bus, circuit: &Circuit) -> usize {
     let rows = 1usize << circuit.cells().nu();
     bus.ports
         .iter()
-        .map(|p| circuit.counts()[p.ty].min(rows))
-        .sum()
+        .map(|p| {
+            let most = (1usize << p.mult.len().min(40)) - 1;
+            circuit.counts()[p.ty].min(rows).saturating_mul(most.max(1))
+        })
+        .fold(0usize, usize::saturating_add)
 }
 
 /// Prove the bus balances on the committed buffer `packed` (the same padded
 /// union buffer [`super::prove_wiring`] reads). Returns the proof and one
-/// packed-direct claim per committed word read, for the opening.
+/// packed-direct claim per committed word read — the gather's, then the
+/// multiplicity sumcheck's — for the opening.
 pub(crate) fn prove_bus<C: Challenger>(
     circuit: &Circuit,
     bus: &Bus,
@@ -352,29 +496,39 @@ pub(crate) fn prove_bus<C: Challenger>(
     };
     let gamma: Vec<F128> = (0..bus.width).map(|_| ch.sample_f128()).collect();
     let challenges = Challenges { beta, gamma };
+    let word = |iota: usize, j: usize| packed[cells.gate_word_addr(iota, j)];
 
     let groups = 1usize << bus.c_bits();
     let leaves = |dir: BusDirection| -> ProductLeaves {
-        let ports = bus.side(dir);
+        let gs = bus.groups(dir);
         let mut buf = take_f128(groups * rows);
         let lens: Vec<usize> = (0..groups)
-            .map(|g| ports.get(g).map_or(0, |p| circuit.counts()[p.ty].min(rows)))
+            .map(|g| {
+                gs.get(g)
+                    .map_or(0, |&(p, _)| circuit.counts()[bus.ports[p].ty].min(rows))
+            })
             .collect();
-        // Parallel over ports and, within a port, chunks of rows.
+        // Parallel over groups and, within a group, chunks of rows.
         const CHUNK: usize = 1 << 13;
         buf[..groups * rows]
             .par_chunks_mut(rows)
-            .zip(ports.par_iter())
+            .zip(gs.par_iter())
             .zip(lens.par_iter())
-            .for_each(|((group, &port), &live)| {
+            .for_each(|((group, &(p, bit)), &live)| {
+                let port = &bus.ports[p];
                 group[..live]
                     .par_chunks_mut(CHUNK)
                     .enumerate()
                     .for_each(|(c, out)| {
                         for (i, leaf) in out.iter_mut().enumerate() {
-                            *leaf = fingerprint(port, c * CHUNK + i, &challenges, |iota, j| {
-                                packed[cells.gate_word_addr(iota, j)]
-                            });
+                            let j = c * CHUNK + i;
+                            let f = fingerprint(port, j, &challenges, word);
+                            *leaf = match bit {
+                                None => f,
+                                Some(b) => {
+                                    F128::ONE + word(port.mult[b], j) * (F128::ONE + frob(f, b))
+                                }
+                            };
                         }
                     });
             });
@@ -389,43 +543,37 @@ pub(crate) fn prove_bus<C: Challenger>(
     let words = bus.words();
     let gather: Vec<F128> = words
         .par_iter()
-        .map(|&iota| {
-            let CellSlot::Gate { ty, .. } = cells.slots()[iota] else {
-                unreachable!("validated: bus words are gate cell-slots")
-            };
-            let live = circuit.counts()[ty].min(rows);
-            let base = cells.gate_word_addr(iota, 0);
-            eq_row[..live]
-                .iter()
-                .zip(&packed[base..base + live])
-                .fold(F128::ZERO, |acc, (&e, &w)| acc + e * w)
-        })
+        .map(|&iota| column_at(circuit, iota, &eq_row, word))
         .collect();
-    let claims = words
+    let mut claims: Vec<PackedDirectClaim> = words
         .iter()
         .zip(&gather)
-        .map(|(&iota, &value)| {
-            let point = cells.gate_claim_point(iota, rho_row);
-            PackedDirectClaim {
-                value,
-                eq_ind: DirectEqInd::EqPoint(point.clone()),
-                point,
-            }
-        })
+        .map(|(&iota, &value)| direct_claim(circuit, iota, rho_row, value))
         .collect();
+    let mult = bus.has_mult().then(|| {
+        let (proof, opened) = prove_mult(circuit, bus, word, &challenges, &eq_row, ch);
+        claims.extend(
+            opened
+                .into_iter()
+                .map(|(iota, point, value)| direct_claim(circuit, iota, &point, value)),
+        );
+        proof
+    });
     (
         BusProof {
             gkr,
             gather,
             fingerprint_nonce,
+            mult,
         },
         claims,
     )
 }
 
 /// Replay the bus and check both products' leaf claims against the gather
-/// values. Returns the gather claims `(point, value)` in proof order and the
-/// static columns' evaluations the check read.
+/// values (and the multiplicity groups' sums, which their sumcheck proves).
+/// Returns the claims `(point, value)` in proof order and the static
+/// columns' evaluations the check read.
 pub(crate) fn verify_bus<C: Challenger>(
     circuit: &Circuit,
     bus: &Bus,
@@ -437,7 +585,7 @@ pub(crate) fn verify_bus<C: Challenger>(
     let nu = cells.nu();
     let rows = 1usize << nu;
     let words = bus.words();
-    if proof.gather.len() != words.len() {
+    if proof.gather.len() != words.len() || proof.mult.is_some() != bus.has_mult() {
         return Err(WiringError::MalformedProof);
     }
     ch.observe_label(DOMAIN_BUS);
@@ -458,6 +606,7 @@ pub(crate) fn verify_bus<C: Challenger>(
         ch.sample_f128()
     };
     let gamma: Vec<F128> = (0..bus.width).map(|_| ch.sample_f128()).collect();
+    let challenges = Challenges { beta, gamma };
 
     let c = bus.c_bits();
     let claim = verify_leaves(nu + c, &proof.gkr, grinding, ch).map_err(WiringError::BusGkr)?;
@@ -472,23 +621,43 @@ pub(crate) fn verify_bus<C: Challenger>(
         .map(|c| c.eval(circuit, rho_row, &eq_row))
         .collect();
     let column = |col: BusColumn| values[Bus::column_index(&cols, col)];
+    let mut opened = Vec::new();
+    let sums: &[F128] = match &proof.mult {
+        Some(mult) => {
+            opened = verify_mult(circuit, bus, mult, &challenges, rho_row, ch)?;
+            &mult.sums
+        }
+        None => &[],
+    };
+    let mult_groups = bus.mult_groups();
 
-    // Each side: 1 + Σ_p eq(ρ_port, p)·[(β + 1)·E_p + Σ_k γ_k·(coordinate MLE)].
+    // Each side: 1 + Σ_g eq(ρ_port, g)·[(β + 1)·E_p + Σ_k γ_k·(coordinate
+    // MLE)], or the group's sum S for a multiplicity bit.
     let side = |dir: BusDirection| -> F128 {
         let mut acc = F128::ONE;
-        for (g, port) in bus.side(dir).into_iter().enumerate() {
-            let mass = column(BusColumn::Live { ty: port.ty });
-            let mut inner = (beta + F128::ONE) * mass;
-            for (term, &gk) in port.terms.iter().zip(&gamma) {
-                let mut value = term.constant * mass;
-                if let Some(iota) = term.word {
-                    value += gathered(iota);
+        for (g, (p, bit)) in bus.groups(dir).into_iter().enumerate() {
+            let port = &bus.ports[p];
+            let inner = match bit {
+                Some(i) => {
+                    let at = mult_groups.iter().position(|&x| x == (p, i));
+                    sums[at.expect("a multiplicity group")]
                 }
-                if let Some(tag) = term.row {
-                    value += column(BusColumn::Tag { ty: port.ty, tag });
+                None => {
+                    let mass = column(BusColumn::Live { ty: port.ty });
+                    let mut inner = (challenges.beta + F128::ONE) * mass;
+                    for (term, &gk) in port.terms.iter().zip(&challenges.gamma) {
+                        let mut value = term.constant * mass;
+                        if let Some(iota) = term.word {
+                            value += gathered(iota);
+                        }
+                        if let Some(tag) = term.row {
+                            value += column(BusColumn::Tag { ty: port.ty, tag });
+                        }
+                        inner += gk * value;
+                    }
+                    inner
                 }
-                inner += gk * value;
-            }
+            };
             acc += eq_port[g] * inner;
         }
         acc
@@ -500,6 +669,11 @@ pub(crate) fn verify_bus<C: Challenger>(
         .iter()
         .zip(&proof.gather)
         .map(|(&iota, &value)| (cells.gate_claim_point(iota, rho_row), value))
+        .chain(
+            opened
+                .into_iter()
+                .map(|(iota, point, value)| (cells.gate_claim_point(iota, &point), value)),
+        )
         .collect();
     Ok((
         gather,
@@ -508,6 +682,334 @@ pub(crate) fn verify_bus<C: Challenger>(
             values,
         },
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Multiplicities: the groups' sumcheck
+// ---------------------------------------------------------------------------
+
+const DOMAIN_MULT: &[u8] = b"flock-tuple-bus-multiplicities-v1";
+
+/// An opening the multiplicity sumcheck asks for: cell-slot, row point,
+/// value.
+type Opened = (usize, Vec<F128>, F128);
+
+/// `x^{2^i}`.
+#[inline]
+fn frob(mut x: F128, i: usize) -> F128 {
+    for _ in 0..i {
+        x = x.square();
+    }
+    x
+}
+
+/// `x^{2^{-i}}`: Frobenius has order 128 on GF(2^128).
+fn frob_inv(x: F128, i: usize) -> F128 {
+    frob(x, (128 - i % 128) % 128)
+}
+
+/// The sumcheck's third node: the generator `x`; the nodes are `0, 1, x,
+/// x + 1`.
+const NODE: F128 = F128::new(2, 0);
+
+/// The cubic through `(0, v0), (1, v1), (x, vx), (x + 1, vx1)` at `r`.
+fn interpolate(v: [F128; 4], r: F128) -> F128 {
+    let nodes = [F128::ZERO, F128::ONE, NODE, NODE + F128::ONE];
+    let mut acc = F128::ZERO;
+    for k in 0..4 {
+        let (mut num, mut den) = (F128::ONE, F128::ONE);
+        for l in (0..4).filter(|&l| l != k) {
+            num *= r + nodes[l];
+            den *= nodes[k] + nodes[l];
+        }
+        acc += v[k] * num * den.inv();
+    }
+    acc
+}
+
+/// `eq(a, b)` for two points.
+fn eq_at(a: &[F128], b: &[F128]) -> F128 {
+    a.iter().zip(b).fold(F128::ONE, |acc, (&x, &y)| {
+        acc * (x * y + (F128::ONE + x) * (F128::ONE + y))
+    })
+}
+
+/// The live rows of `iota`'s type.
+fn live_of(circuit: &Circuit, iota: usize, rows: usize) -> usize {
+    let CellSlot::Gate { ty, .. } = circuit.cells().slots()[iota] else {
+        unreachable!("validated: bus words are gate cell-slots")
+    };
+    circuit.counts()[ty].min(rows)
+}
+
+/// `Σ_{j<live} eq[j]·word(iota, j)`: the column's MLE at the point `eq` was
+/// built from.
+fn column_at(
+    circuit: &Circuit,
+    iota: usize,
+    eq: &[F128],
+    word: impl Fn(usize, usize) -> F128,
+) -> F128 {
+    let live = live_of(circuit, iota, eq.len());
+    eq[..live]
+        .iter()
+        .enumerate()
+        .fold(F128::ZERO, |acc, (j, &e)| acc + e * word(iota, j))
+}
+
+fn direct_claim(circuit: &Circuit, iota: usize, row: &[F128], value: F128) -> PackedDirectClaim {
+    let point = circuit.cells().gate_claim_point(iota, row);
+    PackedDirectClaim {
+        value,
+        eq_ind: DirectEqInd::EqPoint(point.clone()),
+        point,
+    }
+}
+
+/// Row `j`'s fingerprint over all `2^ν` rows: the live rows' tuples, and
+/// `β + Σ_k γ_k·c_k` past them (words and tags are zero there), so that its
+/// MLE is affine in the words' MLEs.
+fn fingerprint_everywhere(
+    port: &BusPort,
+    j: usize,
+    live: usize,
+    ch: &Challenges,
+    word: impl Fn(usize, usize) -> F128,
+) -> F128 {
+    if j < live {
+        return fingerprint(port, j, ch, word);
+    }
+    port.terms
+        .iter()
+        .zip(&ch.gamma)
+        .fold(ch.beta, |acc, (t, &g)| acc + g * t.constant)
+}
+
+/// Sample the batching challenges `λ_g, μ_g` after the sums.
+fn batching<C: Challenger>(sums: &[F128], ch: &mut C) -> (Vec<F128>, Vec<F128>) {
+    ch.observe_label(DOMAIN_MULT);
+    ch.observe_f128_slice(sums);
+    let lambda = sums.iter().map(|_| ch.sample_f128()).collect();
+    let mu = sums.iter().map(|_| ch.sample_f128()).collect();
+    (lambda, mu)
+}
+
+/// Prove every multiplicity group's sum `S_g` and that its bits are 0 or 1:
+/// `Σ_j eq(ρ_row, j)·Σ_g m_g(j)·[λ_g·(1 + F_g(j)) + μ_g·(1 + m_g(j))] =
+/// Σ_g λ_g·S_g`, one degree-3 sumcheck binding the row bits low first.
+fn prove_mult<C: Challenger>(
+    circuit: &Circuit,
+    bus: &Bus,
+    word: impl Fn(usize, usize) -> F128 + Copy + Sync,
+    challenges: &Challenges,
+    eq_row: &[F128],
+    ch: &mut C,
+) -> (MultProof, Vec<Opened>) {
+    let rows = eq_row.len();
+    let groups = bus.mult_groups();
+    // Per group: the bits m_g and F_g = f^{2^i} over all rows.
+    let tables: Vec<(Vec<F128>, Vec<F128>)> = groups
+        .par_iter()
+        .map(|&(p, i)| {
+            let port = &bus.ports[p];
+            let live = circuit.counts()[port.ty].min(rows);
+            let m: Vec<F128> = (0..rows)
+                .map(|j| {
+                    if j < live {
+                        word(port.mult[i], j)
+                    } else {
+                        F128::ZERO
+                    }
+                })
+                .collect();
+            let f: Vec<F128> = (0..rows)
+                .map(|j| frob(fingerprint_everywhere(port, j, live, challenges, word), i))
+                .collect();
+            (m, f)
+        })
+        .collect();
+    let sums: Vec<F128> = tables
+        .iter()
+        .map(|(m, f)| {
+            (0..rows).fold(F128::ZERO, |acc, j| {
+                acc + eq_row[j] * m[j] * (F128::ONE + f[j])
+            })
+        })
+        .collect();
+    let (lambda, mu) = batching(&sums, ch);
+    let mut claim = sums
+        .iter()
+        .zip(&lambda)
+        .fold(F128::ZERO, |acc, (&s, &l)| acc + l * s);
+    let mut e = eq_row.to_vec();
+    let (mut ms, mut gs): (Vec<Vec<F128>>, Vec<Vec<F128>>) = tables
+        .into_iter()
+        .zip(lambda.iter().zip(&mu))
+        .map(|((m, f), (&l, &u))| {
+            let g = (0..rows)
+                .map(|j| l * (F128::ONE + f[j]) + u * (F128::ONE + m[j]))
+                .collect();
+            (m, g)
+        })
+        .unzip();
+
+    let nodes = [F128::ZERO, NODE, NODE + F128::ONE];
+    let mut rounds = Vec::new();
+    let mut r = Vec::new();
+    while e.len() > 1 {
+        let half = e.len() / 2;
+        let s: [F128; 3] = (0..half)
+            .into_par_iter()
+            .map(|t| {
+                let mut out = [F128::ZERO; 3];
+                for (o, &x) in out.iter_mut().zip(&nodes) {
+                    let at = |v: &[F128]| v[2 * t] + x * (v[2 * t] + v[2 * t + 1]);
+                    let inner = ms
+                        .iter()
+                        .zip(&gs)
+                        .fold(F128::ZERO, |acc, (m, g)| acc + at(m) * at(g));
+                    *o = at(&e) * inner;
+                }
+                out
+            })
+            .reduce(|| [F128::ZERO; 3], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]]);
+        ch.observe_f128_slice(&s);
+        let rk = ch.sample_f128();
+        claim = interpolate([s[0], claim + s[0], s[1], s[2]], rk);
+        rounds.push(s);
+        r.push(rk);
+        let fold = |v: &mut Vec<F128>| {
+            *v = (0..half)
+                .map(|t| v[2 * t] + rk * (v[2 * t] + v[2 * t + 1]))
+                .collect();
+        };
+        fold(&mut e);
+        ms.iter_mut().for_each(fold);
+        gs.iter_mut().for_each(fold);
+    }
+    // The claim closes on e[0]·Σ_g m_g[0]·g_g[0] exactly when every bit is
+    // 0 or 1; otherwise the verifier rejects, which the tests rely on.
+
+    let mut opened = Vec::new();
+    let eq_r = build_eq(&r);
+    let bits: Vec<F128> = bus
+        .mult_bits()
+        .into_iter()
+        .map(|iota| {
+            let v = column_at(circuit, iota, &eq_r, word);
+            opened.push((iota, r.clone(), v));
+            v
+        })
+        .collect();
+    let mut sigma: Vec<(Vec<F128>, Vec<F128>)> = Vec::new();
+    let words: Vec<F128> = bus
+        .mult_words()
+        .into_iter()
+        .map(|(i, iota)| {
+            while sigma.len() <= i {
+                let point: Vec<F128> = r.iter().map(|&x| frob_inv(x, sigma.len())).collect();
+                let eq = build_eq(&point);
+                sigma.push((point, eq));
+            }
+            let v = column_at(circuit, iota, &sigma[i].1, word);
+            opened.push((iota, sigma[i].0.clone(), v));
+            v
+        })
+        .collect();
+    ch.observe_f128_slice(&bits);
+    ch.observe_f128_slice(&words);
+    (
+        MultProof {
+            sums,
+            rounds,
+            bits,
+            words,
+        },
+        opened,
+    )
+}
+
+/// Replay [`prove_mult`]: the rounds, then the end point's value from the
+/// opened bits and words. Returns the openings, which the PCS checks.
+fn verify_mult<C: Challenger>(
+    circuit: &Circuit,
+    bus: &Bus,
+    proof: &MultProof,
+    challenges: &Challenges,
+    rho_row: &[F128],
+    ch: &mut C,
+) -> Result<Vec<Opened>, WiringError> {
+    let groups = bus.mult_groups();
+    let bit_slots = bus.mult_bits();
+    let word_slots = bus.mult_words();
+    if proof.sums.len() != groups.len()
+        || proof.rounds.len() != rho_row.len()
+        || proof.bits.len() != bit_slots.len()
+        || proof.words.len() != word_slots.len()
+    {
+        return Err(WiringError::MalformedProof);
+    }
+    let (lambda, mu) = batching(&proof.sums, ch);
+    let mut claim = proof
+        .sums
+        .iter()
+        .zip(&lambda)
+        .fold(F128::ZERO, |acc, (&s, &l)| acc + l * s);
+    let mut r = Vec::with_capacity(rho_row.len());
+    for s in &proof.rounds {
+        ch.observe_f128_slice(s);
+        let rk = ch.sample_f128();
+        claim = interpolate([s[0], claim + s[0], s[1], s[2]], rk);
+        r.push(rk);
+    }
+    ch.observe_f128_slice(&proof.bits);
+    ch.observe_f128_slice(&proof.words);
+
+    let most = bus.ports.iter().map(|p| p.mult.len()).max().unwrap_or(0);
+    let sigma: Vec<Vec<F128>> = (0..most)
+        .map(|i| r.iter().map(|&x| frob_inv(x, i)).collect())
+        .collect();
+    let eq_sigma: Vec<Vec<F128>> = sigma.iter().map(|s| build_eq(s)).collect();
+    let bit = |iota: usize| proof.bits[bit_slots.binary_search(&iota).expect("a bit")];
+    let word = |i: usize, iota: usize| {
+        proof.words[word_slots
+            .binary_search(&(i, iota))
+            .expect("a multiplicity word")]
+    };
+    let mut total = F128::ZERO;
+    for (g, &(p, i)) in groups.iter().enumerate() {
+        let port = &bus.ports[p];
+        let m = bit(port.mult[i]);
+        // f̂(σ_i) = β + Σ_k γ_k·(c_k + ŵ_k(σ_i) + T̂_k(σ_i)).
+        let mut f = challenges.beta;
+        for (term, &gk) in port.terms.iter().zip(&challenges.gamma) {
+            let mut value = term.constant;
+            if let Some(iota) = term.word {
+                value += word(i, iota);
+            }
+            if let Some(tag) = term.row {
+                value += BusColumn::Tag { ty: port.ty, tag }.eval(circuit, &sigma[i], &eq_sigma[i]);
+            }
+            f += gk * value;
+        }
+        let big_f = frob(f, i);
+        total += m * (lambda[g] * (F128::ONE + big_f) + mu[g] * (F128::ONE + m));
+    }
+    if eq_at(rho_row, &r) * total != claim {
+        return Err(WiringError::BusRecombination);
+    }
+    let mut opened: Vec<Opened> = bit_slots
+        .iter()
+        .zip(&proof.bits)
+        .map(|(&iota, &v)| (iota, r.clone(), v))
+        .collect();
+    opened.extend(
+        word_slots
+            .iter()
+            .zip(&proof.words)
+            .map(|(&(i, iota), &v)| (iota, sigma[i].clone(), v)),
+    );
+    Ok(opened)
 }
 
 /// Row `j`'s leaf in `port`: `β + Σ_k γ_k·t_k`, reading committed words
@@ -549,4 +1051,23 @@ pub fn tuple(port: &BusPort, j: usize, word: impl Fn(usize, usize) -> F128) -> V
             t
         })
         .collect()
+}
+
+/// How many times `port`'s row `j` counts: its multiplicity bits read as an
+/// integer (a bit word other than 0 or 1 is `None`), 1 without bits. For
+/// witness-side balance checks.
+pub fn multiplicity(port: &BusPort, j: usize, word: impl Fn(usize, usize) -> F128) -> Option<u64> {
+    if port.mult.is_empty() {
+        return Some(1);
+    }
+    port.mult.iter().enumerate().try_fold(0u64, |acc, (i, &iota)| {
+        let b = word(iota, j);
+        if b == F128::ZERO {
+            Some(acc)
+        } else if b == F128::ONE {
+            Some(acc | 1 << i)
+        } else {
+            None
+        }
+    })
 }

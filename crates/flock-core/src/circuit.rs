@@ -2379,6 +2379,7 @@ mod tests {
             ty,
             dir,
             terms: vec![BusTerm::word(words[0]), BusTerm::word(words[1]), last],
+            mult: Vec::new(),
         };
         let bus = Bus {
             width: 3,
@@ -2539,6 +2540,234 @@ mod tests {
                 .fold(F128::ZERO, |acc, (&e, &w)| acc + e * w);
             assert_eq!(mle, c.value);
         }
+    }
+
+    // ---- bus multiplicities -------------------------------------------------
+
+    /// A lookup: type 1 is a table of four `(key, row)` entries, word 3 the
+    /// key, the row a row tag, words 4 and 5 the count's bits; types 0 and 2
+    /// request `(key, row)` from words (0, 1) and (6, 7).
+    fn lookup_circuit(reg: &Registry, mult: Vec<usize>) -> Circuit {
+        use bus::{Bus, BusDirection, BusPort, BusTerm, RowTag};
+        let index = RowTag {
+            offset: 0,
+            div: 1,
+            modulo: 0,
+        };
+        let request = |ty: usize, words: [usize; 2]| BusPort {
+            ty,
+            dir: BusDirection::Recv,
+            terms: vec![BusTerm::word(words[0]), BusTerm::word(words[1])],
+            mult: Vec::new(),
+        };
+        let bus = Bus {
+            width: 2,
+            ports: vec![
+                request(0, [0, 1]),
+                BusPort {
+                    ty: 1,
+                    dir: BusDirection::Send,
+                    terms: vec![BusTerm::word(3).plus(F128::new(9, 0)), BusTerm::row(index)],
+                    mult,
+                },
+                request(2, [6, 7]),
+            ],
+        };
+        Circuit::new(&reg.clone(), vec![3, 4, 6], 0, Vec::new())
+            .unwrap()
+            .with_bus(bus)
+            .expect("a valid bus")
+    }
+
+    /// Table keys, counts `counts`, and the nine requests spread over types 0
+    /// and 2 in a shuffled order.
+    fn lookup_buffer(circuit: &Circuit, reg: &Registry, counts: [u64; 4], rng: &mut Rng) -> Vec<F128> {
+        let cells = circuit.cells();
+        let mut packed = vec![F128::ZERO; 1usize << (reg.m_total() - 7)];
+        let keys: Vec<F128> = (0..4).map(|_| rng.f128()).collect();
+        let mut requests = Vec::new();
+        for (j, (&key, &m)) in keys.iter().zip(&counts).enumerate() {
+            packed[cells.gate_word_addr(3, j)] = key;
+            packed[cells.gate_word_addr(4, j)] = F128::new(m & 1, 0);
+            packed[cells.gate_word_addr(5, j)] = F128::new(m >> 1, 0);
+            requests.extend((0..m).map(|_| (key + F128::new(9, 0), F128::new(j as u64, 0))));
+        }
+        // Three rows of type 0, six of type 2, whatever the counts sum to.
+        let order = [4usize, 0, 7, 2, 8, 5, 1, 3, 6];
+        let mut at = order.iter().map(|&i| requests.get(i).copied().unwrap_or_default());
+        for (words, rows) in [([0usize, 1], 3usize), ([6, 7], 6)] {
+            for row in 0..rows {
+                let (k, j) = at.next().unwrap();
+                packed[cells.gate_word_addr(words[0], row)] = k;
+                packed[cells.gate_word_addr(words[1], row)] = j;
+            }
+        }
+        packed
+    }
+
+    /// A table row counted 1 to 3 times balances its requests; a count off by
+    /// one, a bit that is neither 0 nor 1, and a tampered proof value do not.
+    #[test]
+    fn bus_multiplicities_roundtrip_and_tamper() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let circuit = lookup_circuit(&reg, vec![4, 5]);
+        let mut rng = Rng::new(0xB05_0101);
+        let packed = lookup_buffer(&circuit, &reg, [3, 1, 2, 3], &mut rng);
+        let counted = circuit.bus().unwrap();
+        for j in 0..4 {
+            let m = bus::multiplicity(&counted.ports[1], j, |iota, j| {
+                packed[circuit.cells().gate_word_addr(iota, j)]
+            });
+            assert_eq!(m, Some([3, 1, 2, 3][j]));
+        }
+        roundtrip(&circuit, &packed, &[]).expect("a balanced lookup verifies");
+
+        let mut rng = Rng::new(0xB05_0101);
+        let off = lookup_buffer(&circuit, &reg, [3, 0, 2, 3], &mut rng);
+        assert!(roundtrip(&circuit, &off, &[]).is_err(), "a count off by one");
+
+        // Row 1 (counted 1) takes a high bit of x: the leaf is no power of f.
+        let mut bad = packed.clone();
+        bad[circuit.cells().gate_word_addr(5, 1)] = F128::new(2, 0);
+        assert!(roundtrip(&circuit, &bad, &[]).is_err(), "a bit that is not 0 or 1");
+
+        let once = lookup_circuit(&reg, Vec::new());
+        assert_ne!(once.digest(), circuit.digest(), "the counts bind the digest");
+
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, claims) = prove_wiring(&circuit, &packed, &[], &mut ch);
+        let mult = proof.bus.as_ref().unwrap().mult.as_ref().expect("the counts' sumcheck");
+        assert_eq!(mult.sums.len(), 2);
+        assert_eq!(mult.rounds.len(), nu);
+        assert_eq!(mult.bits.len(), 2);
+        let lens = [mult.sums.len(), mult.rounds.len(), mult.bits.len(), mult.words.len()];
+        let tampered = |edit: &dyn Fn(&mut bus::MultProof)| {
+            let mut bad = proof.clone();
+            edit(bad.bus.as_mut().unwrap().mult.as_mut().unwrap());
+            let mut ch = FsChallenger::new(b"circuit-unit");
+            verify_wiring(&circuit, &[], &bad, &mut ch)
+        };
+        for i in 0..lens[0] {
+            assert!(tampered(&|m| m.sums[i] += F128::ONE).is_err(), "sum {i}");
+        }
+        for i in 0..lens[1] {
+            for k in 0..3 {
+                assert!(tampered(&|m| m.rounds[i][k] += F128::ONE).is_err(), "round {i}.{k}");
+            }
+        }
+        for i in 0..lens[2] {
+            assert!(tampered(&|m| m.bits[i] += F128::ONE).is_err(), "bit {i}");
+        }
+        for i in 0..lens[3] {
+            assert!(tampered(&|m| m.words[i] += F128::ONE).is_err(), "word {i}");
+        }
+        assert_eq!(
+            tampered(&|m| {
+                m.words.pop();
+            }),
+            Err(WiringError::MalformedProof)
+        );
+        let mut missing = proof.clone();
+        missing.bus.as_mut().unwrap().mult = None;
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        assert_eq!(
+            verify_wiring(&circuit, &[], &missing, &mut ch),
+            Err(WiringError::MalformedProof)
+        );
+
+        // Every claim, the sumcheck's openings at r and at each σ_i among
+        // them, is its column's MLE.
+        for c in &claims[proof.gather.len()..] {
+            let eq = build_eq(&c.point);
+            let mle = eq
+                .iter()
+                .zip(&packed)
+                .fold(F128::ZERO, |acc, (&e, &w)| acc + e * w);
+            assert_eq!(mle, c.value);
+        }
+
+        let grinding = BatchedGrinding::per_challenge_128();
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, claims) = prove_wiring_with_grinding(&circuit, &packed, &[], grinding, &mut ch);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let out = verify_wiring_with_grinding(&circuit, &[], &proof, grinding, &mut ch)
+            .expect("a ground lookup verifies");
+        assert_eq!(out.len(), claims.len());
+    }
+
+    /// A count of 0 everywhere leaves the table out: an empty request side
+    /// balances it.
+    #[test]
+    fn bus_multiplicity_zero_leaves_rows_out() {
+        use bus::{Bus, BusDirection, BusPort, BusTerm};
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let circuit = Circuit::new(&reg, vec![0, 4, 0], 0, Vec::new())
+            .unwrap()
+            .with_bus(Bus {
+                width: 1,
+                ports: vec![
+                    BusPort {
+                        ty: 1,
+                        dir: BusDirection::Send,
+                        terms: vec![BusTerm::word(3)],
+                        mult: vec![4],
+                    },
+                    BusPort {
+                        ty: 0,
+                        dir: BusDirection::Recv,
+                        terms: vec![BusTerm::word(0)],
+                        mult: Vec::new(),
+                    },
+                ],
+            })
+            .expect("a valid bus");
+        let mut rng = Rng::new(0xB05_0102);
+        let mut packed = vec![F128::ZERO; 1usize << (reg.m_total() - 7)];
+        for j in 0..4 {
+            packed[circuit.cells().gate_word_addr(3, j)] = rng.f128();
+        }
+        roundtrip(&circuit, &packed, &[]).expect("nothing counted, nothing asked");
+        packed[circuit.cells().gate_word_addr(4, 2)] = F128::ONE;
+        assert!(roundtrip(&circuit, &packed, &[]).is_err(), "one row counted");
+    }
+
+    /// A port that sends and receives the same rows balances whatever its
+    /// bits hold, so only the bus's own zero check of `m² + m` rejects a bit
+    /// that is neither 0 nor 1.
+    #[test]
+    fn bus_multiplicity_bits_must_be_boolean() {
+        use bus::{Bus, BusDirection, BusPort, BusTerm};
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let port = |dir| BusPort {
+            ty: 1,
+            dir,
+            terms: vec![BusTerm::word(3)],
+            mult: vec![4, 5],
+        };
+        let circuit = Circuit::new(&reg, vec![0, 4, 0], 0, Vec::new())
+            .unwrap()
+            .with_bus(Bus {
+                width: 1,
+                ports: vec![port(BusDirection::Send), port(BusDirection::Recv)],
+            })
+            .expect("a valid bus");
+        let mut rng = Rng::new(0xB05_0103);
+        let mut packed = vec![F128::ZERO; 1usize << (reg.m_total() - 7)];
+        for j in 0..4 {
+            packed[circuit.cells().gate_word_addr(3, j)] = rng.f128();
+            packed[circuit.cells().gate_word_addr(4, j)] = F128::new(j as u64 & 1, 0);
+            packed[circuit.cells().gate_word_addr(5, j)] = F128::new(j as u64 >> 1, 0);
+        }
+        roundtrip(&circuit, &packed, &[]).expect("Boolean bits");
+        packed[circuit.cells().gate_word_addr(5, 2)] = rng.f128();
+        assert_eq!(
+            roundtrip(&circuit, &packed, &[]),
+            Err(WiringError::BusRecombination),
+            "the products balance, the zero check does not"
+        );
     }
 
     /// Pruning drops the unwired cell-slots from the wiring argument and its

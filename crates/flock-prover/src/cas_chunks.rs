@@ -304,7 +304,7 @@ mod tests {
             let c = ChunkCircuit::new(len, &opened, 1);
             let whole = crate::cas_typed::compressions(len.div_ceil(64));
             assert!(c.compressions < whole / 2, "{} of {whole}", c.compressions);
-            let proof = c.prove(&c.witness(&[key], &[b.clone()]));
+            let proof = c.prove(&c.witness(&[key], std::slice::from_ref(&b)));
             c.verify(&[key], &proof).expect("verifies");
             let mut other = key;
             other[0] ^= 1;

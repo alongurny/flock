@@ -433,7 +433,7 @@ pub struct ShapeBuilder {
     islands: Vec<(usize, usize)>,
     /// Tuple-bus ports by DECLARED slot, terms naming io-schema words;
     /// resolved to cell-slots in [`Self::finish`].
-    bus_ports: Vec<(usize, BusDirection, Vec<BusTerm>)>,
+    bus_ports: Vec<(usize, BusDirection, Vec<BusTerm>, Vec<usize>)>,
     /// See [`Self::prune_unwired`].
     prune_unwired: bool,
     /// See [`Self::open_public_columns`].
@@ -668,12 +668,30 @@ impl ShapeBuilder {
     /// each row sends (or receives) the tuple `terms`, whose words are indices
     /// into the gate's io schema. Every port of a circuit has the same width.
     pub fn bus_port(&mut self, slot: SlotId, dir: BusDirection, terms: Vec<BusTerm>) {
+        self.bus_port_counted(slot, dir, terms, Vec::new());
+    }
+
+    /// [`Self::bus_port`] where each row counts `Σ_i 2^i·m_i` times, the bits
+    /// `m_i` (least significant first) being io-schema indices of words that
+    /// hold 0 or 1 — the bus proves they do. A lookup table's supply side:
+    /// each entry once, with the number of requests.
+    pub fn bus_port_counted(
+        &mut self,
+        slot: SlotId,
+        dir: BusDirection,
+        terms: Vec<BusTerm>,
+        mult: Vec<usize>,
+    ) {
         let n_io = self.slots[slot.0].n_in() + self.slots[slot.0].n_out();
         assert!(
             terms.iter().all(|t| t.word.is_none_or(|k| k < n_io)),
             "a bus term names a word outside the gate's io schema"
         );
-        self.bus_ports.push((slot.0, dir, terms));
+        assert!(
+            mult.iter().all(|&k| k < n_io),
+            "a multiplicity bit names a word outside the gate's io schema"
+        );
+        self.bus_ports.push((slot.0, dir, terms, mult));
     }
 
     /// Open an independence island: the steps recorded until the matching
@@ -815,11 +833,11 @@ impl ShapeBuilder {
         if self.pack_live_slots {
             circuit = circuit.with_live_slots_packed();
         }
-        if let Some((_, _, first)) = self.bus_ports.first() {
+        if let Some((_, _, first, _)) = self.bus_ports.first() {
             let ports = self
                 .bus_ports
                 .iter()
-                .map(|(declared, dir, terms)| BusPort {
+                .map(|(declared, dir, terms, mult)| BusPort {
                     ty: registry_slot[*declared],
                     dir: *dir,
                     terms: terms
@@ -829,6 +847,7 @@ impl ShapeBuilder {
                             ..*t
                         })
                         .collect(),
+                    mult: mult.iter().map(|k| iota_base[*declared] + k).collect(),
                 })
                 .collect();
             let width = first.len();

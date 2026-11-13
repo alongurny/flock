@@ -259,6 +259,10 @@ pub(super) fn emit_bus(
     zassert: Wire,
 ) -> (Vec<Wire>, Vec<Wire>) {
     let bus = circuit.bus().expect("a bus region needs a bus");
+    assert!(
+        !bus.has_mult(),
+        "recursion does not carry bus multiplicities yet"
+    );
     let nu = circuit.cells().nu();
     let (cl_w, cr_w, pt_w) = emit_gkr_layers(
         sb, macs, zcr, &br.layers, br.top_v, br.top, trace, outs, wv, vals, zw, ow, zassert,
@@ -338,6 +342,10 @@ pub(super) fn pin_bus_sides(
         structure.rho_row,
         br.r_pt[..nu],
         "the bus columns sit at the walk's row point"
+    );
+    assert!(
+        !bus.has_mult(),
+        "recursion does not carry bus multiplicities yet"
     );
     let cols = bus.structure_columns();
     assert_eq!(structure.values.len(), cols.len(), "one value per column");

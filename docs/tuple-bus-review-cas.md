@@ -60,6 +60,15 @@ below, before a table can be read many times.
      table's leaf `∏_i (β + φ)^{2^i · m_i}`, the powers made by repeated
      squaring (a linear map in characteristic 2, so cheap in the GKR's
      leaves). The degree bound becomes `Σ m ≤ N`, unchanged in order.
+   - **Done (2026-11-13):** `BusPort::mult` and
+     `ShapeBuilder::bus_port_counted`. Each bit is its own group, with leaf
+     `1 + m_i·(1 + f^{2^i})`. That leaf is not affine in the words, so the
+     prover sends each group's sum and proves them, with a zero check that
+     every bit is 0 or 1, in one degree-3 sumcheck. Its end needs
+     `f^{2^i}` at `r`, which is `f̂(r^{2^{-i}})^{2^i}` (Frobenius fixes the
+     cube), so the words are opened at `r^{2^{-i}}`. The module docs of
+     `flock-core/src/circuit/bus.rs` have the argument. Recursion does not
+     carry it yet (finding 4).
 3. **Keys are two coordinates.** A BLAKE3 key is 256 bits: two GF(2^128)
    coordinates, each with its own `γ`. Fine with per-coordinate challenges;
    do not pack a key into one coordinate by a power of one challenge.
@@ -74,6 +83,6 @@ below, before a table can be read many times.
 ## Decision
 
 Use the bus for cas's chunk-path rows (one-to-one, finding 2 does not bite),
-with tags in their own coordinates. Add multiplicities (finding 2) before
-the Lean table checker. A prover with an established lookup is not needed
+with tags in their own coordinates. Multiplicities (finding 2) are in, for
+the Lean table checker and cas's key lookup. A prover with an established lookup is not needed
 for either.
