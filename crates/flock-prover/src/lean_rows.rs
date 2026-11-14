@@ -27,6 +27,8 @@
 
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
+use serde::{Deserialize, Serialize};
+
 use flock_core::{
     challenger::FsChallenger,
     circuit::{
@@ -49,8 +51,12 @@ use crate::prover::{
     UnionElementSlotInput, commit_ligerito_union_circuit, prove_fast_ligerito_union_circuit,
 };
 
-/// Tuple width: tag, id, kind, four fields, rank.
-const W: usize = 8;
+/// Tuple width: tag, id, kind, four fields, rank, and a judgement's owner
+/// (the order of the declaration whose check it belongs to).
+const W: usize = 9;
+
+/// A tuple on the bus, as `(lo, hi)` words: how counts are keyed.
+pub type Tuple = [(u64, u64); W];
 
 /// The generator of the exponent encodings: `x`, primitive in this field
 /// (see the test).
@@ -86,6 +92,8 @@ const TAG_TERM: u64 = 1;
 const TAG_FACT: u64 = 2;
 const TAG_DECL: u64 = 3;
 const TAG_RANGE: u64 = 4;
+// TAG_RANGE + 1 is the second limb's table.
+const TAG_CHECKED: u64 = 6;
 // Term kinds.
 const K_BVAR: u64 = 1;
 const K_LEAF: u64 = 2;
@@ -112,7 +120,7 @@ const F_LEQ: u64 = 7;
 // ---------------------------------------------------------------- the data
 
 /// A value and, for the exponent encodings, its exponent.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 struct V {
     f: F128,
     e: i64,
@@ -125,7 +133,7 @@ fn ve(e: i64) -> V {
     V { f: gp(e), e }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct TermRec {
     kind: u64,
     /// Parts: a bound variable's `g^j`; a leaf's kind and payload; children.
@@ -136,14 +144,32 @@ struct TermRec {
     rank: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct DeclRec {
     unfold: u64,
     levels: u64,
     value: Option<usize>,
+    /// The declared type, its kind (`DeclKind` from 1), the first 16 bytes
+    /// of its key, and its order (position in the export).
+    ty: Option<usize>,
+    kind: u64,
+    key: (u64, u64),
+    order: i64,
+    /// Whether a goal of this proof checks it.
+    checked: bool,
 }
 
-#[derive(Clone, Debug)]
+/// A declaration's goal: its row and the judgements that establish it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GoalRec {
+    decl: usize,
+    /// `Infer([], ty, s)` and `Eq([], s, sort u)`.
+    ty: (usize, usize),
+    /// `Infer([], value, t)` and `Eq([], t, ty)`.
+    value: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct FactRec {
     rule: String,
     tag: u64,
@@ -153,13 +179,33 @@ struct FactRec {
     is_term: [bool; 4],
     premises: Vec<usize>,
     rank: i64,
+    /// The order of the declaration whose check this judgement is part of.
+    owner: i64,
 }
 
-/// A parsed derivation.
+/// A parsed derivation, or (in cone mode) the shared terms and
+/// declarations of many, or one batch's judgements and goals over them.
+#[derive(Default, Serialize, Deserialize)]
 pub struct Rows {
     terms: Vec<TermRec>,
     decls: Vec<DeclRec>,
     facts: Vec<FactRec>,
+    goals: Vec<GoalRec>,
+    /// Limb width for every table, when fixed for a whole cone.
+    limb: Option<usize>,
+    /// The file's own level, list and context rows (local ids), kept only
+    /// to put them in a cone's shared numbering.
+    #[serde(skip)]
+    local: Local,
+}
+
+#[derive(Default)]
+struct Local {
+    levels: Vec<(u8, u64, u64)>,
+    lists: Vec<Option<(u64, u64)>>,
+    ctxs: Vec<Option<(u64, u64)>>,
+    /// The canonical number of each declaration row.
+    decl_no: Vec<u64>,
 }
 
 impl Rows {
@@ -168,6 +214,8 @@ impl Rows {
         let mut decl_at: HashMap<u64, usize> = HashMap::new();
         let mut decls = Vec::new();
         let mut facts = Vec::new();
+        let mut local = Local::default();
+        let mut goal_line: Option<((u64, u64), Vec<i64>)> = None;
         for line in text.lines() {
             let w: Vec<&str> = line.split_whitespace().collect();
             let n = |i: usize| -> Result<u64, String> {
@@ -177,6 +225,27 @@ impl Rows {
                     .map_err(|e| format!("{e}: {line}"))
             };
             match w.first().copied() {
+                Some("L") => {
+                    let row = match w[2] {
+                        "zero" => (0, 0, 0),
+                        "succ" => (1, n(3)?, 0),
+                        "max" => (2, n(3)?, n(4)?),
+                        "imax" => (3, n(3)?, n(4)?),
+                        _ => (4, n(3)?, 0),
+                    };
+                    local.levels.push(row);
+                }
+                Some("S") => local.lists.push((w[2] == "cons").then(|| (n(3).unwrap(), n(4).unwrap()))),
+                Some("C") => local.ctxs.push((w[2] == "push").then(|| (n(3).unwrap(), n(4).unwrap()))),
+                Some("G") => {
+                    goal_line = Some((
+                        (n(1)?, n(2)?),
+                        w[3..]
+                            .iter()
+                            .map(|x| x.parse::<i64>().map_err(|e| format!("{e}: {line}")))
+                            .collect::<Result<_, _>>()?,
+                    ))
+                }
                 Some("T") => {
                     if n(1)? as usize != terms.len() {
                         return Err(format!("terms out of order: {line}"));
@@ -257,10 +326,17 @@ impl Rows {
                 Some("D") => {
                     let v: i64 = w[4].parse().map_err(|e| format!("{e}: {line}"))?;
                     decl_at.insert(n(1)?, decls.len());
+                    local.decl_no.push(n(1)?);
+                    let more = w.len() >= 10;
                     decls.push(DeclRec {
                         unfold: n(2)?,
                         levels: n(3)?,
                         value: (v >= 0).then_some(v as usize),
+                        ty: if more { Some(n(8)? as usize) } else { None },
+                        kind: if more { n(7)? } else { 0 },
+                        key: if more { (n(5)?, n(6)?) } else { (0, 0) },
+                        order: if more { w[9].parse().map_err(|e| format!("{e}: {line}"))? } else { 0 },
+                        checked: false,
                     });
                 }
                 Some("F") => {
@@ -304,6 +380,7 @@ impl Rows {
                         is_term,
                         premises,
                         rank,
+                        owner: 0,
                     });
                 }
                 _ => {}
@@ -320,21 +397,59 @@ impl Rows {
                 t.x[0] = vi(*decl_at.get(&c).ok_or(format!("no declaration {c}"))? as u64);
             }
         }
+        // The goal: the declaration checked, by key among the cited rows or
+        // as a row of its own, and every judgement's owner.
+        let mut goals = Vec::new();
+        if let Some((key, g)) = goal_line {
+            let [kind, levels, ty, value, ti, te, vi_, ve_, _prop, order, _empty] = g[..] else {
+                return Err(format!("a goal row of {} fields", g.len() + 2));
+            };
+            let decl = match decls.iter().position(|d| d.key == key) {
+                Some(i) => i,
+                None => {
+                    decls.push(DeclRec {
+                        unfold: matches!(kind, 2 | 3) as u64,
+                        levels: levels as u64,
+                        value: (value >= 0).then_some(value as usize),
+                        ty: Some(ty as usize),
+                        kind: kind as u64,
+                        key,
+                        order,
+                        checked: false,
+                    });
+                    local.decl_no.push(u64::MAX);
+                    decls.len() - 1
+                }
+            };
+            decls[decl].checked = true;
+            for f in &mut facts {
+                f.owner = order;
+            }
+            let fact = |i: i64| -> Result<usize, String> {
+                (i >= 0 && (i as usize) < facts.len())
+                    .then_some(i as usize)
+                    .ok_or(format!("a goal names fact {i}"))
+            };
+            goals.push(GoalRec {
+                decl,
+                ty: (fact(ti)?, fact(te)?),
+                value: if vi_ >= 0 { Some((fact(vi_)?, fact(ve_)?)) } else { None },
+            });
+        }
         Ok(Rows {
             terms,
             decls,
             facts,
+            goals,
+            limb: None,
+            local,
         })
     }
 
     /// Several derivations as one: indices shifted, nothing shared (levels,
     /// lists and contexts stay opaque numbers).
     pub fn merge(parts: Vec<Rows>) -> Rows {
-        let mut m = Rows {
-            terms: Vec::new(),
-            decls: Vec::new(),
-            facts: Vec::new(),
-        };
+        let mut m = Rows::default();
         for p in parts {
             let (nt, nd, nf) = (m.terms.len(), m.decls.len(), m.facts.len());
             for mut t in p.terms {
@@ -351,7 +466,14 @@ impl Rows {
             }
             for mut d in p.decls {
                 d.value = d.value.map(|v| v + nt);
+                d.ty = d.ty.map(|v| v + nt);
                 m.decls.push(d);
+            }
+            for mut g in p.goals {
+                g.decl += nd;
+                g.ty = (g.ty.0 + nf, g.ty.1 + nf);
+                g.value = g.value.map(|(a, b)| (a + nf, b + nf));
+                m.goals.push(g);
             }
             for mut f in p.facts {
                 for x in 0..4 {
@@ -399,6 +521,8 @@ enum Part {
     X(usize),
     L,
     R,
+    /// A judgement's owner, `g^order`.
+    O,
 }
 
 #[derive(Clone, Debug)]
@@ -425,6 +549,8 @@ enum Src {
     Bit,
     /// The range table's value at this row.
     RangeV(usize),
+    /// A value the verifier is given (a public word).
+    Pub(E),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -459,6 +585,12 @@ struct Spec {
     name: String,
     cols: Vec<(Col, Option<Src>)>,
     ports: Vec<Port>,
+    /// A judgement table's owner column.
+    owner: Option<usize>,
+}
+
+fn pad<const N: usize>(t: [T; N]) -> [T; W] {
+    std::array::from_fn(|i| if i < N { t[i] } else { Z })
 }
 
 /// An element table whose columns are inputs or products of earlier ones.
@@ -569,6 +701,7 @@ impl Spec {
             name: name.into(),
             cols: Vec::new(),
             ports: Vec::new(),
+            owner: None,
         }
     }
     fn src(&mut self, s: Src) -> usize {
@@ -582,17 +715,17 @@ impl Spec {
         self.cols.push((c, None));
         self.cols.len() - 1
     }
-    fn recv(&mut self, t: [T; W]) {
+    fn recv<const N: usize>(&mut self, t: [T; N]) {
         self.ports.push(Port {
             send: false,
-            t,
+            t: pad(t),
             mult: Vec::new(),
         });
     }
-    fn send(&mut self, t: [T; W]) {
+    fn send<const N: usize>(&mut self, t: [T; N]) {
         self.ports.push(Port {
             send: true,
-            t,
+            t: pad(t),
             mult: Vec::new(),
         });
     }
@@ -638,6 +771,7 @@ impl Spec {
             .map(|i| x[i].unwrap_or_else(|| T::C(self.val(E::Prem(j, Part::X(i))))))
             .collect();
         let pr = self.val(E::Prem(j, Part::R));
+        let o = self.owner.expect("a judgement table");
         self.recv([
             k(TAG_FACT),
             T::C(id),
@@ -647,6 +781,7 @@ impl Spec {
             x[2],
             x[3],
             T::C(pr),
+            T::C(o),
         ]);
         if ablate("RANK") {
             return [x[0], x[1], x[2], x[3]];
@@ -668,9 +803,23 @@ fn tc(i: usize) -> T {
 enum Of {
     Range(usize),
     Term(u64),
-    Decl,
+    /// Cited declarations: checked by a goal of this proof, members of
+    /// inductive blocks (no value, never unfolded), or free (assumed).
+    DeclChecked,
+    DeclBlock,
+    DeclFree,
     Fact(&'static str),
     Assumed,
+    /// A declaration's goal, with or without a value.
+    Goal(bool),
+}
+
+impl Of {
+    /// Whether the table belongs to the shared part of a cone (terms and
+    /// declarations) rather than to a batch of judgements.
+    fn shared(self) -> bool {
+        matches!(self, Of::Term(_) | Of::DeclChecked | Of::DeclBlock | Of::DeclFree)
+    }
 }
 
 fn spec(of: Of) -> Spec {
@@ -690,10 +839,54 @@ fn spec(of: Of) -> Spec {
             ]);
             s
         }
-        Of::Decl => {
-            let mut s = Spec::new("decl");
-            let x: Vec<usize> = (0..3).map(|i| s.val(E::Own(Part::X(i)))).collect();
-            s.send([k(TAG_DECL), T::Id, tc(x[0]), tc(x[1]), tc(x[2]), Z, Z, Z]);
+        Of::DeclChecked | Of::DeclBlock | Of::DeclFree => {
+            let mut s = Spec::new(match of {
+                Of::DeclChecked => "decl_checked",
+                Of::DeclBlock => "decl_block",
+                _ => "decl_free",
+            });
+            let x: Vec<usize> = (0..4).map(|i| s.val(E::Own(Part::X(i)))).collect();
+            let o = s.val(E::Own(Part::R));
+            // The key, public: which declarations the proof checks or assumes.
+            s.src(Src::Pub(E::Own(Part::X(4))));
+            s.src(Src::Pub(E::Own(Part::X(5))));
+            let (unfold, value) = match of {
+                Of::DeclBlock => (Z, Z),
+                _ => (tc(x[0]), tc(x[2])),
+            };
+            if of == Of::DeclChecked {
+                s.recv([k(TAG_CHECKED), T::Id, tc(x[1]), tc(x[3]), tc(x[2]), tc(o)]);
+            }
+            s.send([k(TAG_DECL), T::Id, unfold, tc(x[1]), value, tc(x[3]), tc(o)]);
+            s
+        }
+        Of::Goal(with_value) => {
+            let mut s = Spec::new(if with_value { "goal" } else { "goal_ax" });
+            let own = |p| E::Own(p);
+            let (d, lv, ty) = (s.val(own(Part::X(0))), s.val(own(Part::X(1))), s.val(own(Part::X(3))));
+            let o = s.val(own(Part::R));
+            // A premise in the empty context (id 0), owned by this goal.
+            let fact = |s: &mut Spec, j: usize, tag: u64, x: [T; 4]| {
+                let id = s.val(E::Prem(j, Part::Id));
+                let r = s.val(E::Prem(j, Part::R));
+                s.recv([k(TAG_FACT), tc(id), k(tag), x[0], x[1], x[2], x[3], tc(r), tc(o)]);
+            };
+            let sv = s.val(E::Prem(0, Part::X(2)));
+            let su = s.val(E::Prem(1, Part::X(2)));
+            fact(&mut s, 0, F_INFER, [Z, tc(ty), tc(sv), Z]);
+            fact(&mut s, 1, F_EQ, [Z, tc(sv), tc(su), Z]);
+            let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
+            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), Some(tc(u)), Some(Z)], None);
+            let v = if with_value {
+                let v = s.val(own(Part::X(2)));
+                let t = s.val(E::Prem(2, Part::X(2)));
+                fact(&mut s, 2, F_INFER, [Z, tc(v), tc(t), Z]);
+                fact(&mut s, 3, F_EQ, [Z, tc(t), tc(ty), Z]);
+                tc(v)
+            } else {
+                Z
+            };
+            s.send([k(TAG_CHECKED), tc(d), tc(lv), tc(ty), v, tc(o)]);
             s
         }
         Of::Term(kind) => term_spec(kind),
@@ -702,6 +895,7 @@ fn spec(of: Of) -> Spec {
             let tag = s.val(E::Own(Part::Kind));
             let x: Vec<usize> = (0..4).map(|i| s.val(E::Own(Part::X(i)))).collect();
             let r = s.val(E::Own(Part::R));
+            let o = s.val(E::Own(Part::O));
             s.send([
                 k(TAG_FACT),
                 T::Id,
@@ -711,6 +905,7 @@ fn spec(of: Of) -> Spec {
                 tc(x[2]),
                 tc(x[3]),
                 tc(r),
+                tc(o),
             ]);
             s
         }
@@ -781,10 +976,16 @@ fn fact_spec(rule: &str) -> Spec {
     let mut s = Spec::new(rule);
     let own = |p| E::Own(p);
     let r = s.val(own(Part::R));
+    let o = s.val(own(Part::O));
+    s.owner = Some(o);
     let fld = |s: &mut Spec, i: usize| s.val(own(Part::X(i)));
     let one = T::K(F128::ONE);
     let send = |s: &mut Spec, tag: u64, x: [T; 4]| {
-        s.send([k(TAG_FACT), T::Id, k(tag), x[0], x[1], x[2], x[3], tc(r)])
+        s.send([k(TAG_FACT), T::Id, k(tag), x[0], x[1], x[2], x[3], tc(r), tc(o)])
+    };
+    // A citation names an earlier declaration: owner ≥ order + 1.
+    let earlier = |s: &mut Spec, ord: usize, tr: TR| {
+        s.ge(o, E::Own(Part::O), ord, E::Dcl(tr, Part::R), 1);
     };
     // The term in judgement field i, and its children.
     let f = |i: usize| TR::Fld(i);
@@ -845,17 +1046,42 @@ fn fact_spec(rule: &str) -> Spec {
                 s.val(E::Tm(f(1), Part::X(2))),
             );
             s.term(a, f(1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
+            let ty = s.val(E::Dcl(f(1), Part::X(3)));
+            let ord = s.val(E::Dcl(f(1), Part::R));
             if rule == "Delta0" {
-                s.recv([k(TAG_DECL), tc(d), one, Z, tc(b), Z, Z, Z]);
+                s.recv([k(TAG_DECL), tc(d), one, Z, tc(b), tc(ty), tc(ord)]);
             } else {
                 let (lv, v) = (
                     s.val(E::Dcl(f(1), Part::X(1))),
                     s.val(E::Dcl(f(1), Part::X(2))),
                 );
-                s.recv([k(TAG_DECL), tc(d), one, tc(lv), tc(v), Z, Z, Z]);
+                s.recv([k(TAG_DECL), tc(d), one, tc(lv), tc(v), tc(ty), tc(ord)]);
                 s.prem(0, F_LINST, [c(v), c(ls), c(b), Some(Z)], r);
             }
+            earlier(&mut s, ord, f(1));
             send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
+        "Const0" | "ConstL" => {
+            let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (d, ls) = (
+                s.val(E::Tm(f(1), Part::X(1))),
+                s.val(E::Tm(f(1), Part::X(2))),
+            );
+            s.term(e, f(1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
+            let unf = s.val(E::Dcl(f(1), Part::X(0)));
+            let v = s.val(E::Dcl(f(1), Part::X(2)));
+            let ord = s.val(E::Dcl(f(1), Part::R));
+            if rule == "Const0" {
+                // No level parameters: the type is the declared one.
+                s.recv([k(TAG_DECL), tc(d), tc(unf), Z, tc(v), tc(t), tc(ord)]);
+            } else {
+                let lv = s.val(E::Dcl(f(1), Part::X(1)));
+                let ty = s.val(E::Dcl(f(1), Part::X(3)));
+                s.recv([k(TAG_DECL), tc(d), tc(unf), tc(lv), tc(v), tc(ty), tc(ord)]);
+                s.prem(0, F_LINST, [c(ty), c(ls), c(t), Some(Z)], r);
+            }
+            earlier(&mut s, ord, f(1));
+            send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
         "App" => {
             let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
@@ -929,7 +1155,7 @@ fn fact_spec(rule: &str) -> Spec {
 }
 
 /// The table a judgement row goes to.
-fn table_of(rows: &Rows, i: usize) -> Of {
+fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     let f = &rows.facts[i];
     let r = match f.rule.as_str() {
         "Refl" => "Refl",
@@ -941,10 +1167,12 @@ fn table_of(rows: &Rows, i: usize) -> Of {
         "InstClosed" => "InstClosed",
         "InstHit" => "InstHit",
         "InstApp" => "InstApp",
+        "Const" if f.premises.is_empty() => "Const0",
+        "Const" => "ConstL",
         "Delta" if f.premises.is_empty() => "Delta0",
         "Delta" => "DeltaL",
         "InstBind" => {
-            if rows.terms[f.raw[0] as usize].kind == K_LAM {
+            if g.terms[f.raw[0] as usize].kind == K_LAM {
                 "InstLam"
             } else {
                 "InstPi"
@@ -955,7 +1183,9 @@ fn table_of(rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 14] = [
+const FACT_TABLES: [&str; 16] = [
+    "Const0",
+    "ConstL",
     "Refl",
     "Symm",
     "Trans",
@@ -971,6 +1201,19 @@ const FACT_TABLES: [&str; 14] = [
     "DeltaL",
     "Assumed",
 ];
+
+/// Which tables a build fills: all of a derivation's, or one side of a
+/// cone (the shared terms and declarations, or a batch's judgements).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Whole,
+    Shared,
+    Batch,
+}
+
+/// The shared side of a cone starts at this chunk, so no term has id 0
+/// (which stands for "no value").
+pub const SHARED_BASE: usize = 1;
 
 /// A derivation laid out as tables, ready to prove.
 pub struct LeanCircuit {
@@ -1022,12 +1265,36 @@ impl LeanCircuit {
     /// Chunk numbers start at `base`, so derivations built at disjoint
     /// bases have disjoint row tags and can share one bus.
     pub fn build_at(rows: &Rows, strict: bool, base: usize) -> Result<LeanCircuit, String> {
+        let (c, left) = Self::build_side(rows, rows, Side::Whole, base, &HashMap::new())?;
+        if let Some((t, n)) = left.iter().next().filter(|_| strict) {
+            return Err(format!(
+                "{} tuples asked for but never given, e.g. {t:?} ({n} times)",
+                left.len()
+            ));
+        }
+        Ok(c)
+    }
+
+    /// Lays out the tables of `shared` (terms, declarations) and `batch`
+    /// (judgements, goals), and fills those of `side`: both for a whole
+    /// derivation, or one side of a cone, where the shared side is built
+    /// once at chunk base [`SHARED_BASE`] and each batch at its own base.
+    /// `outside` counts tuples the other side asks for; returns the tuples
+    /// this side asks for and does not give.
+    pub fn build_side(
+        g: &Rows,
+        b: &Rows,
+        side: Side,
+        base: usize,
+        outside: &HashMap<Tuple, u64>,
+    ) -> Result<(LeanCircuit, HashMap<Tuple, u64>), String> {
         let t0 = Instant::now();
         // Tables and which rows go to each.
-        let mut ofs: Vec<Of> = vec![Of::Range(0), Of::Range(1), Of::Decl];
+        let mut ofs: Vec<Of> = vec![Of::Range(0), Of::Range(1)];
         for kd in [K_BVAR, K_LEAF, K_APP, K_LAM, K_PI, K_LET, K_PROJ] {
             ofs.push(Of::Term(kd));
         }
+        ofs.extend([Of::DeclChecked, Of::DeclBlock, Of::DeclFree]);
         for r in FACT_TABLES {
             ofs.push(if r == "Assumed" {
                 Of::Assumed
@@ -1035,34 +1302,56 @@ impl LeanCircuit {
                 Of::Fact(r)
             });
         }
+        ofs.extend([Of::Goal(true), Of::Goal(false)]);
         let at = |of: Of| ofs.iter().position(|&o| o == of).unwrap();
         let mut members: Vec<Vec<usize>> = vec![Vec::new(); ofs.len()];
-        let mut term_at = vec![(0usize, 0usize); rows.terms.len()];
-        for (i, t) in rows.terms.iter().enumerate() {
+        let mut term_at = vec![(0usize, 0usize); g.terms.len()];
+        for (i, t) in g.terms.iter().enumerate() {
             let s = at(Of::Term(t.kind));
             term_at[i] = (s, members[s].len());
             members[s].push(i);
         }
-        let mut fact_at = vec![(0usize, 0usize); rows.facts.len()];
-        for i in 0..rows.facts.len() {
-            let s = at(table_of(rows, i));
+        let mut decl_at = vec![(0usize, 0usize); g.decls.len()];
+        for (i, d) in g.decls.iter().enumerate() {
+            let s = at(if d.checked {
+                Of::DeclChecked
+            } else if d.kind >= 5 {
+                Of::DeclBlock
+            } else {
+                Of::DeclFree
+            });
+            decl_at[i] = (s, members[s].len());
+            members[s].push(i);
+        }
+        let mut fact_at = vec![(0usize, 0usize); b.facts.len()];
+        for i in 0..b.facts.len() {
+            let s = at(table_of(g, b, i));
             fact_at[i] = (s, members[s].len());
             members[s].push(i);
         }
-        let ds = at(Of::Decl);
-        members[ds] = (0..rows.decls.len()).collect();
-        // Range limbs wide enough for every rank and bound: 2^(2L) > span.
-        let span = rows
-            .facts
-            .iter()
-            .map(|f| f.rank)
-            .chain(rows.terms.iter().map(|t| t.rank + t.lbr))
-            .max()
-            .unwrap_or(0);
-        let limb = ((((span + 2) as f64).log2() / 2.0).ceil() as usize).max(4);
+        for (i, goal) in b.goals.iter().enumerate() {
+            members[at(Of::Goal(goal.value.is_some()))].push(i);
+        }
+        // Range limbs wide enough for every rank, bound and order: 2^(2L) > span.
+        let limb = g.limb.unwrap_or_else(|| {
+            let span = b
+                .facts
+                .iter()
+                .map(|f| f.rank.max(f.owner))
+                .chain(g.terms.iter().map(|t| t.rank + t.lbr))
+                .chain(g.decls.iter().map(|d| d.order + 1))
+                .max()
+                .unwrap_or(0);
+            ((((span + 2) as f64).log2() / 2.0).ceil() as usize).max(4)
+        });
         for l in 0..2 {
             members[at(Of::Range(l))] = (0..1usize << limb).collect();
         }
+        let mine = |s: usize| match (side, ofs[s]) {
+            (Side::Whole, _) | (_, Of::Range(_)) => true,
+            (Side::Shared, o) => o.shared(),
+            (Side::Batch, o) => !o.shared(),
+        };
         // The capacity 2^nu of every slot: a table takes as many slots as it
         // needs, so pick the nu that wastes least (padded width times rows,
         // plus each port's group of 2^nu), counting each slot's fixed cost
@@ -1076,34 +1365,70 @@ impl LeanCircuit {
                 ((sp.cols.len() + 16).next_power_of_two(), sp.ports.len())
             })
             .collect();
-        let cost = |nu: usize| -> usize {
-            members
-                .iter()
-                .zip(&widths)
-                .map(|(m, &(w, p))| m.len().div_ceil(1 << nu) * (((w + 4 * p) << nu) + (1 << 17)))
-                .sum()
+        // A layout: the nu of some tables and each one's first chunk.
+        let layout = |which: &dyn Fn(usize) -> bool, base: usize| -> (usize, Vec<usize>) {
+            let cost = |nu: usize| -> usize {
+                (0..ofs.len())
+                    .filter(|&s| which(s))
+                    .map(|s| {
+                        let (w, p) = widths[s];
+                        members[s].len().div_ceil(1 << nu) * (((w + 4 * p) << nu) + (1 << 17))
+                    })
+                    .sum()
+            };
+            let nu = std::env::var("LEAN_ROWS_NU")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| (8..=22).min_by_key(|&nu| cost(nu)).unwrap());
+            let mut chunk_base = vec![0; ofs.len()];
+            let mut n = base;
+            for s in (0..ofs.len()).filter(|&s| which(s)) {
+                chunk_base[s] = n;
+                n += members[s].len().div_ceil(1 << nu);
+            }
+            (nu, chunk_base)
         };
-        let nu = std::env::var("LEAN_ROWS_NU")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| (8..=22).min_by_key(|&nu| cost(nu)).unwrap());
-        let mask = (1usize << nu) - 1;
-        let mut chunk_base = Vec::with_capacity(ofs.len());
-        let mut n_slots = base;
-        for m in &members {
-            chunk_base.push(n_slots);
-            n_slots += m.len().div_ceil(1 << nu);
-        }
-        let chunk_base = &chunk_base;
-        let id = move |s: usize, j: usize| {
-            int((((chunk_base[s] + (j >> nu)) as u64) << 32) + (j & mask) as u64)
+        let is_shared = |s: usize| ofs[s].shared() || matches!(ofs[s], Of::Range(_));
+        let is_batch = |s: usize| !ofs[s].shared();
+        // Ids of the shared tables come from the shared layout; a batch's
+        // own from its layout.
+        let (whole, shared_l, batch_l) = match side {
+            Side::Whole => {
+                let l = layout(&|_| true, base);
+                (Some(l), None, None)
+            }
+            Side::Shared => (None, Some(layout(&is_shared, base)), None),
+            Side::Batch => (
+                None,
+                Some(layout(&is_shared, SHARED_BASE)),
+                Some(layout(&is_batch, base)),
+            ),
+        };
+        let lay_of = |s: usize| -> &(usize, Vec<usize>) {
+            if let Some(l) = &whole {
+                l
+            } else if ofs[s].shared() {
+                shared_l.as_ref().unwrap()
+            } else {
+                batch_l.as_ref().or(shared_l.as_ref()).unwrap()
+            }
+        };
+        let id = |s: usize, j: usize| {
+            let (nu, cb) = lay_of(s);
+            int((((cb[s] + (j >> nu)) as u64) << 32) + (j & ((1usize << nu) - 1)) as u64)
+        };
+        let (nu, chunk_base) = match side {
+            Side::Whole => whole.clone().unwrap(),
+            Side::Shared => shared_l.clone().unwrap(),
+            Side::Batch => batch_l.clone().unwrap(),
         };
         let term_id = |i: usize| id(term_at[i].0, term_at[i].1);
         let fact_id = |i: usize| id(fact_at[i].0, fact_at[i].1);
-        let decl_id = |i: usize| id(ds, i);
+        let decl_id = |i: usize| id(decl_at[i].0, decl_at[i].1);
+        let opt_term = |t: Option<usize>| t.map_or(F128::ZERO, term_id);
         // Fact fields as encoded values.
         let field = |i: usize, x: usize| -> V {
-            let f = &rows.facts[i];
+            let f = &b.facts[i];
             if f.is_term[x] {
                 V {
                     f: term_id(f.raw[x] as usize),
@@ -1116,7 +1441,7 @@ impl LeanCircuit {
             }
         };
         let term_part = |i: usize, p: Part| -> V {
-            let t = &rows.terms[i];
+            let t = &g.terms[i];
             match p {
                 Part::Id => V {
                     f: term_id(i),
@@ -1140,77 +1465,97 @@ impl LeanCircuit {
                 },
                 Part::L => ve(t.lbr),
                 Part::R => ve(t.rank),
+                Part::O => unreachable!(),
             }
         };
-        let resolve = |tr: &TR, own: usize, is_fact: bool| -> usize {
-            fn go(tr: &TR, own: usize, is_fact: bool, rows: &Rows) -> usize {
-                match tr {
-                    TR::Own => own,
-                    TR::Fld(x) => {
-                        assert!(is_fact);
-                        rows.facts[own].raw[*x] as usize
-                    }
-                    TR::PFld(j, x) => rows.facts[rows.facts[own].premises[*j]].raw[*x] as usize,
-                    TR::Child(t, c) => {
-                        rows.terms[go(t, own, is_fact, rows)].child[*c].expect("a child")
+        let decl_part = |i: usize, p: Part| -> V {
+            let d = &g.decls[i];
+            match p {
+                Part::Id => V {
+                    f: decl_id(i),
+                    e: 0,
+                },
+                Part::X(0) => vi(d.unfold),
+                Part::X(1) => vi(d.levels),
+                Part::X(2) => V {
+                    f: opt_term(d.value),
+                    e: 0,
+                },
+                Part::X(3) => V {
+                    f: opt_term(d.ty),
+                    e: 0,
+                },
+                Part::X(4) => vi(d.key.0),
+                Part::X(5) => vi(d.key.1),
+                Part::R => ve(d.order),
+                _ => unreachable!(),
+            }
+        };
+        // Premise `j` of a row: a judgement's, or a goal's facts in order.
+        let prem_of = |of: Of, own: usize, j: usize| -> usize {
+            match of {
+                Of::Goal(_) => {
+                    let gl = &b.goals[own];
+                    match j {
+                        0 => gl.ty.0,
+                        1 => gl.ty.1,
+                        2 => gl.value.unwrap().0,
+                        _ => gl.value.unwrap().1,
                     }
                 }
+                _ => b.facts[own].premises[j],
             }
-            go(tr, own, is_fact, rows)
+        };
+        let resolve = |tr: &TR, own: usize, of: Of| -> usize {
+            fn go(
+                tr: &TR,
+                own: usize,
+                of: Of,
+                g: &Rows,
+                b: &Rows,
+                prem_of: &dyn Fn(Of, usize, usize) -> usize,
+            ) -> usize {
+                match tr {
+                    TR::Own => own,
+                    TR::Fld(x) => b.facts[own].raw[*x] as usize,
+                    TR::PFld(j, x) => b.facts[prem_of(of, own, *j)].raw[*x] as usize,
+                    TR::Child(t, c) => g.terms[go(t, own, of, g, b, prem_of)].child[*c].expect("a child"),
+                }
+            }
+            go(tr, own, of, g, b, &prem_of)
+        };
+        let fact_part = |q: usize, p: Part| -> V {
+            match p {
+                Part::Id => V {
+                    f: fact_id(q),
+                    e: 0,
+                },
+                Part::Kind => vi(b.facts[q].tag),
+                Part::X(x) => field(q, x),
+                Part::R => ve(b.facts[q].rank),
+                Part::O => ve(b.facts[q].owner),
+                Part::L => unreachable!(),
+            }
         };
         let eval = |e: &E, of: Of, own: usize| -> V {
-            let is_fact = matches!(of, Of::Fact(_) | Of::Assumed);
             match e {
                 E::Own(p) => match of {
                     Of::Term(_) => term_part(own, *p),
-                    Of::Decl => {
-                        let d = &rows.decls[own];
+                    Of::DeclChecked | Of::DeclBlock | Of::DeclFree => decl_part(own, *p),
+                    Of::Goal(_) => {
+                        let d = b.goals[own].decl;
                         match p {
-                            Part::X(0) => vi(d.unfold),
-                            Part::X(1) => vi(d.levels),
-                            Part::X(2) => V {
-                                f: d.value.map_or(F128::ZERO, term_id),
-                                e: 0,
-                            },
-                            _ => unreachable!(),
+                            Part::X(0) => decl_part(d, Part::Id),
+                            _ => decl_part(d, *p),
                         }
                     }
-                    _ => match p {
-                        Part::Id => V {
-                            f: fact_id(own),
-                            e: 0,
-                        },
-                        Part::Kind => vi(rows.facts[own].tag),
-                        Part::X(x) => field(own, *x),
-                        Part::R => ve(rows.facts[own].rank),
-                        Part::L => unreachable!(),
-                    },
+                    _ => fact_part(own, *p),
                 },
-                E::Prem(j, p) => {
-                    let q = rows.facts[own].premises[*j];
-                    match p {
-                        Part::Id => V {
-                            f: fact_id(q),
-                            e: 0,
-                        },
-                        Part::Kind => vi(rows.facts[q].tag),
-                        Part::X(x) => field(q, *x),
-                        Part::R => ve(rows.facts[q].rank),
-                        Part::L => unreachable!(),
-                    }
-                }
-                E::Tm(tr, p) => term_part(resolve(tr, own, is_fact), *p),
+                E::Prem(j, p) => fact_part(prem_of(of, own, *j), *p),
+                E::Tm(tr, p) => term_part(resolve(tr, own, of), *p),
                 E::Dcl(tr, p) => {
-                    let t = &rows.terms[resolve(tr, own, is_fact)];
-                    let d = &rows.decls[t.x[1].f.lo as usize];
-                    match p {
-                        Part::X(1) => vi(d.levels),
-                        Part::X(2) => V {
-                            f: d.value.map_or(F128::ZERO, term_id),
-                            e: 0,
-                        },
-                        _ => unreachable!(),
-                    }
+                    let t = &g.terms[resolve(tr, own, of)];
+                    decl_part(t.x[1].f.lo as usize, *p)
                 }
             }
         };
@@ -1222,13 +1567,13 @@ impl LeanCircuit {
         for (s, of) in ofs.iter().enumerate() {
             let sp = &specs[s];
             let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
-            let mut out = Vec::with_capacity(members[s].len());
-            for &own in &members[s] {
+            let mut out = Vec::new();
+            for &own in members[s].iter().filter(|_| mine(s)) {
                 let mut z = vec![F128::ZERO; cols.len()];
                 for (y, (_, src)) in sp.cols.iter().enumerate() {
                     let Some(src) = src else { continue };
                     z[y] = match src {
-                        Src::Val(e) => eval(e, *of, own).f,
+                        Src::Val(e) | Src::Pub(e) => eval(e, *of, own).f,
                         Src::Limb(e, l) => {
                             let x = eval(e, *of, own).e;
                             assert!(x >= 0 && x >> (2 * limb) == 0, "an index out of range");
@@ -1266,8 +1611,8 @@ impl LeanCircuit {
             }
             tables.push(out);
         }
-        // Count every tuple received.
-        let tuple = |t: &[T; W], z: &[F128], s: usize, j: usize| -> [(u64, u64); W] {
+        // Count every tuple received, here and outside.
+        let tuple = |t: &[T; W], z: &[F128], s: usize, j: usize| -> Tuple {
             std::array::from_fn(|i| {
                 let v = match t[i] {
                     T::C(c) => z[c],
@@ -1277,11 +1622,19 @@ impl LeanCircuit {
                 (v.lo, v.hi)
             })
         };
-        let mut asked: HashMap<[(u64, u64); W], u64> = HashMap::new();
+        let mut asked: HashMap<Tuple, u64> = outside.clone();
         for (s, sp) in specs.iter().enumerate() {
             for p in sp.ports.iter().filter(|p| !p.send) {
                 for (j, z) in tables[s].iter().enumerate() {
                     *asked.entry(tuple(&p.t, z, s, j)).or_default() += 1;
+                }
+            }
+            // A batch's goals are received by the shared side, once each.
+            if side == Side::Batch && matches!(ofs[s], Of::Goal(_)) {
+                for p in sp.ports.iter().filter(|p| p.send) {
+                    for (j, z) in tables[s].iter().enumerate() {
+                        *asked.entry(tuple(&p.t, z, s, j)).or_default() += 1;
+                    }
                 }
             }
         }
@@ -1312,21 +1665,23 @@ impl LeanCircuit {
                 }
             }
         }
-        if let Some((t, n)) = asked.iter().next().filter(|_| strict) {
-            return Err(format!(
-                "{} tuples asked for but never given, e.g. {t:?} ({n} times)",
-                asked.len()
-            ));
+        // Tables of the other side are not part of this circuit.
+        for s in 0..specs.len() {
+            if !mine(s) {
+                tables[s].clear();
+            }
         }
-        let chunk_base = chunk_base.clone();
-        Ok(LeanCircuit {
-            nu,
-            limb,
-            specs,
-            tables,
-            chunk_base,
-            build_ms: t0.elapsed().as_secs_f64() * 1e3,
-        })
+        Ok((
+            LeanCircuit {
+                nu,
+                limb,
+                specs,
+                tables,
+                chunk_base,
+                build_ms: t0.elapsed().as_secs_f64() * 1e3,
+            },
+            asked,
+        ))
     }
 
     /// Every chunk `(table, chunk)` in order, with its row count.
@@ -1410,7 +1765,7 @@ impl LeanCircuit {
                     .filter(|(_, c)| matches!(c.0, Col::In))
                     .map(|(y, c)| {
                         values.push(z[y]);
-                        if matches!(c.1, Some(Src::RangeV(_))) {
+                        if matches!(c.1, Some(Src::RangeV(_)) | Some(Src::Pub(_))) {
                             sb.fixed_public_input(z[y])
                         } else {
                             sb.input()
@@ -1755,4 +2110,214 @@ F 10 App infer 0 5 0 0 : 7 8 6 9 5
 /// checks to see what they cost.
 fn ablate(what: &str) -> bool {
     std::env::var("LEAN_ROWS_ABLATE").is_ok_and(|v| v.split(',').any(|w| w == what))
+}
+
+// ---------------------------------------------------------------- cones
+
+/// Many declarations' derivations in one numbering: equal terms, levels,
+/// level lists and contexts share one id across all of them, and a
+/// declaration is one row by key. A citation in one declaration's check
+/// then names the very row whose goal another declaration's check proves.
+/// The shared side (terms and declarations) is proven once; each batch of
+/// judgements and goals refers to it over the shared bus.
+pub struct Cone {
+    pub shared: Rows,
+    levels: HashMap<(u8, u64, u64), u64>,
+    lists: HashMap<Option<(u64, u64)>, u64>,
+    ctxs: HashMap<Option<(u64, u64)>, u64>,
+    terms: HashMap<(u64, [(u64, u64); 3]), usize>,
+    decls: HashMap<(u64, u64), usize>,
+    span: i64,
+}
+
+impl Default for Cone {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Cone {
+    pub fn new() -> Cone {
+        let mut ctxs = HashMap::new();
+        // The empty context is 0, as goals expect.
+        ctxs.insert(None, 0);
+        Cone {
+            shared: Rows::default(),
+            levels: HashMap::new(),
+            lists: HashMap::new(),
+            ctxs,
+            terms: HashMap::new(),
+            decls: HashMap::new(),
+            span: 0,
+        }
+    }
+
+    /// Adds one declaration's derivation: its terms and cited
+    /// declarations join the shared side, its judgements and goal are
+    /// appended to `batch` in the shared numbering.
+    pub fn add(&mut self, r: Rows, batch: &mut Rows) -> Result<(), String> {
+        let lc = &r.local;
+        // Declarations by key.
+        let mut decl = Vec::with_capacity(r.decls.len());
+        for d in &r.decls {
+            if d.key == (0, 0) {
+                return Err("a declaration without a key (an old dump)".into());
+            }
+            let i = match self.decls.get(&d.key) {
+                Some(&i) => {
+                    let e = &self.shared.decls[i];
+                    if (e.unfold, e.levels, e.kind, e.order) != (d.unfold, d.levels, d.kind, d.order) {
+                        return Err(format!("declaration {:?} differs between derivations", d.key));
+                    }
+                    i
+                }
+                None => {
+                    let i = self.shared.decls.len();
+                    self.shared.decls.push(DeclRec {
+                        value: None,
+                        ty: None,
+                        checked: false,
+                        ..d.clone()
+                    });
+                    self.decls.insert(d.key, i);
+                    i
+                }
+            };
+            self.shared.decls[i].checked |= d.checked;
+            self.span = self.span.max(d.order + 1);
+            decl.push(i);
+        }
+        // Levels and lists: opaque ids, shared by structure.
+        let mut lv = Vec::with_capacity(lc.levels.len());
+        for &(kind, a, b) in &lc.levels {
+            let m = |x: u64| lv[x as usize];
+            let key = match kind {
+                0 => (0, 0, 0),
+                1 => (1, m(a), 0),
+                2 | 3 => (kind, m(a), m(b)),
+                _ => (4, a, 0),
+            };
+            let n = self.levels.len() as u64;
+            lv.push(*self.levels.entry(key).or_insert(n));
+        }
+        let mut ls: Vec<u64> = Vec::with_capacity(lc.lists.len());
+        for &row in &lc.lists {
+            let key = row.map(|(h, t)| (lv[h as usize], ls[t as usize]));
+            let n = self.lists.len() as u64;
+            ls.push(*self.lists.entry(key).or_insert(n));
+        }
+        // Terms.
+        let mut tm = Vec::with_capacity(r.terms.len());
+        for t in &r.terms {
+            let mut t = t.clone();
+            for c in t.child.iter_mut().flatten() {
+                *c = tm[*c];
+            }
+            if t.kind == K_LEAF {
+                let sub = t.x[0].f.lo;
+                if sub == SUB_CONST {
+                    t.x[1] = vi(decl[t.x[1].f.lo as usize] as u64);
+                    t.x[2] = vi(*ls.get(t.x[2].f.lo as usize).ok_or("a list out of range")?);
+                } else if sub == SUB_SORT {
+                    t.x[1] = vi(*lv.get(t.x[1].f.lo as usize).ok_or("a level out of range")?);
+                }
+            }
+            if t.kind == K_PROJ {
+                t.x[0] = vi(decl[t.x[0].f.lo as usize] as u64);
+            }
+            let w = |i: usize| match t.child[i] {
+                Some(c) => (c as u64, u64::MAX),
+                None => (t.x[i].f.lo, t.x[i].f.hi),
+            };
+            let key = (t.kind, [w(0), w(1), w(2)]);
+            let i = match self.terms.get(&key) {
+                Some(&i) => i,
+                None => {
+                    let i = self.shared.terms.len();
+                    self.span = self.span.max(t.rank + t.lbr);
+                    self.shared.terms.push(t);
+                    self.terms.insert(key, i);
+                    i
+                }
+            };
+            tm.push(i);
+        }
+        // Declared types and values, which must agree where cited twice.
+        for (d, &i) in r.decls.iter().zip(&decl) {
+            let e = &mut self.shared.decls[i];
+            for (mine, theirs) in [(d.ty, &mut e.ty), (d.value, &mut e.value)] {
+                if let Some(x) = mine {
+                    let x = tm[x];
+                    match theirs {
+                        None => *theirs = Some(x),
+                        Some(y) if *y == x => {}
+                        Some(_) => return Err(format!("declaration {:?} has two types or values", d.key)),
+                    }
+                }
+            }
+        }
+        // Contexts.
+        let mut cx: Vec<u64> = Vec::with_capacity(lc.ctxs.len());
+        for &row in &lc.ctxs {
+            let key = row.map(|(q, a)| (cx[q as usize], tm[a as usize] as u64));
+            let n = self.ctxs.len() as u64;
+            cx.push(*self.ctxs.entry(key).or_insert(n));
+        }
+        // Judgements and the goal.
+        let base = batch.facts.len();
+        for mut f in r.facts {
+            for x in 0..4 {
+                if f.is_term[x] {
+                    f.raw[x] = tm[f.raw[x] as usize] as u64;
+                }
+            }
+            let ctx = |v: u64| cx.get(v as usize).copied().ok_or("a context out of range");
+            let lvl = |v: u64| lv.get(v as usize).copied().ok_or("a level out of range");
+            let lst = |v: u64| ls.get(v as usize).copied().ok_or("a list out of range");
+            match f.tag {
+                F_HAS | F_INFER | F_EQ => f.raw[0] = ctx(f.raw[0])?,
+                F_LINST => f.raw[1] = lst(f.raw[1])?,
+                F_LINSTL => {
+                    f.raw[0] = lvl(f.raw[0])?;
+                    f.raw[1] = lst(f.raw[1])?;
+                    f.raw[2] = lvl(f.raw[2])?;
+                }
+                F_LEQ => {
+                    f.raw[0] = lvl(f.raw[0])?;
+                    f.raw[1] = lvl(f.raw[1])?;
+                }
+                _ => {}
+            }
+            for p in &mut f.premises {
+                *p += base;
+            }
+            self.span = self.span.max(f.rank.max(f.owner));
+            batch.facts.push(f);
+        }
+        for g in r.goals {
+            batch.goals.push(GoalRec {
+                decl: decl[g.decl],
+                ty: (g.ty.0 + base, g.ty.1 + base),
+                value: g.value.map(|(a, b)| (a + base, b + base)),
+            });
+        }
+        Ok(())
+    }
+
+    /// The shared side, with one limb width for every build of the cone.
+    pub fn finish(mut self) -> Rows {
+        self.shared.limb = Some(((((self.span + 2) as f64).log2() / 2.0).ceil() as usize).max(4));
+        self.shared
+    }
+
+    /// How many terms and declarations (checked, in blocks, free).
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        let d = &self.shared.decls;
+        (
+            self.shared.terms.len(),
+            d.iter().filter(|d| d.checked).count(),
+            d.iter().filter(|d| !d.checked && d.kind >= 5).count(),
+            d.iter().filter(|d| !d.checked && d.kind < 5).count(),
+        )
+    }
 }
