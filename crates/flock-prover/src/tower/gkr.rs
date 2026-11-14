@@ -59,6 +59,24 @@ pub(super) struct BusRec {
     pub(super) claim_r: F128,
     /// The multiplicity groups' sumcheck, located, when a port has bits.
     pub(super) mult: Option<MultRec>,
+    /// A shared bus: the value index of the absorbed β (the γs follow);
+    /// its products stay open, `top` the send side's and `top_r` the
+    /// receive side's.
+    pub(super) shared_v: Option<usize>,
+    pub(super) top_r: F128,
+}
+
+impl BusRec {
+    /// β's and the γs' native values: absorbed words or squeezes.
+    pub(super) fn challenges(&self, vals_rec: &[F128], chals: &[F128], width: usize) -> (F128, Vec<F128>) {
+        match self.shared_v {
+            Some(v) => (vals_rec[v], vals_rec[v + 1..v + 1 + width].to_vec()),
+            None => (
+                chals[self.beta_ch],
+                (0..width).map(|k| chals[self.beta_ch + 1 + k]).collect(),
+            ),
+        }
+    }
 }
 
 /// The multiplicity sumcheck's region (`bus::verify_mult`), located on the
@@ -189,6 +207,7 @@ pub(super) fn emit_gkr_layers(
     layers: &[GkrLayerRec],
     top_v: usize,
     top: F128,
+    top_r: Option<F128>,
     trace: &FsChainTrace,
     outs: &[Vec<Wire>],
     wv: &impl Fn(usize) -> Wire,
@@ -198,8 +217,12 @@ pub(super) fn emit_gkr_layers(
     zassert: Wire,
 ) -> (Wire, Wire, Vec<Wire>) {
     let (mut cl_w, mut cr_w) = (wv(top_v), wv(top_v + 1));
-    sb.connect(cl_w, cr_w);
     emit_nonzero_top(sb, macs, cl_w, top, vals, ow, zassert);
+    match top_r {
+        // Open products (a shared bus): both nonzero, balanced elsewhere.
+        Some(tr) => emit_nonzero_top(sb, macs, cr_w, tr, vals, ow, zassert),
+        None => sb.connect(cl_w, cr_w),
+    }
     let mut pt_w: Vec<Wire> = Vec::new();
     for lr in layers {
         let lam_w = outs[trace.squeezes[lr.lam_fin][0]][0];
@@ -287,20 +310,25 @@ pub(super) fn emit_bus(
 ) -> (Vec<Wire>, Vec<Wire>, Option<MultWires>) {
     let bus = circuit.bus().expect("a bus region needs a bus");
     let nu = circuit.cells().nu();
+    let top_r = br.shared_v.map(|_| br.top_r);
     let (cl_w, cr_w, pt_w) = emit_gkr_layers(
-        sb, macs, zcr, &br.layers, br.top_v, br.top, trace, outs, wv, vals, zw, ow, zassert,
+        sb, macs, zcr, &br.layers, br.top_v, br.top, top_r, trace, outs, wv, vals, zw, ow, zassert,
     );
     assert_eq!(
         pt_w.len(),
         nu + bus.c_bits(),
         "the bus point spans rows and ports"
     );
-    let beta_w = outs[trace.squeezes[br.beta_fin][0]][0];
-    let gamma_w: Vec<Wire> = br
-        .gamma_fins
-        .iter()
-        .map(|&f| outs[trace.squeezes[f][0]][0])
-        .collect();
+    let (beta_w, gamma_w): (Wire, Vec<Wire>) = match br.shared_v {
+        Some(v) => (wv(v), (0..bus.width).map(|k| wv(v + 1 + k)).collect()),
+        None => (
+            outs[trace.squeezes[br.beta_fin][0]][0],
+            br.gamma_fins
+                .iter()
+                .map(|&f| outs[trace.squeezes[f][0]][0])
+                .collect(),
+        ),
+    };
     let cols = bus.structure_columns();
     let col_w: Vec<Wire> = structure
         .values
@@ -557,6 +585,7 @@ pub(super) fn pin_bus_sides(
     circuit: &Circuit,
     bus: &Bus,
     br: &BusRec,
+    vals_rec: &[F128],
     chals: &[F128],
     gather: &[F128],
     structure: &BusStructure,
@@ -572,8 +601,7 @@ pub(super) fn pin_bus_sides(
     assert_eq!(structure.values.len(), cols.len(), "one value per column");
     let words = bus.words();
     let (gather, opened) = gather.split_at(words.len());
-    let beta = chals[br.beta_ch];
-    let gamma: Vec<F128> = (0..bus.width).map(|k| chals[br.beta_ch + 1 + k]).collect();
+    let (beta, gamma) = br.challenges(vals_rec, chals, bus.width);
     let sums: Vec<F128> = match &br.mult {
         Some(m) => pin_bus_mult(
             bus,

@@ -1751,10 +1751,12 @@ impl LeanCircuit {
             // One swap row on zeros: the boolean class the tower needs.
             let gate = crate::leanxmss::gadgets::swap_gate(nu).map_err(|e| format!("{e:?}"))?;
             let slot = sb.slot(gate.clone());
+            // Its first word is a fixed public zero: a tower child has a
+            // public segment even when its tables publish nothing.
             let w: Vec<Wire> = (0..3)
-                .map(|_| {
+                .map(|k| {
                     values.push(F128::ZERO);
-                    sb.input()
+                    if k == 0 { sb.fixed_public_input(F128::ZERO) } else { sb.input() }
                 })
                 .collect();
             sb.gate(slot, &w);

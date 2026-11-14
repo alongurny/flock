@@ -327,6 +327,7 @@ impl<'p> ChildTape<'p> {
                 &vals_rec,
                 &chals,
                 proof.wiring().bus.as_ref().expect("a bus proof"),
+                bus.shared.as_ref(),
                 bus_l[0],
                 bus.width,
                 &vc_at,
@@ -479,6 +480,7 @@ impl<'p> ChildTape<'p> {
                 &built.shape.circuit,
                 bus,
                 br,
+                &vals_rec,
                 &chals,
                 &gammas_o[n_el_pd + n_wire + n_pubcol..]
                     .iter()
@@ -2604,7 +2606,7 @@ fn emit_wiring_gkr_and_recombination(
     // proof itself fails on a broken identity; no public, no checker item),
     // and they are nonzero (`emit_nonzero_top`).
     let (cl_w, cr_w, pt_w) = emit_gkr_layers(
-        sb, macs, zcr, &g.layers, g.top_v, g.top, trace, outs, wv, vals, zw, ow, zassert,
+        sb, macs, zcr, &g.layers, g.top_v, g.top, None, trace, outs, wv, vals, zw, ow, zassert,
     );
     assert_eq!(
         pt_w.len(),

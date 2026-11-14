@@ -129,7 +129,24 @@ pub(super) fn walk_gkr_layers(
     vc_at: &impl Fn(usize) -> (usize, usize),
     fin_at: &impl Fn(usize) -> usize,
 ) -> (usize, Vec<GkrLayerRec>, Vec<F128>, F128, F128) {
-    let (mut claim_l, mut claim_r) = (top, top);
+    walk_gkr_layers_open(ops, vals_rec, chals, i, top, top, layers, vc_at, fin_at)
+}
+
+/// [`walk_gkr_layers`] from two tops: a shared bus leaves its products
+/// open, so the sides start apart.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn walk_gkr_layers_open(
+    ops: &[Op],
+    vals_rec: &[F128],
+    chals: &[F128],
+    mut i: usize,
+    top_l: F128,
+    top_r: F128,
+    layers: &[BatchedLayerProof],
+    vc_at: &impl Fn(usize) -> (usize, usize),
+    fin_at: &impl Fn(usize) -> usize,
+) -> (usize, Vec<GkrLayerRec>, Vec<F128>, F128, F128) {
+    let (mut claim_l, mut claim_r) = (top_l, top_r);
     let mut r_pt: Vec<F128> = Vec::new();
     let mut lrecs: Vec<GkrLayerRec> = Vec::new();
     for (k, layer) in layers.iter().enumerate() {
@@ -214,6 +231,7 @@ pub(super) fn walk_bus_gkr(
     vals_rec: &[F128],
     chals: &[F128],
     bus_proof: &BusProof,
+    shared: Option<&flock_core::circuit::bus::SharedChallenges>,
     bus_l0: usize,
     width: usize,
     vc_at: &impl Fn(usize) -> (usize, usize),
@@ -221,20 +239,32 @@ pub(super) fn walk_bus_gkr(
 ) -> BusRec {
     let gkr = &bus_proof.gkr;
     let mut i = bus_l0 + 1;
-    while matches!(ops[i], Op::Pow { .. }) {
+    // A shared bus absorbs β and the γs (fixed outside, over every piece);
+    // otherwise they are squeezed here, β behind its grind.
+    let (shared_v, beta_fin, beta_ch, gamma_fins) = if let Some(sh) = shared {
+        assert_eq!(sh.gamma.len(), width, "one shared γ per coordinate");
+        let (v, j) = take_observes(ops, i, 1 + width, vc_at);
+        assert_eq!(vals_rec[v], sh.beta, "the shared β on the stream");
+        assert_eq!(&vals_rec[v + 1..v + 1 + width], &sh.gamma[..], "the shared γs on the stream");
+        i = j;
+        (Some(v), usize::MAX, usize::MAX, Vec::new())
+    } else {
+        while matches!(ops[i], Op::Pow { .. }) {
+            i += 1;
+        }
+        assert!(matches!(ops[i], Op::SqueezeScalar), "bus beta");
+        let beta_fin = fin_at(i);
+        let (_, beta_ch) = vc_at(i);
         i += 1;
-    }
-    assert!(matches!(ops[i], Op::SqueezeScalar), "bus beta");
-    let beta_fin = fin_at(i);
-    let (_, beta_ch) = vc_at(i);
-    i += 1;
-    let mut gamma_fins = Vec::with_capacity(width);
-    for k in 0..width {
-        assert!(matches!(ops[i], Op::SqueezeScalar), "bus gamma {k}");
-        assert_eq!(vc_at(i).1, beta_ch + 1 + k, "bus challenges are adjacent");
-        gamma_fins.push(fin_at(i));
-        i += 1;
-    }
+        let mut gamma_fins = Vec::with_capacity(width);
+        for k in 0..width {
+            assert!(matches!(ops[i], Op::SqueezeScalar), "bus gamma {k}");
+            assert_eq!(vc_at(i).1, beta_ch + 1 + k, "bus challenges are adjacent");
+            gamma_fins.push(fin_at(i));
+            i += 1;
+        }
+        (None, beta_fin, beta_ch, gamma_fins)
+    };
     assert!(
         matches!(&ops[i], Op::Label(l) if l.as_slice() == LBL_PRODUCT_LEAVES),
         "the bus's leaves label"
@@ -244,14 +274,17 @@ pub(super) fn walk_bus_gkr(
     let (tv, _) = vc_at(i);
     assert_eq!(vals_rec[tv], gkr.top_lhs, "bus top_lhs on the stream");
     assert_eq!(vals_rec[tv + 1], gkr.top_rhs, "bus top_rhs on the stream");
-    assert_eq!(gkr.top_lhs, gkr.top_rhs, "the bus products agree");
+    if shared.is_none() {
+        assert_eq!(gkr.top_lhs, gkr.top_rhs, "the bus products agree");
+    }
     i += 2;
-    let (i, layers, r_pt, claim_l, claim_r) = walk_gkr_layers(
+    let (i, layers, r_pt, claim_l, claim_r) = walk_gkr_layers_open(
         ops,
         vals_rec,
         chals,
         i,
         gkr.top_lhs,
+        gkr.top_rhs,
         &gkr.layers,
         vc_at,
         fin_at,
@@ -262,6 +295,8 @@ pub(super) fn walk_bus_gkr(
         .map(|m| walk_bus_mult(ops, vals_rec, chals, i, m, vc_at, fin_at));
     BusRec {
         mult,
+        shared_v,
+        top_r: gkr.top_rhs,
         beta_fin,
         beta_ch,
         gamma_fins,

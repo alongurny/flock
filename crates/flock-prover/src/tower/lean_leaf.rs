@@ -174,3 +174,51 @@ fn lean_child_region_rejects_moved_counts() {
     ct.sigma_native.bus = honest;
     assert!(runs(&ct), "restored, it runs again");
 }
+
+/// Two Lean pieces sharing one bus: committed first, challenges drawn from
+/// both commitments, each proven as a tower leaf with its products left
+/// open. Each child region emits, runs and checks, and the open products
+/// balance across the two.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+#[cfg(not(target_arch = "aarch64"))]
+fn lean_shared_pieces_emit() {
+    use crate::lean_rows::shared_challenges;
+    let small = include_str!("../../tests/data/lean_small.rows");
+    let rows = Rows::merge((0..4000).map(|_| Rows::parse(small).unwrap()).collect());
+    let c = LeanCircuit::build(&rows).unwrap();
+    let total: usize = c.chunks().iter().map(|x| x.2).sum();
+    let pieces: Vec<_> = c
+        .pieces(total / 2 + 1)
+        .iter()
+        .map(|p| c.piece_with(p, true).unwrap())
+        .collect();
+    assert_eq!(pieces.len(), 2);
+    let statement: Vec<_> = pieces.iter().map(|p| (p.digest(), p.commit())).collect();
+    let ch = shared_challenges(&statement);
+    let (mut lhs, mut rhs) = (F128::ONE, F128::ONE);
+    for (i, p) in pieces.iter().enumerate() {
+        let label = (i as u64).to_le_bytes();
+        let inner = build_lean_leaf(p, Some(&ch), &label);
+        let gkr = &inner.proof.wiring().bus.as_ref().unwrap().gkr;
+        lhs *= gkr.top_lhs;
+        rhs *= gkr.top_rhs;
+        assert_ne!(gkr.top_lhs, gkr.top_rhs, "one piece alone does not balance");
+        let lcs = p.lincheck_circuits();
+        let ct = ChildTape::new(&inner, LEAN_DOMAIN, &lcs);
+        let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(16);
+        let mut sb = ShapeBuilder::new(nu2);
+        let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
+        let mut vals: Vec<F128> = Vec::new();
+        let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
+        let mut consts: Vec<(F128, Wire)> = Vec::new();
+        let b3_slot = cs.q.b3;
+        let region = emit_child_region(&mut sb, &mut cs, b3_slot, &ct, &mut vals, &mut hints, &mut consts);
+        let shape2 = sb.finish().expect("the Lean child circuit builds");
+        let hint_refs: Vec<&(dyn Any + Sync)> = hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
+        let built2 = shape2.run(&vals, &hint_refs);
+        let consumed = check_child_region(&built2.public, &ct, &region);
+        assert_eq!(region.pub_base + consumed, built2.public.len());
+    }
+    assert_eq!(lhs, rhs, "the open products balance across the pieces");
+}
