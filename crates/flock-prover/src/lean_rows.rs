@@ -32,7 +32,8 @@ use serde::{Deserialize, Serialize};
 use flock_core::{
     challenger::FsChallenger,
     circuit::{
-        builder::{CircuitShape, GateType, ShapeBuilder, SlotId, SlotWitness, Wire},
+        boolean::BooleanGate,
+        builder::{CircuitShape, CircuitWitness, GateType, ShapeBuilder, SlotId, SlotWitness, Wire},
         Circuit,
         bus::{self, BusDirection, BusTerm, RowTag, SharedChallenges},
     },
@@ -48,8 +49,10 @@ use flock_core::{
 use flock_field::F128;
 
 use crate::prover::{
-    UnionElementSlotInput, commit_ligerito_union_circuit, prove_fast_ligerito_union_circuit,
+    UnionElementSlotInput, UnionSlotProverInput, commit_ligerito_union_circuit,
+    prove_fast_ligerito_union_circuit,
 };
+use flock_core::lincheck::LincheckCircuit;
 
 /// Tuple width: tag, id, kind, four fields, rank, and a judgement's owner
 /// (the order of the declaration whose check it belongs to).
@@ -1236,7 +1239,19 @@ pub struct Piece {
     shape: CircuitShape,
     values: Vec<F128>,
     slots: Vec<(SlotId, String, usize, usize, usize)>,
+    /// In the recursion tower's posture: one boolean slot (the tower's
+    /// child walker expects a boolean class) and the chained transcript.
+    tower: Option<(SlotId, BooleanGate)>,
 }
+
+/// A piece's shape and input values.
+pub struct BuiltParts<'a> {
+    pub shape: &'a CircuitShape,
+    pub values: &'a [F128],
+}
+
+/// The transcript domain of a piece proven for the recursion tower.
+pub const TOWER_DOMAIN: &[u8] = b"cas-lean-rows-tower-v0";
 
 pub struct Report {
     pub nu: usize,
@@ -1723,10 +1738,30 @@ impl LeanCircuit {
 
     /// The circuit of some chunks: one gate per row, inputs in order.
     pub fn piece(&self, chunks: &[(usize, usize)]) -> Result<Piece, String> {
+        self.piece_with(chunks, false)
+    }
+
+    /// [`Self::piece`], in the recursion tower's posture when `tower`.
+    pub fn piece_with(&self, chunks: &[(usize, usize)], tower: bool) -> Result<Piece, String> {
         let nu = self.nu;
         let mut sb = ShapeBuilder::new(nu);
         let mut values = Vec::new();
         let mut slots = Vec::new();
+        let tower = if tower {
+            // One swap row on zeros: the boolean class the tower needs.
+            let gate = crate::leanxmss::gadgets::swap_gate(nu).map_err(|e| format!("{e:?}"))?;
+            let slot = sb.slot(gate.clone());
+            let w: Vec<Wire> = (0..3)
+                .map(|_| {
+                    values.push(F128::ZERO);
+                    sb.input()
+                })
+                .collect();
+            sb.gate(slot, &w);
+            Some((slot, gate))
+        } else {
+            None
+        };
         for &(s, c) in chunks {
             let sp = &self.specs[s];
             let chunk = &self.tables[s][c << nu..((c + 1) << nu).min(self.tables[s].len())];
@@ -1788,6 +1823,7 @@ impl LeanCircuit {
             shape,
             values,
             slots,
+            tower,
         })
     }
 
@@ -1843,8 +1879,9 @@ impl Piece {
         self.slots.iter().map(|s| s.2).sum()
     }
 
-    /// The witness, as the prover's element inputs, and the public words.
-    fn witness(&self, tamper: bool) -> (Vec<Vec<F128>>, Vec<F128>) {
+    /// The witness, as the prover's element inputs, the public words, and
+    /// the run (for the boolean slot's rows).
+    fn witness(&self, tamper: bool) -> (Vec<Vec<F128>>, Vec<F128>, CircuitWitness) {
         let mut w = self.shape.run(&self.values, &[]);
         let mut el: Vec<(usize, Vec<F128>)> = self
             .slots
@@ -1869,7 +1906,59 @@ impl Piece {
             let i = z.iter().position(|v| !v.is_zero()).unwrap();
             z[i] += F128::ONE;
         }
-        (el.into_iter().map(|x| x.1).collect(), w.public)
+        let public = w.public.clone();
+        (el.into_iter().map(|x| x.1).collect(), public, w)
+    }
+
+    /// The boolean slot's prover input, in the tower's posture.
+    fn boolean_inputs<'a>(&'a self, w: &'a CircuitWitness) -> Vec<UnionSlotProverInput<'a>> {
+        self.tower
+            .iter()
+            .map(|(slot, gate)| {
+                let rows = w.rows::<BooleanGate>(*slot);
+                UnionSlotProverInput::in_place(
+                    move |dst| gate.pack_into(rows, dst),
+                    gate.r1cs().csc_lincheck_circuit(),
+                )
+            })
+            .collect()
+    }
+
+    /// The lincheck circuits the verifier needs: the boolean slot's.
+    pub fn lincheck_circuits(&self) -> Vec<&dyn LincheckCircuit> {
+        self.tower
+            .iter()
+            .map(|(_, g)| g.r1cs().csc_lincheck_circuit() as &dyn LincheckCircuit)
+            .collect()
+    }
+
+    /// The challenger a proof of this piece starts from.
+    pub fn challenger(&self, label: &[u8]) -> FsChallenger {
+        if self.tower.is_some() {
+            FsChallenger::with_chained_blake3(TOWER_DOMAIN)
+        } else {
+            let mut ch = FsChallenger::new(b"cas-lean-rows-v0");
+            ch.observe_label(label);
+            ch
+        }
+    }
+
+    /// The circuit, with the shared challenges when given.
+    pub fn circuit_for(&self, shared: Option<&SharedChallenges>) -> Circuit {
+        self.circuit(shared).into_owned()
+    }
+
+    /// The shape and its witness, for a recursion leaf.
+    pub fn built(&self) -> crate::lean_rows::BuiltParts<'_> {
+        BuiltParts { shape: &self.shape, values: &self.values }
+    }
+
+    pub fn union_instance(&self) -> UnionInstance<'_> {
+        self.union()
+    }
+
+    pub fn pcs_params(&self) -> PcsParams {
+        Self::pcs(&self.union())
     }
 
     fn inputs(z: &[Vec<F128>]) -> Vec<UnionElementSlotInput<'_>> {
@@ -1885,32 +1974,51 @@ impl Piece {
         }
     }
 
+    /// A tower leaf's parts: the circuit (with the shared challenges when
+    /// given) and its witness, the proof and its commitment. The piece
+    /// must be in the tower's posture.
+    pub(crate) fn tower_parts(
+        &self,
+        shared: Option<&SharedChallenges>,
+        label: &[u8],
+    ) -> (flock_core::circuit::builder::BuiltCircuit, R1csProofCircuitMerged, Commitment) {
+        assert!(self.tower.is_some(), "a tower leaf is a piece in the tower's posture");
+        let pp = self.prove(shared, label, false);
+        let (_, _, witness) = self.witness(false);
+        let mut shape = self.shape.clone();
+        shape.circuit = self.circuit(shared).into_owned();
+        (
+            flock_core::circuit::builder::BuiltCircuit { shape, witness },
+            pp.proof,
+            pp.commitment,
+        )
+    }
+
     /// The first phase of a shared proof: the commitment only.
     pub fn commit(&self) -> Commitment {
-        let (z, _) = self.witness(false);
+        let (z, _, w) = self.witness(false);
         let union = self.union();
         let pcs = Self::pcs(&union);
-        commit_ligerito_union_circuit(&union, &pcs, Vec::new(), Self::inputs(&z))
+        commit_ligerito_union_circuit(&union, &pcs, self.boolean_inputs(&w), Self::inputs(&z))
     }
 
     /// Proves this piece, with the bus challenges fixed from outside when
     /// `shared` is given. `label` separates the pieces' transcripts.
     pub fn prove(&self, shared: Option<&SharedChallenges>, label: &[u8], tamper: bool) -> PieceProof {
         let t = Instant::now();
-        let (z, public) = self.witness(tamper);
+        let (z, public, w) = self.witness(tamper);
         let witness_ms = t.elapsed().as_secs_f64() * 1e3;
         let union = self.union();
         let pcs = Self::pcs(&union);
         let circuit = self.circuit(shared);
         let t = Instant::now();
-        let mut ch = FsChallenger::new(b"cas-lean-rows-v0");
-        ch.observe_label(label);
+        let mut ch = self.challenger(label);
         let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
             &union,
             &circuit,
             &public,
             &pcs,
-            Vec::new(),
+            self.boolean_inputs(&w),
             Self::inputs(&z),
             &mut ch,
         );
@@ -1940,10 +2048,10 @@ impl Piece {
             .map(|i| c.fixed_public(i).expect("every public word is fixed"))
             .collect();
         let t = Instant::now();
-        let mut ch = FsChallenger::new(b"cas-lean-rows-v0");
-        ch.observe_label(label);
+        let mut ch = self.challenger(label);
+        let lcs = self.lincheck_circuits();
         verify_ligerito_union_circuit(
-            &union, &circuit, &public, &[], commitment, proof, &pcs, &mut ch,
+            &union, &circuit, &public, &lcs, commitment, proof, &pcs, &mut ch,
         )?;
         Ok(t.elapsed().as_secs_f64() * 1e3)
     }
@@ -2012,26 +2120,7 @@ mod tests {
     }
 
     /// `(\x. x) y = y` and the typing of an application, by hand.
-    const SMALL: &str = "\
-T 0 leaf sort 1 0
-T 1 bvar 0
-T 2 pi 0 0
-T 3 lam 0 1
-T 4 leaf fvar 0 0
-T 5 app 3 4
-D 0 1 0 -1
-F 0 Refl eq 0 4 4 0 :
-F 1 InstHit inst 1 0 4 4 :
-F 2 Beta eq 0 5 4 0 : 1
-F 3 Trans eq 0 5 4 0 : 2 0
-F 4 Symm eq 0 4 5 0 : 3
-F 5 InstClosed inst 0 0 4 0 :
-F 6 FVar infer 0 4 0 0 :
-F 7 Lam infer 0 3 2 0 :
-F 8 Refl eq 0 2 2 0 :
-F 9 Refl eq 0 0 0 0 :
-F 10 App infer 0 5 0 0 : 7 8 6 9 5
-";
+    const SMALL: &str = include_str!("../tests/data/lean_small.rows");
 
     #[test]
     fn small_derivation_proves() {
@@ -2090,6 +2179,20 @@ F 10 App infer 0 5 0 0 : 7 8 6 9 5
         assert_eq!(n, 2);
         assert!(ok, "the pieces verify and balance together");
         assert!(!shared(&c, total / 2 + 1, true).1, "a piece left out unbalances the bus");
+    }
+
+    /// A piece in the recursion tower's posture (a boolean slot, the
+    /// chained transcript) proves, verifies and refuses a changed word.
+    #[test]
+    fn tower_piece_proves() {
+        let rows = Rows::merge((0..4000).map(|_| Rows::parse(SMALL).unwrap()).collect());
+        let c = LeanCircuit::build(&rows).unwrap();
+        let p = c.piece_with(&c.pieces(usize::MAX)[0], true).unwrap();
+        assert!(p.lincheck_circuits().len() == 1);
+        let pp = p.prove(None, b"", false);
+        p.verify(None, b"", &pp.commitment, &pp.proof).expect("the tower piece verifies");
+        let bad = p.prove(None, b"", true);
+        assert!(p.verify(None, b"", &bad.commitment, &bad.proof).is_err());
     }
 
     #[test]

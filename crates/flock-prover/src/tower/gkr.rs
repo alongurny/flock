@@ -4,7 +4,7 @@ use flock_core::{
     circuit::{
         CellSlot, Circuit, SigmaAssertion,
         builder::SlotId,
-        bus::{Bus, BusColumn, BusDirection, BusStructure},
+        bus::{Bus, BusColumn, BusDirection, BusStructure, MultStructure},
     },
     genus95_curve_code::EvaluationPoint,
     zerocheck::{K_SKIP, univariate_skip::build_eq},
@@ -57,6 +57,32 @@ pub(super) struct BusRec {
     pub(super) r_pt: Vec<F128>,
     pub(super) claim_l: F128,
     pub(super) claim_r: F128,
+    /// The multiplicity groups' sumcheck, located, when a port has bits.
+    pub(super) mult: Option<MultRec>,
+}
+
+/// The multiplicity sumcheck's region (`bus::verify_mult`), located on the
+/// tape: the groups' sums, the batching challenges λ then μ, each round's
+/// three values and its challenge, then the bits at `r` and the words at
+/// each `σ_i`.
+pub(super) struct MultRec {
+    /// Value index of the first sum (the sums are consecutive).
+    pub(super) sums_v: usize,
+    /// Challenge index of λ_0; λ then μ, one each per group, consecutive.
+    pub(super) lam_ch: usize,
+    /// The fin ordinals of λ_g then μ_g.
+    pub(super) lam_fins: Vec<usize>,
+    pub(super) mu_fins: Vec<usize>,
+    /// Per round: the value index of `s(0)` (then `s(x)`, `s(x+1)`), the
+    /// challenge index and fin ordinal of `r_k`.
+    pub(super) rounds: Vec<(usize, usize, usize)>,
+    /// The end point `r`, native.
+    pub(super) r: Vec<F128>,
+    pub(super) bits_v: usize,
+    pub(super) words_v: usize,
+    /// The sums and the rounds' values, native (checked on the stream).
+    pub(super) sums: Vec<F128>,
+    pub(super) round_values: Vec<[F128; 3]>,
 }
 
 /// **THE RECOMBINATION (round 4), pinned natively.** The wiring verifier's
@@ -248,6 +274,7 @@ pub(super) fn emit_bus(
     circuit: &Circuit,
     br: &BusRec,
     structure: &BusStructure,
+    mult_structure: Option<&MultStructure>,
     gather_w: &[Wire],
     trace: &FsChainTrace,
     outs: &[Vec<Wire>],
@@ -257,12 +284,8 @@ pub(super) fn emit_bus(
     zw: Wire,
     ow: Wire,
     zassert: Wire,
-) -> (Vec<Wire>, Vec<Wire>) {
+) -> (Vec<Wire>, Vec<Wire>, Option<MultWires>) {
     let bus = circuit.bus().expect("a bus region needs a bus");
-    assert!(
-        !bus.has_mult(),
-        "recursion does not carry bus multiplicities yet"
-    );
     let nu = circuit.cells().nu();
     let (cl_w, cr_w, pt_w) = emit_gkr_layers(
         sb, macs, zcr, &br.layers, br.top_v, br.top, trace, outs, wv, vals, zw, ow, zassert,
@@ -288,15 +311,50 @@ pub(super) fn emit_bus(
         })
         .collect();
     let words = bus.words();
-    assert_eq!(gather_w.len(), words.len(), "one gather wire per bus word");
+    assert!(gather_w.len() >= words.len(), "one gather wire per bus word");
+    let (gather_w, opened_w) = gather_w.split_at(words.len());
+    let mult = br.mult.as_ref().map(|m| {
+        emit_bus_mult(
+            sb,
+            macs,
+            bus,
+            m,
+            mult_structure.expect("the multiplicity columns travel"),
+            opened_w,
+            beta_w,
+            &gamma_w,
+            &pt_w[..nu],
+            trace,
+            outs,
+            wv,
+            vals,
+            consts,
+            zw,
+            ow,
+        )
+    });
+    if mult.is_none() {
+        assert!(opened_w.is_empty(), "one gather wire per bus word");
+    }
+    let mult_groups = bus.mult_groups();
     let n_ports = bus
-        .side(BusDirection::Send)
+        .groups(BusDirection::Send)
         .len()
-        .max(bus.side(BusDirection::Recv).len());
+        .max(bus.groups(BusDirection::Recv).len());
     let eq_port_w = emit_eq_prefix(sb, macs, &pt_w[nu..], n_ports, zw, ow);
     for (dir, claim_w) in [(BusDirection::Send, cl_w), (BusDirection::Recv, cr_w)] {
         let mut acc = ow;
-        for (g, port) in bus.side(dir).into_iter().enumerate() {
+        for (g, (p, bit)) in bus.groups(dir).into_iter().enumerate() {
+            let port = &bus.ports[p];
+            if let Some(i) = bit {
+                let at = mult_groups
+                    .iter()
+                    .position(|&x| x == (p, i))
+                    .expect("a multiplicity group");
+                let sum_w = mult.as_ref().expect("multiplicity wires").sums[at];
+                acc = sb.gate(macs, &[acc, eq_port_w[g], sum_w])[0];
+                continue;
+            }
             let mass = col_w[Bus::column_index(&cols, BusColumn::Live { ty: port.ty })];
             // (β + 1)·E_p
             let mut inner = sb.gate(macs, &[mass, beta_w, mass])[0];
@@ -320,7 +378,173 @@ pub(super) fn emit_bus(
         }
         sb.connect(acc, claim_w);
     }
-    (pt_w, col_w)
+    (pt_w, col_w, mult)
+}
+
+/// The multiplicity sumcheck's wires the rest of the region reads: the
+/// groups' sums (the sides), the end point `r` and each `σ_i` (the opened
+/// bits' and words' points), and the row-tag columns at the `σ_i` (bound
+/// by the circuit-structure claims).
+pub(super) struct MultWires {
+    pub(super) sums: Vec<Wire>,
+    pub(super) r: Vec<Wire>,
+    pub(super) sigma: Vec<Vec<Wire>>,
+    pub(super) tags: Vec<Wire>,
+}
+
+/// **The multiplicity sumcheck in-circuit** (`bus::verify_mult`): the
+/// batched claim `Σ_g λ_g·S_g` through each round's cubic (Lagrange on the
+/// nodes `0, 1, x, x + 1`, constants baked), `σ_i` as advice held by
+/// `σ_i² = σ_{i-1}` (`σ_0 = r`), the groups' total at `r`, and
+/// `eq(ρ_row, r)·total = claim`. Every value is a located tape word or a
+/// squeeze wire; the tags at `σ_i` are inputs the structure claims bind.
+#[allow(clippy::too_many_arguments)]
+fn emit_bus_mult(
+    sb: &mut ShapeBuilder,
+    macs: SlotId,
+    bus: &Bus,
+    m: &MultRec,
+    ms: &MultStructure,
+    opened_w: &[Wire],
+    beta_w: Wire,
+    gamma_w: &[Wire],
+    rho_row_w: &[Wire],
+    trace: &FsChainTrace,
+    outs: &[Vec<Wire>],
+    wv: &impl Fn(usize) -> Wire,
+    vals: &mut Vec<F128>,
+    consts: &mut Vec<(F128, Wire)>,
+    zw: Wire,
+    ow: Wire,
+) -> MultWires {
+    use flock_core::circuit::bus::{NODE, frob_inv};
+    let groups = bus.mult_groups();
+    let n = groups.len();
+    let sq = |f: usize| outs[trace.squeezes[f][0]][0];
+    let sums: Vec<Wire> = (0..n).map(|g| wv(m.sums_v + g)).collect();
+    let lam: Vec<Wire> = m.lam_fins.iter().map(|&f| sq(f)).collect();
+    let mu: Vec<Wire> = m.mu_fins.iter().map(|&f| sq(f)).collect();
+    let mut claim = zw;
+    for g in 0..n {
+        claim = sb.gate(macs, &[claim, lam[g], sums[g]])[0];
+    }
+    // Lagrange on 0, 1, x, x + 1: L_k(r) = Π_{l≠k}(r + n_l) / Π_{l≠k}(n_k + n_l).
+    let nodes = [F128::ZERO, F128::ONE, NODE, NODE + F128::ONE];
+    let inv_den: Vec<F128> = (0..4)
+        .map(|k| {
+            (0..4)
+                .filter(|&l| l != k)
+                .fold(F128::ONE, |a, l| a * (nodes[k] + nodes[l]))
+                .inv()
+        })
+        .collect();
+    let node_w: Vec<Wire> = nodes.iter().map(|&x| cw(sb, vals, consts, x)).collect();
+    let inv_w: Vec<Wire> = inv_den.iter().map(|&x| cw(sb, vals, consts, x)).collect();
+    let mut r_w = Vec::with_capacity(m.rounds.len());
+    for &(v, _, fin) in &m.rounds {
+        let rk = sq(fin);
+        r_w.push(rk);
+        let d: Vec<Wire> = (0..4).map(|l| sb.gate(macs, &[node_w[l], rk, ow])[0]).collect();
+        let p01 = sb.gate(macs, &[zw, d[0], d[1]])[0];
+        let p23 = sb.gate(macs, &[zw, d[2], d[3]])[0];
+        let num = [
+            sb.gate(macs, &[zw, d[1], p23])[0],
+            sb.gate(macs, &[zw, d[0], p23])[0],
+            sb.gate(macs, &[zw, p01, d[3]])[0],
+            sb.gate(macs, &[zw, p01, d[2]])[0],
+        ];
+        let s0 = wv(v);
+        let s1 = sb.gate(macs, &[claim, s0, ow])[0];
+        let vs = [s0, s1, wv(v + 1), wv(v + 2)];
+        let mut acc = zw;
+        for k in 0..4 {
+            let scaled = sb.gate(macs, &[zw, vs[k], inv_w[k]])[0];
+            acc = sb.gate(macs, &[acc, scaled, num[k]])[0];
+        }
+        claim = acc;
+    }
+    // σ_i = frob⁻ⁱ(r), advice held by squaring down to r.
+    let most = bus.ports.iter().map(|p| p.mult.len()).max().unwrap_or(0);
+    assert_eq!(ms.sigma.len(), most, "one σ per count bit");
+    for (i, s) in ms.sigma.iter().enumerate() {
+        let want: Vec<F128> = m.r.iter().map(|&x| frob_inv(x, i)).collect();
+        assert_eq!(*s, want, "the deferred σ_{i} is frob⁻ⁱ(r)");
+    }
+    let mut sigma_w: Vec<Vec<Wire>> = vec![r_w.clone()];
+    for i in 1..most {
+        let row: Vec<Wire> = (0..m.r.len())
+            .map(|k| {
+                vals.push(ms.sigma[i][k]);
+                let w = sb.input();
+                let sqw = sb.gate(macs, &[zw, w, w])[0];
+                sb.connect(sqw, sigma_w[i - 1][k]);
+                w
+            })
+            .collect();
+        sigma_w.push(row);
+    }
+    let tags: Vec<Wire> = ms
+        .values
+        .iter()
+        .map(|&v| {
+            vals.push(v);
+            sb.input()
+        })
+        .collect();
+    let cols = bus.table_columns();
+    let tag_cols = bus.mult_tag_columns();
+    assert_eq!(tag_cols, ms.columns, "the multiplicity columns' order");
+    let bit_slots = bus.mult_bits();
+    let word_slots = bus.mult_words();
+    assert_eq!(opened_w.len(), bit_slots.len() + word_slots.len(), "bits then words");
+    let (bits_w, words_w) = opened_w.split_at(bit_slots.len());
+    let mut total = zw;
+    for (g, &(p, i)) in groups.iter().enumerate() {
+        let port = &bus.ports[p];
+        let mb = bits_w[bit_slots.binary_search(&port.mult[i]).expect("a bit")];
+        let mut f = beta_w;
+        for (term, &gk) in port.terms.iter().zip(gamma_w) {
+            let mut value = zw;
+            if !term.constant.is_zero() {
+                let c = cw(sb, vals, consts, term.constant);
+                value = sb.gate(macs, &[value, c, ow])[0];
+            }
+            if let Some(iota) = term.word {
+                let w = words_w[word_slots.binary_search(&(i, iota)).expect("a word")];
+                value = sb.gate(macs, &[value, w, ow])[0];
+            }
+            if let Some(tag) = term.row {
+                let c = Bus::column_index(&cols, BusColumn::Tag { ty: port.ty, tag });
+                let tw = tags[tag_cols.binary_search(&(i, c)).expect("a tag column")];
+                value = sb.gate(macs, &[value, tw, ow])[0];
+            }
+            f = sb.gate(macs, &[f, gk, value])[0];
+        }
+        for _ in 0..i {
+            f = sb.gate(macs, &[zw, f, f])[0];
+        }
+        // m·(λ(1 + F) + μ(1 + m))
+        let t1 = sb.gate(macs, &[lam[g], lam[g], f])[0];
+        let t2 = sb.gate(macs, &[mu[g], mu[g], mb])[0];
+        let t = sb.gate(macs, &[t1, t2, ow])[0];
+        total = sb.gate(macs, &[total, mb, t])[0];
+    }
+    // eq(ρ_row, r) = Π(1 + ρ_k + r_k) in characteristic 2.
+    assert_eq!(rho_row_w.len(), r_w.len(), "r spans the rows");
+    let mut e = ow;
+    for (&a, &b) in rho_row_w.iter().zip(&r_w) {
+        let s2 = sb.gate(macs, &[a, b, ow])[0];
+        let s1 = sb.gate(macs, &[s2, ow, ow])[0];
+        e = sb.gate(macs, &[zw, e, s1])[0];
+    }
+    let lhs = sb.gate(macs, &[zw, e, total])[0];
+    sb.connect(lhs, claim);
+    MultWires {
+        sums,
+        r: r_w,
+        sigma: sigma_w,
+        tags,
+    }
 }
 
 /// **The bus's side reconstruction, pinned natively** — the twin of
@@ -336,6 +560,7 @@ pub(super) fn pin_bus_sides(
     chals: &[F128],
     gather: &[F128],
     structure: &BusStructure,
+    mult_structure: Option<&MultStructure>,
 ) {
     let nu = circuit.cells().nu();
     assert_eq!(
@@ -343,21 +568,40 @@ pub(super) fn pin_bus_sides(
         br.r_pt[..nu],
         "the bus columns sit at the walk's row point"
     );
-    assert!(
-        !bus.has_mult(),
-        "recursion does not carry bus multiplicities yet"
-    );
     let cols = bus.structure_columns();
     assert_eq!(structure.values.len(), cols.len(), "one value per column");
     let words = bus.words();
-    assert_eq!(gather.len(), words.len(), "one gather per bus word");
+    let (gather, opened) = gather.split_at(words.len());
     let beta = chals[br.beta_ch];
     let gamma: Vec<F128> = (0..bus.width).map(|k| chals[br.beta_ch + 1 + k]).collect();
+    let sums: Vec<F128> = match &br.mult {
+        Some(m) => pin_bus_mult(
+            bus,
+            mult_structure.expect("the multiplicity columns travel"),
+            m,
+            chals,
+            opened,
+            beta,
+            &gamma,
+            &br.r_pt[..nu],
+        ),
+        None => {
+            assert!(opened.is_empty(), "one gather per bus word");
+            Vec::new()
+        }
+    };
+    let mult_groups = bus.mult_groups();
     let eq_port = build_eq(&br.r_pt[nu..]);
     let column = |col: BusColumn| structure.values[Bus::column_index(&cols, col)];
     let side = |dir: BusDirection| -> F128 {
         let mut acc = F128::ONE;
-        for (g, port) in bus.side(dir).into_iter().enumerate() {
+        for (g, (p, bit)) in bus.groups(dir).into_iter().enumerate() {
+            let port = &bus.ports[p];
+            if let Some(i) = bit {
+                let at = mult_groups.iter().position(|&x| x == (p, i)).expect("a multiplicity group");
+                acc += eq_port[g] * sums[at];
+                continue;
+            }
             let mass = column(BusColumn::Live { ty: port.ty });
             let mut inner = (beta + F128::ONE) * mass;
             for (term, &gk) in port.terms.iter().zip(&gamma) {
@@ -384,6 +628,68 @@ pub(super) fn pin_bus_sides(
         br.claim_r,
         "the receive side rebuilds"
     );
+}
+
+/// **The multiplicity sumcheck, pinned natively** (`bus::verify_mult`):
+/// the batched claim through every round's cubic, σ_i = frob⁻ⁱ(r), and the
+/// groups' total at r against the final claim, from located words (the
+/// sums, the rounds, the opened bits and words). Returns the sums.
+#[allow(clippy::too_many_arguments)]
+fn pin_bus_mult(
+    bus: &Bus,
+    tags: &MultStructure,
+    m: &MultRec,
+    chals: &[F128],
+    opened: &[F128],
+    beta: F128,
+    gamma: &[F128],
+    rho_row: &[F128],
+) -> Vec<F128> {
+    use flock_core::circuit::bus::{eq_at, frob, frob_inv, interpolate};
+    let groups = bus.mult_groups();
+    let n = groups.len();
+    let lambda: Vec<F128> = (0..n).map(|g| chals[m.lam_ch + g]).collect();
+    let mu: Vec<F128> = (0..n).map(|g| chals[m.lam_ch + n + g]).collect();
+    let bit_slots = bus.mult_bits();
+    let word_slots = bus.mult_words();
+    assert_eq!(opened.len(), bit_slots.len() + word_slots.len(), "bits then words");
+    let (bits, words) = opened.split_at(bit_slots.len());
+    let sums: Vec<F128> = m.sums.clone();
+    let mut claim = sums.iter().zip(&lambda).fold(F128::ZERO, |a, (&s, &l)| a + l * s);
+    for (k, s) in m.round_values.iter().enumerate() {
+        let rk = chals[m.rounds[k].1];
+        claim = interpolate([s[0], claim + s[0], s[1], s[2]], rk);
+    }
+    let most = bus.ports.iter().map(|p| p.mult.len()).max().unwrap_or(0);
+    let sigma: Vec<Vec<F128>> = (0..most)
+        .map(|i| m.r.iter().map(|&x| frob_inv(x, i)).collect())
+        .collect();
+    assert_eq!(tags.sigma, sigma, "the deferred tag columns sit at the σ_i");
+    let cols = bus.table_columns();
+    let tag_cols = bus.mult_tag_columns();
+    assert_eq!(tags.columns, tag_cols, "the multiplicity columns' order");
+    let bit = |iota: usize| bits[bit_slots.binary_search(&iota).expect("a bit")];
+    let word = |i: usize, iota: usize| words[word_slots.binary_search(&(i, iota)).expect("a word")];
+    let mut total = F128::ZERO;
+    for (g, &(p, i)) in groups.iter().enumerate() {
+        let port = &bus.ports[p];
+        let mb = bit(port.mult[i]);
+        let mut f = beta;
+        for (term, &gk) in port.terms.iter().zip(gamma) {
+            let mut value = term.constant;
+            if let Some(iota) = term.word {
+                value += word(i, iota);
+            }
+            if let Some(tag) = term.row {
+                let c = Bus::column_index(&cols, BusColumn::Tag { ty: port.ty, tag });
+                value += tags.values[tag_cols.binary_search(&(i, c)).expect("a tag column")];
+            }
+            f += gk * value;
+        }
+        total += mb * (lambda[g] * (F128::ONE + frob(f, i)) + mu[g] * (F128::ONE + mb));
+    }
+    assert_eq!(eq_at(rho_row, &m.r) * total, claim, "the multiplicity sumcheck closes");
+    sums
 }
 
 /// The eq table's `live` prefix over `point_w` wires (LSB-first —
@@ -433,6 +739,7 @@ pub(super) fn circuit_structure_claim_wires(
     element_point: Option<&[Wire]>,
     element_values: Option<(Wire, Wire)>,
     bus: Option<(&[Wire], &[Wire])>,
+    bus_mult: Option<(&[Vec<Wire>], &[Wire])>,
     public_columns: Option<(&[Wire], &[Wire])>,
     zw: Wire,
     ow: Wire,
@@ -490,6 +797,18 @@ pub(super) fn circuit_structure_claim_wires(
         }
     } else {
         assert!(bus.is_none(), "bus wires without a bus structure");
+    }
+    // The row-tag columns at each σ_i of the multiplicity sumcheck: plane 6.
+    if let Some(m) = &sigma.bus_mult {
+        let (sigma_w, value_w) = bus_mult.expect("multiplicity structure wires");
+        assert_eq!(value_w.len(), m.values.len(), "multiplicity column wires");
+        for (&(i, c), &vw) in m.columns.iter().zip(value_w) {
+            let mut col: Vec<Wire> = (0..sigma.base_bits).map(|j| bit((c >> j) & 1)).collect();
+            col.extend_from_slice(&selector(6));
+            out.push((sigma_w[i].to_vec(), col, vw));
+        }
+    } else {
+        assert!(bus_mult.is_none(), "multiplicity wires without their structure");
     }
     // The public columns' values at the wiring's row point: plane 7.
     if let Some(structure) = &sigma.public_columns {

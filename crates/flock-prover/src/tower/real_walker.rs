@@ -1999,6 +1999,7 @@ pub(super) fn emit_real_child_region(
         Some((asum_w, bsum_w)),
         None,
         None,
+        None,
         zw,
         ow,
     );
@@ -3043,6 +3044,7 @@ pub(super) fn check_real_child_region(public: &[F128], rt: &RealTape<'_>, r: &Re
         boolean_pins: rt.sigma_native.boolean_pins.clone(),
         element_constants: rt.sigma_native.element_constants.clone(),
         bus: rt.sigma_native.bus.clone(),
+        bus_mult: rt.sigma_native.bus_mult.clone(),
         public_columns: rt.sigma_native.public_columns.clone(),
     };
     assert_eq!(sa.rho, rt.sigma_native.rho, "the emitted sigma point");

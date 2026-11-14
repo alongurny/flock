@@ -1184,6 +1184,10 @@ pub struct SigmaAssertion {
     /// The tuple bus's static columns at its row point
     /// ([`bus::Bus::structure_columns`]), when the circuit has a bus.
     pub bus: Option<BusStructure>,
+    /// The bus's row-tag columns at each `σ_i` of its multiplicity
+    /// sumcheck (plane 6, like [`Self::bus`]), when a port has bits.
+    #[serde(default)]
+    pub bus_mult: Option<bus::MultStructure>,
     /// The public columns' values at the grand product's row point
     /// ([`Circuit::public_columns`], in that order), when the circuit opens
     /// any: each a function of fixed public words only, so a static column
@@ -1278,6 +1282,22 @@ impl SigmaAssertion {
                 });
             }
         }
+        if let Some(m) = &self.bus_mult {
+            // Which column each value is: the circuit's
+            // `Bus::mult_tag_columns`, carried here as the claim's column.
+            let base_bits = self.matrix_base_bits();
+            for (&(i, c), &value) in m.columns.iter().zip(&m.values) {
+                let mut col: Vec<F128> = (0..base_bits)
+                    .map(|j| F128::new(((c >> j) & 1) as u64, 0))
+                    .collect();
+                col.extend((0..3).map(|j| F128::new(((Self::BUS_PLANE >> j) & 1) as u64, 0)));
+                claims.push(MatrixClaim {
+                    row: Weight::eq(m.sigma[i].clone()),
+                    col: Weight::eq(col),
+                    value,
+                });
+            }
+        }
         if let Some(pc) = &self.public_columns {
             let base_bits = self.matrix_base_bits();
             for (c, &value) in pc.values.iter().enumerate() {
@@ -1317,6 +1337,11 @@ impl SigmaAssertion {
         }
         if let Some(bus) = &self.bus {
             out.extend_from_slice(&bus.rho_row);
+        }
+        if let Some(m) = &self.bus_mult {
+            for s in &m.sigma {
+                out.extend_from_slice(s);
+            }
         }
         if let Some(pc) = &self.public_columns {
             out.extend_from_slice(&pc.rho_row);
@@ -1375,7 +1400,7 @@ impl<'a> CircuitStructureMatrix<'a> {
         };
         let bus_cols = circuit
             .bus()
-            .map_or_else(Vec::new, |bus| bus.structure_columns());
+            .map_or_else(Vec::new, |bus| bus.table_columns());
         let base_cols = cell_cols
             .max(element_cols)
             .max(circuit.registry().num_boolean().next_power_of_two())
@@ -1639,6 +1664,7 @@ fn verify_wiring_core<C: Challenger>(
         boolean_pins: Vec::new(),
         element_constants: None,
         bus: None,
+        bus_mult: None,
         public_columns: None,
     };
     let mut gather: Vec<(Vec<F128>, F128)> = gathered
@@ -1667,9 +1693,10 @@ fn verify_wiring_core<C: Challenger>(
     assertion.public_columns = public_columns;
     match (circuit.bus(), &proof.bus) {
         (Some(bus), Some(bus_proof)) => {
-            let (claims, structure) = bus::verify_bus(circuit, bus, bus_proof, grinding, ch)?;
+            let (claims, structure, mult) = bus::verify_bus(circuit, bus, bus_proof, grinding, ch)?;
             gather.extend(claims);
             assertion.bus = Some(structure);
+            assertion.bus_mult = mult;
         }
         (None, None) => {}
         _ => return Err(WiringError::MalformedProof),
@@ -2615,6 +2642,32 @@ mod tests {
             }
         }
         packed
+    }
+
+    /// With multiplicities, the deferred verify also hands over the row-tag
+    /// columns at each `σ_i`: they discharge, and a wrong value does not.
+    #[test]
+    fn bus_multiplicity_tags_defer_to_the_sigma_assertion() {
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let circuit = lookup_circuit(&reg, vec![4, 5]);
+        let mut rng = Rng::new(0xB05_0101);
+        let packed = lookup_buffer(&circuit, &reg, [3, 1, 2, 3], &mut rng);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (proof, _) = prove_wiring(&circuit, &packed, &[], &mut ch);
+        let mut ch = FsChallenger::new(b"circuit-unit");
+        let (_, assertion) =
+            verify_wiring_deferred(&circuit, &[], &proof, &mut ch).expect("deferred verify");
+        let m = assertion.bus_mult.as_ref().expect("the multiplicity columns travel");
+        assert_eq!(m.columns, circuit.bus().unwrap().mult_tag_columns());
+        assert_eq!(m.sigma.len(), 2, "one point per count bit");
+        assert!(assertion.check(&circuit), "the multiplicity columns discharge");
+        for i in 0..m.values.len() {
+            let mut bad = assertion.clone();
+            bad.bus_mult.as_mut().unwrap().values[i] += F128::ONE;
+            assert!(!bad.check(&circuit), "multiplicity column {i}");
+        }
+        eprintln!("{} multiplicity tag columns", m.values.len());
     }
 
     /// A table row counted 1 to 3 times balances its requests; a count off by

@@ -115,7 +115,7 @@ use crate::{
             strat_scheds,
         },
         gkr::{
-            BusRec, ElPiopRec, GkrLayerRec, GkrRec, assertion_mac, circuit_structure_claim_wires,
+            BusRec, ElPiopRec, GkrLayerRec, GkrRec, MultWires, assertion_mac, circuit_structure_claim_wires,
             emit_ag_point_binding, emit_boolean_reported_check, emit_bus,
             emit_element_reported_check, emit_gkr_layers, emit_lagrange_lows, emit_nonzero_top,
             emit_recombination, pin_bus_sides, pin_recombination, recombination_positions,
@@ -151,6 +151,7 @@ mod gates_glue;
 mod gates_leaf;
 mod gates_spine;
 mod geometry;
+mod lean_leaf;
 mod gkr;
 mod node;
 mod online;

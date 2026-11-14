@@ -37,7 +37,7 @@ use {
 use crate::{
     r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
-        BusRec, CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind,
+        BusRec, CollapsedSlots, ElPiopRec, MultWires, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind,
         InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN, KEY_TRANSPOSE_DOT, LeafEvalGate,
         LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec, OpenLevel,
         PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
@@ -354,7 +354,16 @@ impl<'p> ChildTape<'p> {
             built.shape.circuit.public_columns().count(),
             "one value per public column"
         );
-        let bus_gather: &[F128] = proof.wiring().bus.as_ref().map_or(&[], |b| &b.gather);
+        // The bus's pd claims: its gathers at ρ_row, then (with
+        // multiplicities) the bits at r and the words at each σ_i.
+        let bus_gather: Vec<F128> = proof.wiring().bus.as_ref().map_or(Vec::new(), |b| {
+            let mut v = b.gather.clone();
+            if let Some(m) = &b.mult {
+                v.extend(&m.bits);
+                v.extend(&m.words);
+            }
+            v
+        });
         let n_bus = bus_gather.len();
         assert_eq!(
             pd_recs.len(),
@@ -366,7 +375,7 @@ impl<'p> ChildTape<'p> {
             .gather
             .iter()
             .chain(pubcol)
-            .chain(bus_gather)
+            .chain(&bus_gather)
             .enumerate()
         {
             assert_eq!(
@@ -476,6 +485,7 @@ impl<'p> ChildTape<'p> {
                     .map(|pd| vals_rec[pd.val_v])
                     .collect::<Vec<_>>(),
                 sigma_native.bus.as_ref().expect("the bus columns travel"),
+                sigma_native.bus_mult.as_ref(),
             );
         }
         let params_i = JaggedParams::from_heights(&union.jagged_heights(), n_log_i, m_mp2);
@@ -812,6 +822,19 @@ impl<'p> ChildTape<'p> {
             if let (Some(bus), Some(br)) = (built.shape.circuit.bus(), &bus_rec) {
                 for iota in bus.words() {
                     v.push(cells.gate_claim_point(iota, &br.r_pt[..cells.nu()]));
+                }
+                if let Some(m) = &br.mult {
+                    for iota in bus.mult_bits() {
+                        v.push(cells.gate_claim_point(iota, &m.r));
+                    }
+                    for (i, iota) in bus.mult_words() {
+                        let sigma: Vec<F128> = m
+                            .r
+                            .iter()
+                            .map(|&x| flock_core::circuit::bus::frob_inv(x, i))
+                            .collect();
+                        v.push(cells.gate_claim_point(iota, &sigma));
+                    }
                 }
             }
             v
@@ -1762,24 +1785,6 @@ impl<'p> ChildTape<'p> {
     ) -> (Vec<F128>, F128, F128, F128) {
         if let Some(el_rec) = &el_rec {
             let el_assert = el_assert.as_ref().expect("element assertion");
-            // This strip-sum arm HARD-CODES the single-slot zero-prefix
-            // degenerate case of the REAL side's general region loop
-            // (`real_walker::element_piop_natives` walks every element
-            // slot with its own kappa and region prefix). Assert the
-            // shape it assumes, so a multi-slot or offset element union
-            // fails HERE instead of silently mis-summing — port the
-            // general loop when this fires.
-            let slots_el = region_slots(union);
-            assert_eq!(
-                slots_el.len(),
-                1,
-                "one element slot type (else port real_walker's general strip loop)"
-            );
-            assert_eq!(
-                slots_el[0].layout.region_prefix(union.n_log()),
-                0,
-                "the element region starts the space (else port real_walker's general strip loop)"
-            );
             let mut el_g0: Vec<F128> = Vec::new();
             let mut el_run_n = F128::ZERO;
             for (k, &(gv, _, ch)) in el_rec.zc_rounds.iter().enumerate() {
@@ -1794,22 +1799,26 @@ impl<'p> ChildTape<'p> {
                 el_assert.alpha, chals[el_rec.alpha_ch],
                 "the located alpha is the assertion's"
             );
+            // The strip sums over every element slot type, each with its
+            // own κ and region prefix (`real_walker::element_piop_natives`).
             let (a_sum_n, b_sum_n) = {
-                let mt = MacGate::new();
-                let kappa = mt.ty.kappa();
-                let eq_con = build_eq(&el_assert.r_con[..kappa]);
-                // Single slot at the region start: the prefix bits are all
-                // zero, so the region weight is the all-zero eq pattern.
-                let w = el_assert.r_con[kappa..]
-                    .iter()
-                    .fold(F128::ONE, |acc, &x| acc * (F128::ONE + x));
-                let dot = |c: &[F128]| -> F128 {
-                    eq_con
-                        .iter()
-                        .zip(c)
-                        .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
-                };
-                (w * dot(mt.ty.a_const()), w * dot(mt.ty.b_const()))
+                let nu_i = union.n_log();
+                let (mut a_sum, mut b_sum) = (F128::ZERO, F128::ZERO);
+                for s in &region_slots(union) {
+                    let kappa = s.ty.kappa();
+                    let eq_con = build_eq(&el_assert.r_con[..kappa]);
+                    let prefix = s.layout.region_prefix(nu_i);
+                    let mut w = F128::ONE;
+                    for (j, &x) in el_assert.r_con[kappa..].iter().enumerate() {
+                        w *= if (prefix >> j) & 1 == 1 { x } else { F128::ONE + x };
+                    }
+                    let dot = |c: &[F128]| -> F128 {
+                        eq_con.iter().zip(c).fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
+                    };
+                    a_sum += w * dot(s.ty.a_const());
+                    b_sum += w * dot(s.ty.b_const());
+                }
+                (a_sum, b_sum)
             };
             (el_g0, el_run_n, a_sum_n, b_sum_n)
         } else {
@@ -2227,7 +2236,7 @@ pub(super) fn emit_child_region(
     );
     // The tuple bus, after the wiring on its fork: its gathers are the pd
     // claims after the wiring's.
-    let bus_w: Option<(Vec<Wire>, Vec<Wire>)> = ct.bus.as_ref().map(|br| {
+    let bus_w: Option<(Vec<Wire>, Vec<Wire>, Option<MultWires>)> = ct.bus.as_ref().map(|br| {
         let gather_w: Vec<Wire> = (0..ct.n_bus)
             .map(|k| wv(ct.gammas_o[n_el_pd + ct.n_wire + ct.n_pubcol + k].val_v))
             .collect();
@@ -2241,6 +2250,7 @@ pub(super) fn emit_child_region(
                 .bus
                 .as_ref()
                 .expect("the bus columns travel"),
+            ct.sigma_native.bus_mult.as_ref(),
             &gather_w,
             trace,
             &outs,
@@ -2295,7 +2305,7 @@ pub(super) fn emit_child_region(
         &mp_sig_w,
         anc_w,
         &pt_w,
-        bus_w.as_ref().map(|(p, _)| &p[..]),
+        bus_w.as_ref().map(|(p, _, m)| (&p[..], m.as_ref())),
         (pfslot, pf_w),
         n_el_pd,
         vals,
@@ -2447,7 +2457,11 @@ pub(super) fn emit_child_region(
         element_values,
         bus_w
             .as_ref()
-            .map(|(p, c)| (&p[..ct.inner.built.shape.circuit.cells().nu()], &c[..])),
+            .map(|(p, c, _)| (&p[..ct.inner.built.shape.circuit.cells().nu()], &c[..])),
+        bus_w
+            .as_ref()
+            .and_then(|(_, _, m)| m.as_ref())
+            .map(|m| (&m.sigma[..], &m.tags[..])),
         // The public columns' pd values, at the wiring's row point.
         (ct.n_pubcol > 0).then_some((
             &pt_w[..ct.inner.built.shape.circuit.cells().nu()],
@@ -2839,7 +2853,7 @@ fn emit_anchor_expect(
     mp_sig_w: &[Wire],
     anc_w: Wire,
     pt_w: &[Wire],
-    bus_pt_w: Option<&[Wire]>,
+    bus_pt_w: Option<(&[Wire], Option<&MultWires>)>,
     pf: (SlotId, usize),
     n_el_pd: usize,
     vals: &mut Vec<F128>,
@@ -3063,7 +3077,20 @@ fn emit_anchor_expect(
         for layer in (0..=m_mp2).rev() {
             let za = if layer < n_log_i {
                 if members[0] >= n_el_pd + ct.n_wire + ct.n_pubcol {
-                    bus_pt_w.expect("a bus gather group")[layer]
+                    // The bus's pd claims: gathers at ρ_row, then the
+                    // multiplicity bits at r, then the words at their σ_i.
+                    let (pt, mult) = bus_pt_w.expect("a bus gather group");
+                    let bus = ct.inner.built.shape.circuit.bus().expect("a bus");
+                    let k = members[0] - (n_el_pd + ct.n_wire + ct.n_pubcol);
+                    let (n_words, n_bits) = (bus.words().len(), bus.mult_bits().len());
+                    if k < n_words {
+                        pt[layer]
+                    } else if k < n_words + n_bits {
+                        mult.expect("multiplicity wires").r[layer]
+                    } else {
+                        let i = bus.mult_words()[k - n_words - n_bits].0;
+                        mult.expect("multiplicity wires").sigma[i][layer]
+                    }
                 } else if members[0] >= n_el_pd {
                     pt_w[layer]
                 } else {
@@ -3211,6 +3238,7 @@ pub(super) fn check_child_region(public: &[F128], ct: &ChildTape<'_>, r: &ChildR
             boolean_pins: ct.sigma_native.boolean_pins.clone(),
             element_constants: ct.sigma_native.element_constants.clone(),
             bus: ct.sigma_native.bus.clone(),
+            bus_mult: ct.sigma_native.bus_mult.clone(),
             public_columns: ct.sigma_native.public_columns.clone(),
         };
         assert_eq!(sa.rho, ct.sigma_native.rho, "the emitted sigma point");

@@ -252,7 +252,7 @@ impl BusColumn {
     }
 
     /// `Σ_{j<live} eq(ρ_row, j)·entry(j)`.
-    fn eval(&self, circuit: &Circuit, rho_row: &[F128], eq_row: &[F128]) -> F128 {
+    pub fn eval(&self, circuit: &Circuit, rho_row: &[F128], eq_row: &[F128]) -> F128 {
         let rows = eq_row.len();
         match *self {
             BusColumn::Live { ty } => {
@@ -274,6 +274,16 @@ impl BusColumn {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BusStructure {
     pub rho_row: Vec<F128>,
+    pub values: Vec<F128>,
+}
+
+/// The multiplicity sumcheck's deferred static evaluations: each `σ_i`
+/// and the row-tag columns' values there ([`Bus::mult_tag_columns`] order).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultStructure {
+    pub sigma: Vec<Vec<F128>>,
+    /// [`Bus::mult_tag_columns`]: `(i, column)` per value.
+    pub columns: Vec<(usize, usize)>,
     pub values: Vec<F128>,
 }
 
@@ -387,6 +397,22 @@ impl Bus {
         cols
     }
 
+    /// The bus plane of the circuit-structure table: the
+    /// [`Self::structure_columns`], then each row-tag column only the ports
+    /// with multiplicities read (evaluated at the `σ_i`).
+    pub fn table_columns(&self) -> Vec<BusColumn> {
+        let mut cols = self.structure_columns();
+        for port in self.ports.iter().filter(|p| !p.mult.is_empty()) {
+            for tag in port.terms.iter().filter_map(|t| t.row) {
+                let col = BusColumn::Tag { ty: port.ty, tag };
+                if !cols.contains(&col) {
+                    cols.push(col);
+                }
+            }
+        }
+        cols
+    }
+
     /// The column index of `col` in [`Self::structure_columns`].
     pub fn column_index(cols: &[BusColumn], col: BusColumn) -> usize {
         cols.iter().position(|&c| c == col).expect("a bus column")
@@ -447,6 +473,33 @@ impl Bus {
         bits.sort_unstable();
         bits.dedup();
         bits
+    }
+
+    /// `(i, column)` for each row-tag column (an index into
+    /// [`Self::table_columns`]) a port with at least `i + 1` bits reads,
+    /// by `i` then column: evaluated at `σ_i`, deferred like the columns at
+    /// `ρ_row` ([`MultStructure`]).
+    pub fn mult_tag_columns(&self) -> Vec<(usize, usize)> {
+        let cols = self.table_columns();
+        let most = self.ports.iter().map(|p| p.mult.len()).max().unwrap_or(0);
+        let mut out = Vec::new();
+        for i in 0..most {
+            let mut at: Vec<usize> = self
+                .ports
+                .iter()
+                .filter(|p| p.mult.len() > i)
+                .flat_map(|p| {
+                    p.terms
+                        .iter()
+                        .filter_map(|t| t.row.map(|tag| BusColumn::Tag { ty: p.ty, tag }))
+                })
+                .map(|c| Self::column_index(&cols, c))
+                .collect();
+            at.sort_unstable();
+            at.dedup();
+            out.extend(at.into_iter().map(|c| (i, c)));
+        }
+        out
     }
 
     /// `(i, cell-slot)` for each word a port with at least `i + 1` bits
@@ -625,7 +678,7 @@ pub(crate) fn verify_bus<C: Challenger>(
     proof: &BusProof,
     grinding: BatchedGrinding,
     ch: &mut C,
-) -> Result<(Vec<(Vec<F128>, F128)>, BusStructure), WiringError> {
+) -> Result<(Vec<(Vec<F128>, F128)>, BusStructure, Option<MultStructure>), WiringError> {
     let cells = circuit.cells();
     let nu = cells.nu();
     let rows = 1usize << nu;
@@ -683,9 +736,12 @@ pub(crate) fn verify_bus<C: Challenger>(
         .collect();
     let column = |col: BusColumn| values[Bus::column_index(&cols, col)];
     let mut opened = Vec::new();
+    let mut mult_structure = None;
     let sums: &[F128] = match &proof.mult {
         Some(mult) => {
-            opened = verify_mult(circuit, bus, mult, &challenges, rho_row, ch)?;
+            let (o, m) = verify_mult(circuit, bus, mult, &challenges, rho_row, ch)?;
+            opened = o;
+            mult_structure = Some(m);
             &mult.sums
         }
         None => &[],
@@ -742,6 +798,7 @@ pub(crate) fn verify_bus<C: Challenger>(
             rho_row: rho_row.to_vec(),
             values,
         },
+        mult_structure,
     ))
 }
 
@@ -749,7 +806,7 @@ pub(crate) fn verify_bus<C: Challenger>(
 // Multiplicities: the groups' sumcheck
 // ---------------------------------------------------------------------------
 
-const DOMAIN_MULT: &[u8] = b"flock-tuple-bus-multiplicities-v1";
+pub const DOMAIN_MULT: &[u8] = b"flock-tuple-bus-multiplicities-v1";
 
 /// An opening the multiplicity sumcheck asks for: cell-slot, row point,
 /// value.
@@ -757,7 +814,7 @@ type Opened = (usize, Vec<F128>, F128);
 
 /// `x^{2^i}`.
 #[inline]
-fn frob(mut x: F128, i: usize) -> F128 {
+pub fn frob(mut x: F128, i: usize) -> F128 {
     for _ in 0..i {
         x = x.square();
     }
@@ -765,16 +822,16 @@ fn frob(mut x: F128, i: usize) -> F128 {
 }
 
 /// `x^{2^{-i}}`: Frobenius has order 128 on GF(2^128).
-fn frob_inv(x: F128, i: usize) -> F128 {
+pub fn frob_inv(x: F128, i: usize) -> F128 {
     frob(x, (128 - i % 128) % 128)
 }
 
 /// The sumcheck's third node: the generator `x`; the nodes are `0, 1, x,
 /// x + 1`.
-const NODE: F128 = F128::new(2, 0);
+pub const NODE: F128 = F128::new(2, 0);
 
 /// The cubic through `(0, v0), (1, v1), (x, vx), (x + 1, vx1)` at `r`.
-fn interpolate(v: [F128; 4], r: F128) -> F128 {
+pub fn interpolate(v: [F128; 4], r: F128) -> F128 {
     let nodes = [F128::ZERO, F128::ONE, NODE, NODE + F128::ONE];
     let mut acc = F128::ZERO;
     for k in 0..4 {
@@ -789,7 +846,7 @@ fn interpolate(v: [F128; 4], r: F128) -> F128 {
 }
 
 /// `eq(a, b)` for two points.
-fn eq_at(a: &[F128], b: &[F128]) -> F128 {
+pub fn eq_at(a: &[F128], b: &[F128]) -> F128 {
     a.iter().zip(b).fold(F128::ONE, |acc, (&x, &y)| {
         acc * (x * y + (F128::ONE + x) * (F128::ONE + y))
     })
@@ -999,7 +1056,7 @@ fn verify_mult<C: Challenger>(
     challenges: &Challenges,
     rho_row: &[F128],
     ch: &mut C,
-) -> Result<Vec<Opened>, WiringError> {
+) -> Result<(Vec<Opened>, MultStructure), WiringError> {
     let groups = bus.mult_groups();
     let bit_slots = bus.mult_bits();
     let word_slots = bus.mult_words();
@@ -1031,6 +1088,18 @@ fn verify_mult<C: Challenger>(
         .map(|i| r.iter().map(|&x| frob_inv(x, i)).collect())
         .collect();
     let eq_sigma: Vec<Vec<F128>> = sigma.iter().map(|s| build_eq(s)).collect();
+    // The row-tag columns at each σ_i: static, so deferred in recursion.
+    let cols = bus.table_columns();
+    let tag_cols = bus.mult_tag_columns();
+    let tag_values: Vec<F128> = tag_cols
+        .iter()
+        .map(|&(i, c)| cols[c].eval(circuit, &sigma[i], &eq_sigma[i]))
+        .collect();
+    let tag_at = |i: usize, col: BusColumn| {
+        tag_values[tag_cols
+            .binary_search(&(i, Bus::column_index(&cols, col)))
+            .expect("a multiplicity tag column")]
+    };
     let bit = |iota: usize| proof.bits[bit_slots.binary_search(&iota).expect("a bit")];
     let word = |i: usize, iota: usize| {
         proof.words[word_slots
@@ -1049,7 +1118,7 @@ fn verify_mult<C: Challenger>(
                 value += word(i, iota);
             }
             if let Some(tag) = term.row {
-                value += BusColumn::Tag { ty: port.ty, tag }.eval(circuit, &sigma[i], &eq_sigma[i]);
+                value += tag_at(i, BusColumn::Tag { ty: port.ty, tag });
             }
             f += gk * value;
         }
@@ -1070,7 +1139,14 @@ fn verify_mult<C: Challenger>(
             .zip(&proof.words)
             .map(|(&(i, iota), &v)| (iota, sigma[i].clone(), v)),
     );
-    Ok(opened)
+    Ok((
+        opened,
+        MultStructure {
+            sigma,
+            columns: tag_cols,
+            values: tag_values,
+        },
+    ))
 }
 
 /// Row `j`'s leaf in `port`: `β + Σ_k γ_k·t_k`, reading committed words

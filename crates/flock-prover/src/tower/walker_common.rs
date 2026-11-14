@@ -246,7 +246,7 @@ pub(super) fn walk_bus_gkr(
     assert_eq!(vals_rec[tv + 1], gkr.top_rhs, "bus top_rhs on the stream");
     assert_eq!(gkr.top_lhs, gkr.top_rhs, "the bus products agree");
     i += 2;
-    let (_, layers, r_pt, claim_l, claim_r) = walk_gkr_layers(
+    let (i, layers, r_pt, claim_l, claim_r) = walk_gkr_layers(
         ops,
         vals_rec,
         chals,
@@ -256,7 +256,12 @@ pub(super) fn walk_bus_gkr(
         vc_at,
         fin_at,
     );
+    let mult = bus_proof
+        .mult
+        .as_ref()
+        .map(|m| walk_bus_mult(ops, vals_rec, chals, i, m, vc_at, fin_at));
     BusRec {
+        mult,
         beta_fin,
         beta_ch,
         gamma_fins,
@@ -266,6 +271,100 @@ pub(super) fn walk_bus_gkr(
         r_pt,
         claim_l,
         claim_r,
+    }
+}
+
+/// Consume observe ops worth `n` values from `i`; returns the first value
+/// index and the op after them.
+fn take_observes(ops: &[Op], mut i: usize, n: usize, vc_at: &impl Fn(usize) -> (usize, usize)) -> (usize, usize) {
+    let (v0, _) = vc_at(i);
+    let mut got = 0;
+    while got < n {
+        got += match ops[i] {
+            Op::ObserveScalar => 1,
+            Op::ObserveSlice(k) => k,
+            ref op => panic!("expected {n} observed values, found {op:?} after {got}"),
+        };
+        i += 1;
+    }
+    assert_eq!(got, n, "the observes end on the boundary");
+    (v0, i)
+}
+
+/// One squeeze from `i` (behind any grinds): (challenge index, fin, next op).
+fn take_squeeze(
+    ops: &[Op],
+    mut i: usize,
+    what: &str,
+    vc_at: &impl Fn(usize) -> (usize, usize),
+    fin_at: &impl Fn(usize) -> usize,
+) -> (usize, usize, usize) {
+    while matches!(ops[i], Op::Pow { .. }) {
+        i += 1;
+    }
+    assert!(matches!(ops[i], Op::SqueezeScalar), "{what}");
+    (vc_at(i).1, fin_at(i), i + 1)
+}
+
+/// The multiplicity sumcheck's transcript walk (`bus::verify_mult`): its
+/// label, the groups' sums, λ and μ per group, each round's three values
+/// then its challenge, then the bits and the words. Locates; the values
+/// are checked against the proof here and replayed by `pin_bus_sides`.
+pub(super) fn walk_bus_mult(
+    ops: &[Op],
+    vals_rec: &[F128],
+    chals: &[F128],
+    mut i: usize,
+    m: &flock_core::circuit::bus::MultProof,
+    vc_at: &impl Fn(usize) -> (usize, usize),
+    fin_at: &impl Fn(usize) -> usize,
+) -> crate::tower::gkr::MultRec {
+    use flock_core::circuit::bus::DOMAIN_MULT;
+    assert!(
+        matches!(&ops[i], Op::Label(l) if l.as_slice() == DOMAIN_MULT),
+        "the multiplicities label"
+    );
+    i += 1;
+    let n = m.sums.len();
+    let (sums_v, j) = take_observes(ops, i, n, vc_at);
+    i = j;
+    assert_eq!(&vals_rec[sums_v..sums_v + n], &m.sums[..], "the sums on the stream");
+    let (mut lam_fins, mut mu_fins) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut lam_ch = usize::MAX;
+    for g in 0..2 * n {
+        let (c, f, j) = take_squeeze(ops, i, "a batching challenge", vc_at, fin_at);
+        i = j;
+        if g == 0 {
+            lam_ch = c;
+        }
+        assert_eq!(c, lam_ch + g, "the batching challenges are adjacent");
+        if g < n { lam_fins.push(f) } else { mu_fins.push(f) }
+    }
+    let mut rounds = Vec::with_capacity(m.rounds.len());
+    let mut r = Vec::with_capacity(m.rounds.len());
+    for (k, s) in m.rounds.iter().enumerate() {
+        let (v, j) = take_observes(ops, i, 3, vc_at);
+        assert_eq!(&vals_rec[v..v + 3], &s[..], "round {k} on the stream");
+        let (c, f, j) = take_squeeze(ops, j, "a round challenge", vc_at, fin_at);
+        i = j;
+        rounds.push((v, c, f));
+        r.push(chals[c]);
+    }
+    let (bits_v, j) = take_observes(ops, i, m.bits.len(), vc_at);
+    assert_eq!(&vals_rec[bits_v..bits_v + m.bits.len()], &m.bits[..], "the bits on the stream");
+    let (words_v, _) = take_observes(ops, j, m.words.len(), vc_at);
+    assert_eq!(&vals_rec[words_v..words_v + m.words.len()], &m.words[..], "the words on the stream");
+    crate::tower::gkr::MultRec {
+        sums_v,
+        lam_ch,
+        lam_fins,
+        mu_fins,
+        rounds,
+        r,
+        bits_v,
+        words_v,
+        sums: m.sums.clone(),
+        round_values: m.rounds.clone(),
     }
 }
 
