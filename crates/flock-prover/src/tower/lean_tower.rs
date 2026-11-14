@@ -63,25 +63,60 @@ fn proof_bytes(p: &MixedProof) -> usize {
 /// Prove the tower over `pieces` (uniform leaves of one profile, an even
 /// count of at least four) and verify its root: the statement checks and
 /// the discharge. Panics on any failure; returns the timings.
-pub fn prove_lean_tower(cfg: TowerConfig, pieces: &[Piece], env: LeanEnvelope) -> LeanTowerReport {
-    let n = pieces.len();
+pub fn prove_lean_tower(
+    cfg: TowerConfig,
+    pieces: Vec<Piece>,
+    env: LeanEnvelope,
+) -> LeanTowerReport {
+    let words: Vec<[u8; 32]> = pieces.iter().map(leaf_word).collect();
+    let mut held: Vec<Option<Piece>> = pieces.into_iter().map(Some).collect();
+    let p0 = held[0].take().expect("leaf 0");
+    prove_lean_tower_streaming(
+        cfg,
+        &words,
+        p0,
+        |i| held[i].take().expect("each leaf once"),
+        env,
+        |line| eprintln!("{line}"),
+    )
+}
+
+/// A leaf's word in the commitment tree: its publics digest chained with
+/// its commitment cap (the first pass of a run: commit only).
+pub fn leaf_word(p: &Piece) -> [u8; 32] {
+    lean_leaf_word(&p.public(), &p.commit().cap)
+}
+
+/// [`prove_lean_tower`] holding one leaf pair at a time: `words` are the
+/// leaves' words from a first pass ([`leaf_word`]), `piece0` is leaf 0
+/// (kept to the end: the lane's tables), and `piece(i)` builds leaf `i`,
+/// asked for in DECREASING order from `n - 1` down to 1 (the spine folds
+/// from the tail). `progress` hears a line per proof.
+pub fn prove_lean_tower_streaming(
+    cfg: TowerConfig,
+    words: &[[u8; 32]],
+    piece0: Piece,
+    mut piece: impl FnMut(usize) -> Piece,
+    env: LeanEnvelope,
+    mut progress: impl FnMut(&str),
+) -> LeanTowerReport {
+    let n = words.len();
     assert!(n >= 4 && n % 2 == 0, "leaf pairs, at least two of them");
     set_envelope_override(Some((env.nu, env.lanes, env.m)));
 
     // ---- THE STATEMENT: the commitment root, and its challenges ----
-    let words: Vec<[u8; 32]> = pieces
-        .iter()
-        .map(|p| lean_leaf_word(&p.public(), &p.commit().cap))
-        .collect();
-    let root_digest = lean_cone_root(&words);
+    let root_digest = lean_cone_root(words);
     let ch = shared_challenges_from_root(&root_digest);
     let seed = challenge_seed(&ch);
 
-    // ---- LEAVES + FIRST LEVEL, a pair at a time; leaf 0 stays as the
-    // lane's table owner ----
-    let leaf = |i: usize| build_lean_leaf(&pieces[i], Some(&ch), &(i as u64).to_le_bytes());
+    // ---- LEAF 0, the lane's table owner ----
     let t = Instant::now();
-    let leaf0 = leaf(0);
+    let leaf0 = build_lean_leaf(&piece0, Some(&ch), &0u64.to_le_bytes());
+    assert_eq!(
+        lean_leaf_word(&leaf0.built.witness.public, &leaf0.commitment.cap),
+        words[0],
+        "leaf 0's word from the first pass"
+    );
     let mut leaf_prove_ms = t.elapsed().as_secs_f64() * 1e3;
     let registry = &leaf0.built.shape.registry;
     let family = FlFamily {
@@ -91,7 +126,7 @@ pub fn prove_lean_tower(cfg: TowerConfig, pieces: &[Piece], env: LeanEnvelope) -
             .iter()
             .map(|ty| (&ty.a_0, &ty.b_0))
             .collect(),
-        circs: pieces[0].lincheck_circuits(),
+        circs: piece0.lincheck_circuits(),
         lane_words: None,
         shared: None,
         env_nu: Some(env.nu),
@@ -111,31 +146,49 @@ pub fn prove_lean_tower(cfg: TowerConfig, pieces: &[Piece], env: LeanEnvelope) -
     drop(u);
     let fl_domain: &'static [u8] = b"cas-lean-fl-node-v0";
     let mut fl_prove_ms = 0.0;
-    let mut fls = Vec::with_capacity(n / 2);
-    for j in 0..n / 2 {
+    let mut node_prove_ms = 0.0;
+    // First-level node j over leaves 2j, 2j+1 (leaf 0 is held).
+    let mut fl = |j: usize, leaf_prove_ms: &mut f64, progress: &mut dyn FnMut(&str)| {
         let t = Instant::now();
+        let mut build = |i: usize| {
+            let p = piece(i);
+            let l = build_lean_leaf(&p, Some(&ch), &(i as u64).to_le_bytes());
+            assert_eq!(
+                lean_leaf_word(&l.built.witness.public, &l.commitment.cap),
+                words[i],
+                "leaf {i}'s word from the first pass"
+            );
+            l
+        };
+        let l1 = build(2 * j + 1);
         let a: MixedInner;
         let l0 = if j == 0 {
             &leaf0
         } else {
-            a = leaf(2 * j);
+            a = build(2 * j);
             &a
         };
-        let l1 = leaf(2 * j + 1);
-        leaf_prove_ms += t.elapsed().as_secs_f64() * 1e3;
-        let fl = build_first_level_core(
+        *leaf_prove_ms += t.elapsed().as_secs_f64() * 1e3;
+        let f = build_first_level_core(
             cfg,
             fl_domain,
             &[l0, &l1],
             &family,
             &FlApp::LeanBus { seed },
         );
-        fl_prove_ms += fl.t.prove_ms;
-        fls.push(fl);
-    }
-    let app_base = fls[0].stmt_base;
-    let claims_base = fls[0].fold_pub_base;
-    let block_words = lane_block_words(&fls[0].acc);
+        progress(&format!(
+            "first-level node {j}: prove {:.0} ms",
+            f.t.prove_ms
+        ));
+        f
+    };
+    let k = n / 2;
+    let fl_last = fl(k - 1, &mut leaf_prove_ms, &mut progress);
+    let fl_prev = fl(k - 2, &mut leaf_prove_ms, &mut progress);
+    fl_prove_ms += fl_last.t.prove_ms + fl_prev.t.prove_ms;
+    let app_base = fl_last.stmt_base;
+    let claims_base = fl_last.fold_pub_base;
+    let block_words = lane_block_words(&fl_last.acc);
     macro_rules! lane {
         ($priors:expr) => {
             ChainLane {
@@ -154,29 +207,34 @@ pub fn prove_lean_tower(cfg: TowerConfig, pieces: &[Piece], env: LeanEnvelope) -
         };
     }
 
-    // ---- THE BASE over the last two first-level nodes, then the SPINE ----
-    let k = fls.len();
-    let mut node_prove_ms = 0.0;
-    let base_priors = [&fls[k - 2].acc, &fls[k - 1].acc];
+    // ---- THE BASE over the last two first-level nodes, then the SPINE,
+    // one first-level node at a time ----
+    let base_priors = [&fl_prev.acc, &fl_last.acc];
     let base: NodeOut = build_node_outer_app(
         cfg,
-        &[&fls[k - 2].lo, &fls[k - 1].lo],
+        &[&fl_prev.lo, &fl_last.lo],
         Some(app_base),
         Some(lane!(&base_priors)),
         None,
     );
     node_prove_ms += base.online.prove_ms;
-    let (base, root) = if k == 2 {
-        (None, base)
+    progress(&format!("base node: prove {:.0} ms", base.online.prove_ms));
+    let (fl0, base, root) = if k == 2 {
+        drop(fl_last);
+        (fl_prev, None, base)
     } else {
+        drop((fl_last, fl_prev));
         let mut cur: Option<NodeOut> = None;
+        let mut fl0 = None;
         for i in (0..k - 2).rev() {
+            let f = fl(i, &mut leaf_prove_ms, &mut progress);
+            fl_prove_ms += f.t.prove_ms;
             let prev = cur.as_ref().unwrap_or(&base);
             let prev_lane = prev.lane_acc.clone().expect("the lane rides every level");
-            let priors = [&fls[i].acc, &prev_lane];
+            let priors = [&f.acc, &prev_lane];
             let nd = build_node_outer_app(
                 cfg,
-                &[&fls[i].lo, &prev.lo],
+                &[&f.lo, &prev.lo],
                 Some(app_base),
                 Some(lane!(&priors)),
                 Some(SpineIn {
@@ -186,6 +244,10 @@ pub fn prove_lean_tower(cfg: TowerConfig, pieces: &[Piece], env: LeanEnvelope) -
                 }),
             );
             node_prove_ms += nd.online.prove_ms;
+            progress(&format!(
+                "spine node {i}: prove {:.0} ms",
+                nd.online.prove_ms
+            ));
             if let Some(c) = &cur {
                 assert_eq!(
                     nd.lo.shape.circuit.digest(),
@@ -194,8 +256,15 @@ pub fn prove_lean_tower(cfg: TowerConfig, pieces: &[Piece], env: LeanEnvelope) -
                 );
             }
             cur = Some(nd);
+            if i == 0 {
+                fl0 = Some(f);
+            }
         }
-        (Some(base), cur.expect("k > 2 built a spine node"))
+        (
+            fl0.expect("first-level node 0"),
+            Some(base),
+            cur.expect("k > 2 built a spine node"),
+        )
     };
 
     // ---- THE ROOT: the statement from its publics, then the discharge ----
@@ -230,7 +299,7 @@ pub fn prove_lean_tower(cfg: TowerConfig, pieces: &[Piece], env: LeanEnvelope) -
         "the lane's jagged entry"
     );
     discharge_outer(
-        &fls[0].lo,
+        &fl0.lo,
         &root.lo,
         base.as_ref(),
         &root.acc,
@@ -281,7 +350,7 @@ fn lean_tower_spine() {
     }
     let r = prove_lean_tower(
         super::test_config(),
-        &pieces,
+        pieces,
         LeanEnvelope {
             nu: 15,
             lanes: 40,

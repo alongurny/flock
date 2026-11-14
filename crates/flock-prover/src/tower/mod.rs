@@ -56,6 +56,10 @@ pub use crate::tower::{
         xmss_statement,
     },
 };
+#[cfg(not(target_arch = "aarch64"))]
+pub use crate::tower::lean_tower::{
+    LeanEnvelope, LeanTowerReport, leaf_word, prove_lean_tower, prove_lean_tower_streaming,
+};
 // The wire format (`proof_io`'s tower-root bundle) carries a `MixedProof`.
 pub(crate) use crate::tower::chain::MixedProof;
 use crate::{
@@ -154,6 +158,7 @@ mod gates_spine;
 mod geometry;
 mod gkr;
 mod lean_leaf;
+#[cfg(not(target_arch = "aarch64"))]
 mod lean_tower;
 mod node;
 mod online;
