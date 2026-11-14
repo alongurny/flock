@@ -222,6 +222,13 @@ pub(super) enum FlApp {
     /// publics digests in words 0..2 (2..8 zero); the counter counts
     /// signatures.
     Batches { per_leaf: usize },
+    /// Lean pieces under one shared bus: words 0..2 the commitment digest
+    /// `D = hash_pair(L_0, L_1)` over the leaves' words
+    /// ([`lean_leaf_word`](super::lean_leaf::lean_leaf_word)), 2..4 the
+    /// challenge seed ([`challenge_seed`](super::lean_leaf::challenge_seed)),
+    /// one for both children, 4 and 5 the products of the children's open
+    /// bus products (send, receive); the counter counts leaves.
+    LeanBus { seed: [u8; 32] },
 }
 
 /// What [`build_first_level_core`] hands back; the per-family node types
@@ -360,6 +367,21 @@ pub(super) fn fl_app_words(app: &FlApp, inners: &[&MixedInner]) -> Vec<F128> {
             let mut words = digest_f128(&d).to_vec();
             words.resize(8, F128::ZERO);
             (words, *per_leaf)
+        }
+        FlApp::LeanBus { seed } => {
+            use super::lean_leaf::lean_leaf_word;
+            let word = |i: &MixedInner| lean_leaf_word(&i.built.witness.public, &i.commitment.cap);
+            let d = hash_pair(&word(inners[0]), &word(inners[1]), HashKind::Blake3);
+            let tops = |i: &MixedInner| {
+                let g = &i.proof.wiring().bus.as_ref().expect("a bus").gkr;
+                (g.top_lhs, g.top_rhs)
+            };
+            let (l0, r0) = tops(inners[0]);
+            let (l1, r1) = tops(inners[1]);
+            let mut words = digest_f128(&d).to_vec();
+            words.extend(digest_f128(seed));
+            words.extend([l0 * l1, r0 * r1, F128::ZERO, F128::ZERO]);
+            (words, 1)
         }
     };
     words.push(span_count_word((per_leaf * k_ary) as u128));
@@ -1404,6 +1426,44 @@ pub(super) fn build_first_level_core(
                 let mut words = vec![out[0], out[1]];
                 words.resize(8, zw);
                 (words, *per_leaf)
+            }
+            FlApp::LeanBus { .. } => {
+                // THE SHARED BUS, carried up: both children absorbed the
+                // same β and γs (copy constraints), hashed once into the
+                // seed; the open products multiply; the commitment digest
+                // pairs the leaves' words, each its publics digest chained
+                // with its commitment cap.
+                assert_eq!(k_ary, 2, "a commitment digest pairs two children");
+                let params = cw(&mut sb, &mut vals, &mut consts, pack_params(0, 64, PARENT));
+                let sh: Vec<&super::child_walker::BusSharedWires> = regions
+                    .iter()
+                    .map(|rk| rk.bus_shared.as_ref().expect("a Lean child shares its bus"))
+                    .collect();
+                for (a, b) in sh[0].challenges.iter().zip(&sh[1].challenges) {
+                    sb.connect(*a, *b);
+                }
+                let h = |sb: &mut ShapeBuilder, a: [Wire; 2], b: [Wire; 2]| -> [Wire; 2] {
+                    let o = sb.gate(cs.q.b3, &[iv2[0], iv2[1], a[0], a[1], b[0], b[1], params]);
+                    [o[0], o[1]]
+                };
+                let ch = &sh[0].challenges;
+                assert!(ch.len() % 2 == 0 && ch.len() >= 4, "β and the γs pair up");
+                let mut seed = h(&mut sb, [ch[0], ch[1]], [ch[2], ch[3]]);
+                for p in ch[4..].chunks(2) {
+                    seed = h(&mut sb, seed, [p[0], p[1]]);
+                }
+                let mut leaf_w = Vec::with_capacity(2);
+                for rk in &regions {
+                    let mut acc = rk.pub_digest_w;
+                    for &c in &rk.cap0_w {
+                        acc = h(&mut sb, acc, c);
+                    }
+                    leaf_w.push(acc);
+                }
+                let d = h(&mut sb, leaf_w[0], leaf_w[1]);
+                let pl = sb.gate(cs.macs, &[zw, sh[0].tops[0], sh[1].tops[0]])[0];
+                let pr = sb.gate(cs.macs, &[zw, sh[0].tops[1], sh[1].tops[1]])[0];
+                (vec![d[0], d[1], seed[0], seed[1], pl, pr, zw, zw], 1)
             }
         };
         // THE INHERITABLE ACCUMULATOR: per fold the deltas + the claim

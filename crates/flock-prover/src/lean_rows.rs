@@ -2024,6 +2024,20 @@ pub fn shared_challenges(statement: &[([u8; 32], Commitment)]) -> SharedChalleng
     }
 }
 
+/// The shared challenges of a recursive cone: drawn from the root of the
+/// commitment tree the tower carries up ([`crate::tower`]'s Lean leaves:
+/// each leaf's word chains its publics digest with its commitment cap, and
+/// pairs hash as BLAKE3 parents). The tower checks the root against the
+/// challenges every leaf absorbed.
+pub fn shared_challenges_from_root(root: &[u8; 32]) -> SharedChallenges {
+    let mut ch = FsChallenger::new(b"cas-lean-cone-v0");
+    ch.observe_label(root);
+    SharedChallenges {
+        beta: ch.sample_f128(),
+        gamma: (0..W).map(|_| ch.sample_f128()).collect(),
+    }
+}
+
 /// A piece's proof under shared challenges.
 pub struct PieceProof {
     pub proof: R1csProofCircuitMerged,

@@ -2128,6 +2128,18 @@ pub(super) struct ChildRegion {
     /// The segment's digest as the child's transcript absorbed it — the
     /// H(publics) region's root, connected to those absorbed words.
     pub(super) pub_digest_w: [Wire; 2],
+    /// A shared bus (Lean pieces): β then the γs as absorbed, and the open
+    /// products (send side, receive side).
+    pub(super) bus_shared: Option<BusSharedWires>,
+    /// The child's commitment cap as absorbed, two words per digest.
+    pub(super) cap0_w: Vec<[Wire; 2]>,
+}
+
+/// A shared bus's surface in a child region.
+#[derive(Clone, Debug)]
+pub(super) struct BusSharedWires {
+    pub(super) challenges: Vec<Wire>,
+    pub(super) tops: [Wire; 2],
 }
 
 /// Emit ONE child's complete deferred-verifier region — chain, query phase,
@@ -2248,6 +2260,13 @@ pub(super) fn emit_child_region(
     );
     // The tuple bus, after the wiring on its fork: its gathers are the pd
     // claims after the wiring's.
+    let bus_shared = ct.bus.as_ref().and_then(|br| {
+        let width = ct.inner.built.shape.circuit.bus().expect("a bus").width;
+        br.shared_v.map(|v| BusSharedWires {
+            challenges: (0..=width).map(|k| wv(v + k)).collect(),
+            tops: [wv(br.top_v), wv(br.top_v + 1)],
+        })
+    });
     let bus_w: Option<(Vec<Wire>, Vec<Wire>, Option<MultWires>)> = ct.bus.as_ref().map(|br| {
         let gather_w: Vec<Wire> = (0..ct.n_bus)
             .map(|k| wv(ct.gammas_o[n_el_pd + ct.n_wire + ct.n_pubcol + k].val_v))
@@ -2558,6 +2577,8 @@ pub(super) fn emit_child_region(
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,
         pub_digest_w,
+        bus_shared,
+        cap0_w: cap_w[0].clone(),
     }
 }
 

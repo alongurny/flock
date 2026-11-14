@@ -15,7 +15,8 @@ use {
     std::any::Any,
 };
 
-use flock_core::circuit::bus::SharedChallenges;
+use flock_core::{circuit::bus::SharedChallenges, union::publics_digest};
+use flock_merkle::{HashKind, hash_pair};
 
 #[cfg(not(target_arch = "aarch64"))]
 use crate::verifier::verify_ligerito_union_circuit_deferred;
@@ -26,6 +27,54 @@ use crate::{
 
 /// The Lean leaf's transcript domain.
 pub(super) const LEAN_DOMAIN: &[u8] = TOWER_DOMAIN;
+
+/// A field word pair back to the 32 bytes it packs (the inverse of the
+/// tower's `digest_f128`).
+pub(super) fn f128_digest(w: [F128; 2]) -> [u8; 32] {
+    let mut d = [0u8; 32];
+    for (k, x) in w.iter().enumerate() {
+        d[16 * k..16 * k + 8].copy_from_slice(&x.lo.to_le_bytes());
+        d[16 * k + 8..16 * k + 16].copy_from_slice(&x.hi.to_le_bytes());
+    }
+    d
+}
+
+/// A Lean leaf's word in the commitment tree: its publics digest chained
+/// with each digest of its commitment cap, as BLAKE3 parents.
+pub(super) fn lean_leaf_word(public: &[F128], cap: &[[u8; 32]]) -> [u8; 32] {
+    let mut acc = publics_digest(public);
+    for c in cap {
+        acc = hash_pair(&acc, c, HashKind::Blake3);
+    }
+    acc
+}
+
+/// The commitment tree's root over leaf words in order: pairs hash as
+/// BLAKE3 parents, level by level (a power-of-two count).
+pub(super) fn lean_tree_root(words: &[[u8; 32]]) -> [u8; 32] {
+    assert!(words.len().is_power_of_two(), "a full binary cone");
+    let mut level = words.to_vec();
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|p| hash_pair(&p[0], &p[1], HashKind::Blake3))
+            .collect();
+    }
+    level[0]
+}
+
+/// The challenges' seed every node carries: β and the γs, paired into
+/// digests and chained as BLAKE3 parents.
+pub(super) fn challenge_seed(ch: &SharedChallenges) -> [u8; 32] {
+    let words: Vec<F128> = std::iter::once(ch.beta).chain(ch.gamma.iter().copied()).collect();
+    assert!(words.len() % 2 == 0 && words.len() >= 4, "β and the γs pair up");
+    let d = |k: usize| f128_digest([words[k], words[k + 1]]);
+    let mut acc = hash_pair(&d(0), &d(2), HashKind::Blake3);
+    for k in (4..words.len()).step_by(2) {
+        acc = hash_pair(&acc, &d(k), HashKind::Blake3);
+    }
+    acc
+}
 
 /// Prove `piece` (in the tower's posture) and deferred-verify the proof.
 #[cfg(not(target_arch = "aarch64"))]
@@ -296,7 +345,7 @@ fn lean_first_level_node() {
 #[cfg(not(target_arch = "aarch64"))]
 fn lean_internal_node() {
     use crate::{
-        lean_rows::{LeafSlot, Profile, leaf, shared_challenges},
+        lean_rows::{LeafSlot, Profile, leaf},
         tower::{FlApp, FlFamily, build_first_level_core, build_node_outer_app, test_config},
     };
     let small = include_str!("../../tests/data/lean_small.rows");
@@ -316,8 +365,15 @@ fn lean_internal_node() {
             leaf(&c, &profile, &slots).unwrap()
         })
         .collect();
-    let statement: Vec<_> = leaves.iter().map(|p| (p.digest(), p.commit())).collect();
-    let ch = shared_challenges(&statement);
+    // The cone's statement: the commitment tree over the leaves' words,
+    // and the challenges drawn from its root.
+    let words: Vec<[u8; 32]> = leaves
+        .iter()
+        .map(|p| lean_leaf_word(&p.public(), &p.commit().cap))
+        .collect();
+    let root = lean_tree_root(&words);
+    let ch = crate::lean_rows::shared_challenges_from_root(&root);
+    let seed = challenge_seed(&ch);
     let inners: Vec<MixedInner> = leaves
         .iter()
         .enumerate()
@@ -340,7 +396,7 @@ fn lean_internal_node() {
                 b"cas-lean-fl-node-v0",
                 &[&inners[2 * j], &inners[2 * j + 1]],
                 &family,
-                &FlApp::Batches { per_leaf: 1 },
+                &FlApp::LeanBus { seed },
             )
         })
         .collect();
@@ -350,7 +406,100 @@ fn lean_internal_node() {
         "one first-level circuit for every pair of Lean leaves"
     );
     let t = std::time::Instant::now();
-    let out = build_node_outer_app(test_config(), &[&fls[0].lo, &fls[1].lo], None, None, None);
+    // The lane: the leaves' own accumulators, folded priors-only.
+    let el_types: Vec<_> = registry
+        .element_types()
+        .iter()
+        .map(|s| s.element_type().expect("an element slot's table"))
+        .collect();
+    let el_mats: Vec<_> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
+    let u = inners[0].union();
+    let jp = flock_core::pcs::jagged::JaggedParams::from_heights(
+        &u.jagged_heights(),
+        u.n_log(),
+        inners[0].commitment.params.m - flock_core::pcs::LOG_PACKING,
+    );
+    let lane = crate::tower::ChainLane {
+        registry,
+        mats: &family.mats,
+        circs: &family.circs,
+        circuit: &inners[0].built.shape.circuit,
+        params: &jp,
+        priors: &[&fls[0].acc, &fls[1].acc],
+        claims_base: fls[0].fold_pub_base,
+        family: crate::tower::LaneFamily::Lean {
+            block_words: crate::tower::envelope::lane_block_words(&fls[0].acc),
+            el_mats: &el_mats,
+        },
+    };
+    let out = build_node_outer_app(
+        test_config(),
+        &[&fls[0].lo, &fls[1].lo],
+        Some(fls[0].stmt_base),
+        Some(lane),
+        None,
+    );
+    // THE ROOT'S CHECKS, from the node's publics alone: the commitment
+    // digest is the tree's root, the seed the challenges that root draws,
+    // and the open products balance.
+    let app = out.app_base.expect("the node carries the app block");
+    let p = &out.lo.public;
+    assert_eq!(f128_digest([p[app], p[app + 1]]), root, "the commitment root");
+    assert_eq!(f128_digest([p[app + 2], p[app + 3]]), seed, "the challenges' seed");
+    assert_eq!(p[app + 4], p[app + 5], "the shared bus balances over the cone");
+    assert_ne!(p[app + 4], F128::ZERO, "a nonzero product");
+    // THE ROOT-SIDE DISCHARGE: the lane against the Lean leaf's tables, the
+    // main fold against the first-level and node circuits. With the root
+    // proof's own verify, this is the cone's whole verification.
+    let lane_acc = out.lane_acc.as_ref().expect("the lane accumulator");
+    assert_eq!(lane_acc.per_element.len(), el_mats.len(), "the lane folds the element class");
+    let t_d = std::time::Instant::now();
+    let leaf_circuit = &inners[0].built.shape.circuit;
+    assert!(lane_acc.discharge(&family.mats), "the lane's boolean class discharges");
+    assert!(lane_acc.discharge_element(&el_mats), "the lane's element class discharges");
+    assert!(lane_acc.discharge_sigma(&[leaf_circuit]), "the lane's sigma discharges");
+    assert!(
+        lane_acc.discharge_jagged(&[(leaf_circuit.digest(), &jp)]),
+        "the lane's jagged entry discharges"
+    );
+    let lane_ms = t_d.elapsed().as_secs_f64() * 1e3;
+    {
+        let fl_lo = &fls[0].lo;
+        let t = std::time::Instant::now();
+        let _ = out.acc.discharge_sigma(&[&fl_lo.shape.circuit, &out.lo.shape.circuit]);
+        let sig = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        let fj = crate::tower::node::node_jagged_params(fl_lo);
+        let rj = crate::tower::node::node_jagged_params(&out.lo);
+        let _ = out.acc.discharge_jagged(&[(fl_lo.shape.circuit.digest(), &fj), (out.lo.shape.circuit.digest(), &rj)]);
+        let jag = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
+        let _ = lane_acc.discharge_sigma(&[leaf_circuit]);
+        let lsig = t.elapsed().as_secs_f64() * 1e3;
+        {
+            let t = std::time::Instant::now();
+            let _ = out.acc.discharge(&crate::tower::query::leaf_boolean_mats(fl_lo));
+            let b = t.elapsed().as_secs_f64() * 1e3;
+            let em: Vec<_> = fl_lo.shape.registry.element_types().iter().map(|t| { let e = t.element_type().unwrap(); (e.a_0(), e.b_0()) }).collect();
+            let t = std::time::Instant::now();
+            let _ = out.acc.discharge_element(&em);
+            let e = t.elapsed().as_secs_f64() * 1e3;
+            eprintln!("main boolean {b:.1} ms ({} types), main element {e:.1} ms ({} types)", out.acc.per_type.len(), em.len());
+        }
+        eprintln!("main sigma {sig:.1} ms, main jagged {jag:.1} ms, lane sigma {lsig:.1} ms; sigma entries {}", out.acc.sigma.len());
+    }
+    let t_m = std::time::Instant::now();
+    crate::tower::driver::discharge_outer(&fls[0].lo, &out.lo, None, &out.acc, &[], false)
+        .expect("the main fold discharges");
+    let main_ms = t_m.elapsed().as_secs_f64() * 1e3;
+    eprintln!("root-side discharge: lane {lane_ms:.1} ms, main {main_ms:.1} ms");
+    eprintln!(
+        "the cone's verification: root proof {:.1} ms + discharge {:.1} ms",
+        out.online.verify_ms,
+        lane_ms + main_ms
+    );
+    let lane_acc = out.lane_acc.as_ref().expect("the lane accumulator");
+    assert_eq!(lane_acc.per_element.len(), el_mats.len(), "the lane folds the element class");
     let bytes = match &out.lo.proof {
         MixedProof::Rs(p) => bincode::serialize(p).unwrap().len(),
         MixedProof::Ag(p) => bincode::serialize(p).unwrap().len(),

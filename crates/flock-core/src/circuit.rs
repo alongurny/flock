@@ -1369,6 +1369,17 @@ impl SigmaAssertion {
     /// `O(2^mu)`, paid once at the root, never per node.
     pub fn check(&self, circuit: &Circuit) -> bool {
         let m = Self::matrix(circuit);
+        // Every test that discharges also holds the fast marginal to the
+        // table's definition.
+        #[cfg(test)]
+        for c in self.claims() {
+            let cw = c.col.materialize();
+            assert_eq!(
+                m.row_marginal(&cw[..m.n_cols()], m.n_rows()),
+                m.row_marginal_naive(&cw[..m.n_cols()]),
+                "the structure table's row marginal"
+            );
+        }
         self.claims()
             .iter()
             .all(|c| bilinear(&c.row, &c.col, &m) == c.value)
@@ -1493,17 +1504,127 @@ impl<'a> CircuitStructureMatrix<'a> {
     }
 }
 
-impl FoldMatrix for CircuitStructureMatrix<'_> {
-    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
-        assert_eq!(n_rows, self.n_rows());
-        assert_eq!(w.len(), self.n_cols());
-        let mut out = vec![F128::ZERO; n_rows];
+impl CircuitStructureMatrix<'_> {
+    /// The row marginal by definition: every entry, one at a time. The
+    /// reference [`FoldMatrix::row_marginal`] is checked against.
+    #[cfg(test)]
+    fn row_marginal_naive(&self, w: &[F128]) -> Vec<F128> {
+        let mut out = vec![F128::ZERO; self.n_rows()];
         for (c, &wc) in w.iter().enumerate() {
             if wc.is_zero() {
                 continue;
             }
             for (r, dst) in out.iter_mut().enumerate() {
                 *dst += wc * self.entry(r, c);
+            }
+        }
+        out
+    }
+}
+
+impl FoldMatrix for CircuitStructureMatrix<'_> {
+    /// `out[r] = Σ_c w[c]·M[r, c]`, plane by plane, reading each plane's
+    /// structure rather than every entry. A cell `x = slot·2^ν | r` is live
+    /// for `r < count(slot)`, and the id embedding is additive over the
+    /// disjoint bits (`x = slot·2^ν ⊕ r`), so the id and live planes are
+    /// per-slot constants plus `F(r)` times a per-slot weight over a row
+    /// prefix: difference arrays, `O(slots + rows)`. Only the sigma plane
+    /// reads every live cell (in parallel over slots). The element planes
+    /// do not depend on the row; the Boolean pins are row prefixes; the
+    /// bus and public columns are read per row over their own columns.
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        use rayon::prelude::*;
+        assert_eq!(n_rows, self.n_rows());
+        assert_eq!(w.len(), self.n_cols());
+        let base = self.base_cols();
+        let nu = self.circuit.cells().nu();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - nu);
+        let counts = &self.mask.counts;
+        let fx = |x: usize| F128::new(x as u64, 0);
+        let plane = |p: usize, slot: usize| w[p * base + slot];
+        // Row-prefix difference arrays: a constant, and a weight on F(r).
+        let mut d_const = vec![F128::ZERO; n_rows + 1];
+        let mut d_f = vec![F128::ZERO; n_rows + 1];
+        for slot in 0..cell_cols {
+            let cnt = counts[slot].min(n_rows);
+            if cnt == 0 {
+                continue;
+            }
+            let wid = plane(SigmaAssertion::MASKED_ID_PLANE, slot);
+            let c = wid * fx(slot << nu) + plane(SigmaAssertion::LIVE_PLANE, slot);
+            d_const[0] += c;
+            d_const[cnt] += c;
+            d_f[0] += wid;
+            d_f[cnt] += wid;
+        }
+        let registry = self.circuit.registry();
+        for slot in 0..registry.num_boolean().min(base) {
+            let ty = &registry.boolean_types()[slot];
+            let cnt = self.circuit.counts()[slot].min(n_rows);
+            if ty.const_pin.is_some() && cnt > 0 {
+                let wp = plane(SigmaAssertion::BOOLEAN_PIN_PLANE, slot);
+                d_const[0] += wp;
+                d_const[cnt] += wp;
+            }
+        }
+        // The element planes: one constant for every row.
+        let el: F128 = [SigmaAssertion::ELEMENT_A_PLANE, SigmaAssertion::ELEMENT_B_PLANE]
+            .iter()
+            .flat_map(|&p| (0..base).map(move |slot| (p, slot)))
+            .fold(F128::ZERO, |a, (p, slot)| {
+                let wc = plane(p, slot);
+                if wc.is_zero() { a } else { a + wc * self.entry(0, p * base + slot) }
+            });
+        let mut out = vec![F128::ZERO; n_rows];
+        let (mut rc, mut rf) = (F128::ZERO, F128::ZERO);
+        for (r, dst) in out.iter_mut().enumerate() {
+            rc += d_const[r];
+            rf += d_f[r];
+            *dst = rc + rf * fx(r) + el;
+        }
+        // The sigma plane, every live cell.
+        let sigma = self.circuit.sigma();
+        let sig = (0..cell_cols)
+            .into_par_iter()
+            .fold(
+                || vec![F128::ZERO; n_rows],
+                |mut acc, slot| {
+                    let ws = plane(SigmaAssertion::SIGMA_PLANE, slot);
+                    let cnt = counts[slot].min(n_rows);
+                    if !ws.is_zero() {
+                        let row0 = slot << nu;
+                        for (r, a) in acc[..cnt].iter_mut().enumerate() {
+                            *a += ws * fx(sigma[row0 | r] as usize);
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![F128::ZERO; n_rows],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += *y;
+                    }
+                    a
+                },
+            );
+        for (x, y) in out.iter_mut().zip(&sig) {
+            *x += *y;
+        }
+        // The bus and public columns, over their own columns.
+        for (p, n) in [
+            (SigmaAssertion::BUS_PLANE, self.bus_cols.len()),
+            (SigmaAssertion::PUBLIC_COLUMN_PLANE, self.public_cols.len()),
+        ] {
+            for slot in 0..n.min(base) {
+                let wc = plane(p, slot);
+                if wc.is_zero() {
+                    continue;
+                }
+                for (r, dst) in out.iter_mut().enumerate() {
+                    *dst += wc * self.entry(r, p * base + slot);
+                }
             }
         }
         out
