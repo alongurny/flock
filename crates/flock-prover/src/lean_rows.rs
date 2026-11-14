@@ -321,6 +321,47 @@ impl Rows {
         })
     }
 
+    /// Several derivations as one: indices shifted, nothing shared (levels,
+    /// lists and contexts stay opaque numbers).
+    pub fn merge(parts: Vec<Rows>) -> Rows {
+        let mut m = Rows {
+            terms: Vec::new(),
+            decls: Vec::new(),
+            facts: Vec::new(),
+        };
+        for p in parts {
+            let (nt, nd, nf) = (m.terms.len(), m.decls.len(), m.facts.len());
+            for mut t in p.terms {
+                for c in t.child.iter_mut().flatten() {
+                    *c += nt;
+                }
+                if t.kind == K_LEAF && t.x[0].f == int(SUB_CONST) {
+                    t.x[1] = vi(t.x[1].f.lo + nd as u64);
+                }
+                if t.kind == K_PROJ {
+                    t.x[0] = vi(t.x[0].f.lo + nd as u64);
+                }
+                m.terms.push(t);
+            }
+            for mut d in p.decls {
+                d.value = d.value.map(|v| v + nt);
+                m.decls.push(d);
+            }
+            for mut f in p.facts {
+                for x in 0..4 {
+                    if f.is_term[x] {
+                        f.raw[x] += nt as u64;
+                    }
+                }
+                for q in &mut f.premises {
+                    *q += nf;
+                }
+                m.facts.push(f);
+            }
+        }
+        m
+    }
+
     pub fn counts(&self) -> (usize, usize, usize) {
         (self.terms.len(), self.decls.len(), self.facts.len())
     }
