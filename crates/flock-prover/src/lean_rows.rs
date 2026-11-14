@@ -34,7 +34,7 @@ use flock_core::{
         bus::{BusDirection, BusTerm, RowTag},
     },
     element_r1cs::{ElementTableBuilder, ElementTableType},
-    pcs::{PcsParams, ligerito::LigeritoProfile},
+    pcs::PcsParams,
     schedule::{IoWord, TableType},
     union::UnionInstance,
     verifier::{FlockVerifyError, verify_ligerito_union_circuit},
@@ -978,9 +978,7 @@ impl LeanCircuit {
         }
         let ds = at(Of::Decl);
         members[ds] = (0..rows.decls.len()).collect();
-        let most = members.iter().map(Vec::len).max().unwrap_or(1);
-        let mut nu = most.next_power_of_two().trailing_zeros().max(6) as usize;
-        let limb = nu.min(16);
+        // Range limbs wide enough for every rank and bound: 2^(2L) > span.
         let span = rows
             .facts
             .iter()
@@ -988,14 +986,45 @@ impl LeanCircuit {
             .chain(rows.terms.iter().map(|t| t.rank + t.lbr))
             .max()
             .unwrap_or(0);
-        if span + 2 >= 1i64 << (2 * limb) {
-            nu = nu.max(((span + 2) as f64).log2().ceil() as usize / 2 + 1);
-        }
-        let limb = nu.min(16);
+        let limb = ((((span + 2) as f64).log2() / 2.0).ceil() as usize).max(4);
         for l in 0..2 {
             members[at(Of::Range(l))] = (0..1usize << limb).collect();
         }
-        let id = |s: usize, j: usize| int(((s as u64) << 32) + j as u64);
+        // The capacity 2^nu of every slot: a table takes as many slots as it
+        // needs, so pick the nu that wastes least (padded width times rows,
+        // plus each port's group of 2^nu), counting each slot's fixed cost
+        // in the proof and the verifier as 2^17 cells. Measured on a 250k
+        // row derivation: nu 6, 8, 10, 12, 14 prove in 6.7, 5.1, 4.7, 4.4,
+        // 5.3 s and verify in 1362, 289, 138, 95, 97 ms.
+        let widths: Vec<(usize, usize)> = ofs
+            .iter()
+            .map(|&o| {
+                let sp = spec(o);
+                ((sp.cols.len() + 16).next_power_of_two(), sp.ports.len())
+            })
+            .collect();
+        let cost = |nu: usize| -> usize {
+            members
+                .iter()
+                .zip(&widths)
+                .map(|(m, &(w, p))| m.len().div_ceil(1 << nu) * (((w + 4 * p) << nu) + (1 << 17)))
+                .sum()
+        };
+        let nu = std::env::var("LEAN_ROWS_NU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| (8..=22).min_by_key(|&nu| cost(nu)).unwrap());
+        let mask = (1usize << nu) - 1;
+        let mut chunk_base = Vec::with_capacity(ofs.len());
+        let mut n_slots = 0;
+        for m in &members {
+            chunk_base.push(n_slots);
+            n_slots += m.len().div_ceil(1 << nu);
+        }
+        let chunk_base = &chunk_base;
+        let id = move |s: usize, j: usize| {
+            int((((chunk_base[s] + (j >> nu)) as u64) << 32) + (j & mask) as u64)
+        };
         let term_id = |i: usize| id(term_at[i].0, term_at[i].1);
         let fact_id = |i: usize| id(fact_at[i].0, fact_at[i].1);
         let decl_id = |i: usize| id(ds, i);
@@ -1113,7 +1142,7 @@ impl LeanCircuit {
             }
         };
         let h = gp(1 << limb);
-        let mask = (1i64 << limb) - 1;
+        let lmask = (1i64 << limb) - 1;
         // Rows, without count bits.
         let mut specs: Vec<Spec> = ofs.iter().map(|&o| spec(o)).collect();
         let mut tables: Vec<Vec<Vec<F128>>> = Vec::new();
@@ -1131,7 +1160,7 @@ impl LeanCircuit {
                             let x = eval(e, *of, own).e;
                             assert!(x >= 0 && x >> (2 * limb) == 0, "an index out of range");
                             if *l == 0 {
-                                gp(x & mask)
+                                gp(x & lmask)
                             } else {
                                 pow(h, (x >> limb) as u128)
                             }
@@ -1142,7 +1171,7 @@ impl LeanCircuit {
                             if d < 0 || d >> (2 * limb) != 0 {
                                 return Err(format!("{}: {} ≥ {} + {cc} fails", sp.name, x.e, y.e));
                             }
-                            let a0 = gp(d & mask);
+                            let a0 = gp(d & lmask);
                             if matches!(src, Src::GeA(..)) {
                                 a0
                             } else {
@@ -1223,55 +1252,57 @@ impl LeanCircuit {
         for (s, sp) in specs.iter().enumerate() {
             let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
             let io = io_index(&cols);
-            let slot = sb.slot(Gate::new(cols));
-            for p in &sp.ports {
-                let terms =
-                    p.t.iter()
-                        .map(|t| match *t {
-                            T::C(c) => BusTerm::word(io[c]),
-                            T::K(v) => BusTerm {
-                                word: None,
-                                constant: v,
-                                row: None,
-                            },
-                            T::Id => BusTerm::row(RowTag {
-                                offset: (s as u64) << 32,
-                                div: 1,
-                                modulo: 0,
-                            }),
+            for (c, chunk) in tables[s].chunks(1 << nu).enumerate() {
+                let slot = sb.slot(Gate::new(cols.clone()));
+                for p in &sp.ports {
+                    let terms =
+                        p.t.iter()
+                            .map(|t| match *t {
+                                T::C(c) => BusTerm::word(io[c]),
+                                T::K(v) => BusTerm {
+                                    word: None,
+                                    constant: v,
+                                    row: None,
+                                },
+                                T::Id => BusTerm::row(RowTag {
+                                    offset: ((chunk_base[s] + c) as u64) << 32,
+                                    div: 1,
+                                    modulo: 0,
+                                }),
+                            })
+                            .collect();
+                    let dir = if p.send {
+                        BusDirection::Send
+                    } else {
+                        BusDirection::Recv
+                    };
+                    sb.bus_port_counted(slot, dir, terms, p.mult.iter().map(|&c| io[c]).collect());
+                }
+                for z in chunk {
+                    let wires: Vec<Wire> = sp
+                        .cols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| matches!(c.0, Col::In))
+                        .map(|(y, c)| {
+                            values.push(z[y]);
+                            if matches!(c.1, Some(Src::RangeV(_))) {
+                                sb.fixed_public_input(z[y])
+                            } else {
+                                sb.input()
+                            }
                         })
                         .collect();
-                let dir = if p.send {
-                    BusDirection::Send
-                } else {
-                    BusDirection::Recv
-                };
-                sb.bus_port_counted(slot, dir, terms, p.mult.iter().map(|&c| io[c]).collect());
+                    sb.gate(slot, &wires);
+                }
+                slots.push((
+                    slot,
+                    sp.name.clone(),
+                    chunk.len(),
+                    sp.ports.len(),
+                    sp.cols.len(),
+                ));
             }
-            for z in &tables[s] {
-                let wires: Vec<Wire> = sp
-                    .cols
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| matches!(c.0, Col::In))
-                    .map(|(y, c)| {
-                        values.push(z[y]);
-                        if matches!(c.1, Some(Src::RangeV(_))) {
-                            sb.fixed_public_input(z[y])
-                        } else {
-                            sb.input()
-                        }
-                    })
-                    .collect();
-                sb.gate(slot, &wires);
-            }
-            slots.push((
-                slot,
-                sp.name.clone(),
-                tables[s].len(),
-                sp.ports.len(),
-                sp.cols.len(),
-            ));
         }
         let shape = sb.finish().map_err(|e| format!("{e:?}"))?;
         let build_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -1290,14 +1321,7 @@ impl LeanCircuit {
     }
 
     fn pcs(union: &UnionInstance<'_>) -> PcsParams {
-        PcsParams {
-            m: union.dense_m(),
-            log_inv_rate: 1,
-            log_batch_size: 6,
-            profile: LigeritoProfile::Fast,
-            num_lanes: union.commit_lanes(6),
-            merkle_hash: Default::default(),
-        }
+        crate::leanxmss::circuit::XmssCircuit::pcs_params(union)
     }
 
     /// Fills, proves and verifies; `tamper` changes one witness word first
