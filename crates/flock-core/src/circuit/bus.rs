@@ -84,7 +84,7 @@ use crate::{
     pcs::{DirectEqInd, PackedDirectClaim},
     product_gkr::{
         BatchedGrinding, LiveMask, ProductGkrLeavesProof, ProductLeaves, prove_leaves,
-        verify_leaves,
+        verify_leaves, verify_leaves_open,
     },
     scratch::take_f128,
     zerocheck::univariate_skip::build_eq,
@@ -172,6 +172,34 @@ pub struct BusPort {
 pub struct Bus {
     pub width: usize,
     pub ports: Vec<BusPort>,
+    /// Challenges fixed outside this proof, for a bus shared by several
+    /// proofs (pieces). The caller derives them from every piece's
+    /// commitment, so no piece chooses its witness after seeing them. With
+    /// them, this proof no longer checks `∏ send = ∏ recv` on its own: the
+    /// two products are public in [`BusProof::gkr`] and the caller checks
+    /// that the products of all pieces balance ([`shared_balance`]).
+    #[serde(default)]
+    pub shared: Option<SharedChallenges>,
+}
+
+/// The fingerprint challenges of a bus shared across proofs: `β` and one
+/// `γ_k` per coordinate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedChallenges {
+    pub beta: F128,
+    pub gamma: Vec<F128>,
+}
+
+/// Whether the pieces' shared buses balance: the product of every piece's
+/// send side equals the product of every receive side. Each piece's own
+/// verification already checked its products are nonzero and correct.
+pub fn shared_balance<'a>(proofs: impl IntoIterator<Item = &'a BusProof>) -> bool {
+    let (mut l, mut r) = (F128::ONE, F128::ONE);
+    for p in proofs {
+        l *= p.gkr.top_lhs;
+        r *= p.gkr.top_rhs;
+    }
+    l == r
 }
 
 /// The bus half of a wiring proof: the grand product's transcript, one
@@ -457,6 +485,14 @@ struct Challenges {
     gamma: Vec<F128>,
 }
 
+/// Bind a shared bus's challenges into this proof's transcript.
+fn observe_shared<C: Challenger>(shared: &SharedChallenges, ch: &mut C) {
+    ch.observe_f128(shared.beta);
+    for &g in &shared.gamma {
+        ch.observe_f128(g);
+    }
+}
+
 /// The fingerprint product's degree in `β`: one per live row, `2^b − 1` for
 /// a row of a port with `b` multiplicity bits.
 fn live_entries(bus: &Bus, circuit: &Circuit) -> usize {
@@ -486,16 +522,24 @@ pub(crate) fn prove_bus<C: Challenger>(
     let rows = 1usize << nu;
     ch.observe_label(DOMAIN_BUS);
     let mut fingerprint_nonce = Vec::new();
-    let beta = match grinding.fingerprint_target_for(live_entries(bus, circuit)) {
-        Some(target) => {
-            let (nonce, beta) = ch.grind_pow_below_and_sample_f128(target);
-            fingerprint_nonce.push(nonce);
-            beta
+    let challenges = if let Some(shared) = &bus.shared {
+        observe_shared(shared, ch);
+        Challenges {
+            beta: shared.beta,
+            gamma: shared.gamma.clone(),
         }
-        None => ch.sample_f128(),
+    } else {
+        let beta = match grinding.fingerprint_target_for(live_entries(bus, circuit)) {
+            Some(target) => {
+                let (nonce, beta) = ch.grind_pow_below_and_sample_f128(target);
+                fingerprint_nonce.push(nonce);
+                beta
+            }
+            None => ch.sample_f128(),
+        };
+        let gamma: Vec<F128> = (0..bus.width).map(|_| ch.sample_f128()).collect();
+        Challenges { beta, gamma }
     };
-    let gamma: Vec<F128> = (0..bus.width).map(|_| ch.sample_f128()).collect();
-    let challenges = Challenges { beta, gamma };
     let word = |iota: usize, j: usize| packed[cells.gate_word_addr(iota, j)];
 
     let groups = 1usize << bus.c_bits();
@@ -537,6 +581,7 @@ pub(crate) fn prove_bus<C: Challenger>(
     let lhs = leaves(BusDirection::Send);
     let rhs = leaves(BusDirection::Recv);
     let (gkr, claim) = prove_leaves(lhs, rhs, grinding, ch);
+    debug_assert!(bus.shared.is_some() || gkr.top_lhs == gkr.top_rhs);
 
     let rho_row = &claim.rho[..nu];
     let eq_row = build_eq(rho_row);
@@ -589,27 +634,43 @@ pub(crate) fn verify_bus<C: Challenger>(
         return Err(WiringError::MalformedProof);
     }
     ch.observe_label(DOMAIN_BUS);
-    let beta = if let Some(target) = grinding.fingerprint_target_for(live_entries(bus, circuit)) {
-        let [nonce] = proof.fingerprint_nonce[..] else {
-            return Err(WiringError::BusGkr(
-                crate::product_gkr::ProductGkrError::InvalidGrinding,
-            ));
-        };
-        ch.verify_pow_below_and_sample_f128(nonce, target)
-            .ok_or(WiringError::BusGkr(
-                crate::product_gkr::ProductGkrError::InvalidGrinding,
-            ))?
-    } else {
-        if !proof.fingerprint_nonce.is_empty() {
+    let challenges = if let Some(shared) = &bus.shared {
+        if !proof.fingerprint_nonce.is_empty() || shared.gamma.len() != bus.width {
             return Err(WiringError::MalformedProof);
         }
-        ch.sample_f128()
+        observe_shared(shared, ch);
+        Challenges {
+            beta: shared.beta,
+            gamma: shared.gamma.clone(),
+        }
+    } else {
+        let beta = if let Some(target) = grinding.fingerprint_target_for(live_entries(bus, circuit)) {
+            let [nonce] = proof.fingerprint_nonce[..] else {
+                return Err(WiringError::BusGkr(
+                    crate::product_gkr::ProductGkrError::InvalidGrinding,
+                ));
+            };
+            ch.verify_pow_below_and_sample_f128(nonce, target)
+                .ok_or(WiringError::BusGkr(
+                    crate::product_gkr::ProductGkrError::InvalidGrinding,
+                ))?
+        } else {
+            if !proof.fingerprint_nonce.is_empty() {
+                return Err(WiringError::MalformedProof);
+            }
+            ch.sample_f128()
+        };
+        let gamma: Vec<F128> = (0..bus.width).map(|_| ch.sample_f128()).collect();
+        Challenges { beta, gamma }
     };
-    let gamma: Vec<F128> = (0..bus.width).map(|_| ch.sample_f128()).collect();
-    let challenges = Challenges { beta, gamma };
 
     let c = bus.c_bits();
-    let claim = verify_leaves(nu + c, &proof.gkr, grinding, ch).map_err(WiringError::BusGkr)?;
+    let claim = if bus.shared.is_some() {
+        verify_leaves_open(nu + c, &proof.gkr, grinding, ch)
+    } else {
+        verify_leaves(nu + c, &proof.gkr, grinding, ch)
+    }
+    .map_err(WiringError::BusGkr)?;
     let (rho_row, rho_port) = claim.rho.split_at(nu);
     let eq_row = build_eq(rho_row);
     debug_assert_eq!(eq_row.len(), rows);

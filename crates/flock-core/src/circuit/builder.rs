@@ -851,7 +851,7 @@ impl ShapeBuilder {
                 })
                 .collect();
             let width = first.len();
-            circuit = circuit.with_bus(Bus { width, ports })?;
+            circuit = circuit.with_bus(Bus { width, ports, shared: None })?;
         }
         Ok(CircuitShape {
             registry,

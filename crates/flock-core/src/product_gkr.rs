@@ -2056,6 +2056,7 @@ fn verify_batched_core<C: Challenger>(
         grinding,
         &mut nonces,
         ch,
+        true,
     )?;
 
     // Input-layer checks at the shared ρ: both reconstructed affinely, sharing
@@ -2186,13 +2187,14 @@ fn verify_reduction<C: Challenger>(
     grinding: BatchedGrinding,
     nonces: &mut NonceReader<'_>,
     ch: &mut C,
+    balanced: bool,
 ) -> Result<(Vec<F128>, F128, F128), ProductGkrError> {
     ch.observe_f128(top_lhs);
     ch.observe_f128(top_rhs);
-    if top_lhs != top_rhs {
+    if balanced && top_lhs != top_rhs {
         return Err(ProductGkrError::ProductMismatch);
     }
-    if top_lhs == F128::ZERO {
+    if top_lhs == F128::ZERO || top_rhs == F128::ZERO {
         return Err(ProductGkrError::ZeroProduct);
     }
 
@@ -2337,6 +2339,28 @@ pub fn verify_leaves<C: Challenger>(
     grinding: BatchedGrinding,
     ch: &mut C,
 ) -> Result<ProductLeavesClaim, ProductGkrError> {
+    verify_leaves_with(mu, proof, grinding, ch, true)
+}
+
+/// [`verify_leaves`] without `∏ lhs = ∏ rhs`: both products are checked
+/// correct and nonzero, and the caller checks how they relate (a bus shared
+/// across proofs balances only over all of them).
+pub fn verify_leaves_open<C: Challenger>(
+    mu: usize,
+    proof: &ProductGkrLeavesProof,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> Result<ProductLeavesClaim, ProductGkrError> {
+    verify_leaves_with(mu, proof, grinding, ch, false)
+}
+
+fn verify_leaves_with<C: Challenger>(
+    mu: usize,
+    proof: &ProductGkrLeavesProof,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+    balanced: bool,
+) -> Result<ProductLeavesClaim, ProductGkrError> {
     if proof.layers.len() != mu {
         return Err(ProductGkrError::MalformedProof);
     }
@@ -2352,6 +2376,7 @@ pub fn verify_leaves<C: Challenger>(
         grinding,
         &mut nonces,
         ch,
+        balanced,
     )?;
     debug_assert!(nonces.is_spent());
     Ok(ProductLeavesClaim { rho, lhs, rhs })

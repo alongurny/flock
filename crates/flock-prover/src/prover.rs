@@ -603,6 +603,59 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
     )
 }
 
+/// The commitment [`prove_fast_ligerito_union_circuit`] would make for this
+/// witness, and nothing else: the first phase of proving several pieces
+/// whose shared bus challenges are derived from every piece's commitment
+/// ([`flock_core::circuit::bus::Bus::shared`]). Proving afterwards rebuilds
+/// the same witness and so commits to the same root; the verifier checks
+/// each proof against the root this returned.
+pub fn commit_ligerito_union_circuit(
+    union: &UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+) -> Commitment {
+    assert_eq!(pcs_params.m, union.dense_m());
+    assert_eq!(slots.len(), union.num_boolean());
+    assert_eq!(element_slots.len(), union.num_element());
+    let mut sources = Vec::with_capacity(slots.len() + element_slots.len());
+    for slot in slots {
+        sources.push(slot.source);
+    }
+    for (ty, input) in union.registry().element_types().iter().zip(element_slots) {
+        let element = match &ty.class {
+            TableClass::LargeField(el) => el.clone(),
+            TableClass::Boolean => unreachable!("element_types() are LargeField"),
+        };
+        sources.push(UnionSlotWitnessSource::Element {
+            ty: element,
+            generate: input.generate,
+        });
+    }
+    // The same choices as `prove_union_with_binding_zerocheck`, so the
+    // committed stack is the same.
+    let padding_unread = !union.has_element()
+        && !union.compaction_is_identity()
+        && union.m_total() - union.n_log() >= LOG_PACKING
+        && union.zerocheck_reads_exact();
+    let (z_packed, _a, _b, _stripes, buf_mode) =
+        build_union_witness(union, sources, padding_unread);
+    let q_owned: Option<Vec<F128>> = if union.compaction_is_identity() {
+        None
+    } else if buf_mode == WitnessBufMode::PooledDirty {
+        Some(union.compact_witness_unchecked(&z_packed))
+    } else {
+        Some(union.compact_witness(&z_packed))
+    };
+    let q: &[F128] = q_owned.as_deref().unwrap_or(&z_packed);
+    let (commitment, _data) = if pcs_params.num_lanes.is_some() {
+        commit_lane_major(q, pcs_params)
+    } else {
+        commit(q, pcs_params)
+    };
+    commitment
+}
+
 /// Proves a Boolean-only registry with the merged opening transport.
 ///
 /// This wraps [`prove_union_with_binding`] and packages the Boolean subproofs as

@@ -31,8 +31,12 @@ use flock_core::{
     challenger::FsChallenger,
     circuit::{
         builder::{CircuitShape, GateType, ShapeBuilder, SlotId, SlotWitness, Wire},
-        bus::{BusDirection, BusTerm, RowTag},
+        Circuit,
+        bus::{self, BusDirection, BusTerm, RowTag, SharedChallenges},
     },
+    challenger::Challenger,
+    pcs::Commitment,
+    proof::R1csProofCircuitMerged,
     element_r1cs::{ElementTableBuilder, ElementTableType},
     pcs::PcsParams,
     schedule::{IoWord, TableType},
@@ -41,7 +45,9 @@ use flock_core::{
 };
 use flock_field::F128;
 
-use crate::prover::{UnionElementSlotInput, prove_fast_ligerito_union_circuit};
+use crate::prover::{
+    UnionElementSlotInput, commit_ligerito_union_circuit, prove_fast_ligerito_union_circuit,
+};
 
 /// Tuple width: tag, id, kind, four fields, rank.
 const W: usize = 8;
@@ -970,10 +976,23 @@ const FACT_TABLES: [&str; 14] = [
 pub struct LeanCircuit {
     pub nu: usize,
     pub limb: usize,
+    specs: Vec<Spec>,
+    /// Every table's rows, with count bits.
+    tables: Vec<Vec<Vec<F128>>>,
+    /// Each table's first chunk number: chunk `c` of table `s` holds rows
+    /// `[c·2^nu, (c+1)·2^nu)` and gives them the row tags
+    /// `(chunk_base[s] + c)·2^32 + j`.
+    chunk_base: Vec<usize>,
+    pub build_ms: f64,
+}
+
+/// Some chunks of a [`LeanCircuit`] as one circuit: a piece of a proof
+/// whose bus is shared by every piece ([`flock_core::circuit::bus::Bus::shared`]).
+pub struct Piece {
+    pub nu: usize,
     shape: CircuitShape,
     values: Vec<F128>,
     slots: Vec<(SlotId, String, usize, usize, usize)>,
-    pub build_ms: f64,
 }
 
 pub struct Report {
@@ -997,6 +1016,12 @@ impl LeanCircuit {
     /// With `strict` false, tuples asked for but never given do not stop
     /// the build: for tests that a false derivation is refused by the proof.
     pub fn build_with(rows: &Rows, strict: bool) -> Result<LeanCircuit, String> {
+        Self::build_at(rows, strict, 0)
+    }
+
+    /// Chunk numbers start at `base`, so derivations built at disjoint
+    /// bases have disjoint row tags and can share one bus.
+    pub fn build_at(rows: &Rows, strict: bool, base: usize) -> Result<LeanCircuit, String> {
         let t0 = Instant::now();
         // Tables and which rows go to each.
         let mut ofs: Vec<Of> = vec![Of::Range(0), Of::Range(1), Of::Decl];
@@ -1064,7 +1089,7 @@ impl LeanCircuit {
             .unwrap_or_else(|| (8..=22).min_by_key(|&nu| cost(nu)).unwrap());
         let mask = (1usize << nu) - 1;
         let mut chunk_base = Vec::with_capacity(ofs.len());
-        let mut n_slots = 0;
+        let mut n_slots = base;
         for m in &members {
             chunk_base.push(n_slots);
             n_slots += m.len().div_ceil(1 << nu);
@@ -1293,77 +1318,159 @@ impl LeanCircuit {
                 asked.len()
             ));
         }
-        // The shape: one gate per row, inputs in order.
-        let mut sb = ShapeBuilder::new(nu);
-        let mut values = Vec::new();
-        let mut slots = Vec::new();
-        for (s, sp) in specs.iter().enumerate() {
-            let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
-            let io = io_index(&cols);
-            for (c, chunk) in tables[s].chunks(1 << nu).enumerate() {
-                let slot = sb.slot(Gate::new(cols.clone()));
-                for p in &sp.ports {
-                    let terms =
-                        p.t.iter()
-                            .map(|t| match *t {
-                                T::C(c) => BusTerm::word(io[c]),
-                                T::K(v) => BusTerm {
-                                    word: None,
-                                    constant: v,
-                                    row: None,
-                                },
-                                T::Id => BusTerm::row(RowTag {
-                                    offset: ((chunk_base[s] + c) as u64) << 32,
-                                    div: 1,
-                                    modulo: 0,
-                                }),
-                            })
-                            .collect();
-                    let dir = if p.send {
-                        BusDirection::Send
-                    } else {
-                        BusDirection::Recv
-                    };
-                    sb.bus_port_counted(slot, dir, terms, p.mult.iter().map(|&c| io[c]).collect());
-                }
-                for z in chunk {
-                    let wires: Vec<Wire> = sp
-                        .cols
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| matches!(c.0, Col::In))
-                        .map(|(y, c)| {
-                            values.push(z[y]);
-                            if matches!(c.1, Some(Src::RangeV(_))) {
-                                sb.fixed_public_input(z[y])
-                            } else {
-                                sb.input()
-                            }
-                        })
-                        .collect();
-                    sb.gate(slot, &wires);
-                }
-                slots.push((
-                    slot,
-                    sp.name.clone(),
-                    chunk.len(),
-                    sp.ports.len(),
-                    sp.cols.len(),
-                ));
-            }
-        }
-        let shape = sb.finish().map_err(|e| format!("{e:?}"))?;
-        let build_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let chunk_base = chunk_base.clone();
         Ok(LeanCircuit {
             nu,
             limb,
-            shape,
-            values,
-            slots,
-            build_ms,
+            specs,
+            tables,
+            chunk_base,
+            build_ms: t0.elapsed().as_secs_f64() * 1e3,
         })
     }
 
+    /// Every chunk `(table, chunk)` in order, with its row count.
+    pub fn chunks(&self) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        for (s, t) in self.tables.iter().enumerate() {
+            for (c, ch) in t.chunks(1 << self.nu).enumerate() {
+                out.push((s, c, ch.len()));
+            }
+        }
+        out
+    }
+
+    /// The chunks in pieces of at most about `cap` rows, as even as whole
+    /// chunks allow (so no piece is tiny: a commitment needs some size).
+    pub fn pieces(&self, cap: usize) -> Vec<Vec<(usize, usize)>> {
+        let chunks = self.chunks();
+        let total: usize = chunks.iter().map(|c| c.2).sum();
+        let k = total.div_ceil(cap.max(1)).max(1);
+        let target = total.div_ceil(k);
+        let mut out: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
+        let mut rows = 0;
+        for (s, c, n) in chunks {
+            if rows >= target && out.len() < k {
+                out.push(Vec::new());
+                rows = 0;
+            }
+            rows += n;
+            out.last_mut().unwrap().push((s, c));
+        }
+        out
+    }
+
+    /// All chunks as one circuit.
+    pub fn whole(&self) -> Result<Piece, String> {
+        let all: Vec<(usize, usize)> = self.chunks().iter().map(|&(s, c, _)| (s, c)).collect();
+        self.piece(&all)
+    }
+
+    /// The circuit of some chunks: one gate per row, inputs in order.
+    pub fn piece(&self, chunks: &[(usize, usize)]) -> Result<Piece, String> {
+        let nu = self.nu;
+        let mut sb = ShapeBuilder::new(nu);
+        let mut values = Vec::new();
+        let mut slots = Vec::new();
+        for &(s, c) in chunks {
+            let sp = &self.specs[s];
+            let chunk = &self.tables[s][c << nu..((c + 1) << nu).min(self.tables[s].len())];
+            let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
+            let io = io_index(&cols);
+            let slot = sb.slot(Gate::new(cols.clone()));
+            for p in &sp.ports {
+                let terms =
+                    p.t.iter()
+                        .map(|t| match *t {
+                            T::C(c) => BusTerm::word(io[c]),
+                            T::K(v) => BusTerm {
+                                word: None,
+                                constant: v,
+                                row: None,
+                            },
+                            T::Id => BusTerm::row(RowTag {
+                                offset: ((self.chunk_base[s] + c) as u64) << 32,
+                                div: 1,
+                                modulo: 0,
+                            }),
+                        })
+                        .collect();
+                let dir = if p.send {
+                    BusDirection::Send
+                } else {
+                    BusDirection::Recv
+                };
+                sb.bus_port_counted(slot, dir, terms, p.mult.iter().map(|&c| io[c]).collect());
+            }
+            for z in chunk {
+                let wires: Vec<Wire> = sp
+                    .cols
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| matches!(c.0, Col::In))
+                    .map(|(y, c)| {
+                        values.push(z[y]);
+                        if matches!(c.1, Some(Src::RangeV(_))) {
+                            sb.fixed_public_input(z[y])
+                        } else {
+                            sb.input()
+                        }
+                    })
+                    .collect();
+                sb.gate(slot, &wires);
+            }
+            slots.push((
+                slot,
+                sp.name.clone(),
+                chunk.len(),
+                sp.ports.len(),
+                sp.cols.len(),
+            ));
+        }
+        let shape = sb.finish().map_err(|e| format!("{e:?}"))?;
+        Ok(Piece {
+            nu,
+            shape,
+            values,
+            slots,
+        })
+    }
+
+    /// Builds all chunks as one circuit, fills, proves and verifies;
+    /// `tamper` changes one witness word first (the proof must then fail).
+    pub fn prove_and_verify(&self, tamper: bool) -> Result<Report, FlockVerifyError> {
+        let t = Instant::now();
+        let piece = self.whole().expect("a valid shape");
+        let mut r = piece.prove_and_verify(tamper)?;
+        r.build_ms = self.build_ms + t.elapsed().as_secs_f64() * 1e3 - r.witness_ms - r.prove_ms - r.verify_ms;
+        Ok(r)
+    }
+}
+
+/// The bus challenges every piece shares: drawn after every piece's
+/// circuit digest and commitment, in order.
+pub fn shared_challenges(statement: &[([u8; 32], Commitment)]) -> SharedChallenges {
+    let mut ch = FsChallenger::new(b"cas-lean-pieces-v0");
+    ch.observe_label(&(statement.len() as u64).to_le_bytes());
+    for (digest, c) in statement {
+        ch.observe_label(digest);
+        ch.observe_label(&bincode::serialize(c).expect("a commitment serializes"));
+    }
+    SharedChallenges {
+        beta: ch.sample_f128(),
+        gamma: (0..W).map(|_| ch.sample_f128()).collect(),
+    }
+}
+
+/// A piece's proof under shared challenges.
+pub struct PieceProof {
+    pub proof: R1csProofCircuitMerged,
+    pub commitment: Commitment,
+    pub witness_ms: f64,
+    pub prove_ms: f64,
+}
+
+impl Piece {
     fn union(&self) -> UnionInstance<'_> {
         UnionInstance::new(&self.shape.registry, self.shape.counts.clone())
     }
@@ -1372,14 +1479,18 @@ impl LeanCircuit {
         crate::leanxmss::circuit::XmssCircuit::pcs_params(union)
     }
 
-    /// Fills, proves and verifies; `tamper` changes one witness word first
-    /// (the proof must then fail).
-    pub fn prove_and_verify(&self, tamper: bool) -> Result<Report, FlockVerifyError> {
-        let t = Instant::now();
+    /// The circuit digest, which the shared challenges bind.
+    pub fn digest(&self) -> [u8; 32] {
+        self.shape.circuit.digest()
+    }
+
+    pub fn rows(&self) -> usize {
+        self.slots.iter().map(|s| s.2).sum()
+    }
+
+    /// The witness, as the prover's element inputs, and the public words.
+    fn witness(&self, tamper: bool) -> (Vec<Vec<F128>>, Vec<F128>) {
         let mut w = self.shape.run(&self.values, &[]);
-        let witness_ms = t.elapsed().as_secs_f64() * 1e3;
-        let union = self.union();
-        let pcs = Self::pcs(&union);
         let mut el: Vec<(usize, Vec<F128>)> = self
             .slots
             .iter()
@@ -1395,7 +1506,7 @@ impl LeanCircuit {
             .collect();
         el.sort_by_key(|x| x.0);
         if tamper {
-            // A Trans row's own `a` (or any first live cell): one word off.
+            // The first live cell: one word off.
             let (_, z) = el
                 .iter_mut()
                 .find(|(_, z)| z.iter().any(|v| !v.is_zero()))
@@ -1403,38 +1514,91 @@ impl LeanCircuit {
             let i = z.iter().position(|v| !v.is_zero()).unwrap();
             z[i] += F128::ONE;
         }
-        let inputs: Vec<UnionElementSlotInput<'_>> = el
-            .into_iter()
-            .map(|(_, z)| {
-                UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(&z))
-            })
+        (el.into_iter().map(|x| x.1).collect(), w.public)
+    }
+
+    fn inputs(z: &[Vec<F128>]) -> Vec<UnionElementSlotInput<'_>> {
+        z.iter()
+            .map(|z| UnionElementSlotInput::new(move |dst: &mut [F128]| dst.copy_from_slice(z)))
+            .collect()
+    }
+
+    fn circuit(&self, shared: Option<&SharedChallenges>) -> std::borrow::Cow<'_, Circuit> {
+        match shared {
+            None => std::borrow::Cow::Borrowed(&self.shape.circuit),
+            Some(s) => std::borrow::Cow::Owned(self.shape.circuit.clone().with_shared_challenges(s.clone())),
+        }
+    }
+
+    /// The first phase of a shared proof: the commitment only.
+    pub fn commit(&self) -> Commitment {
+        let (z, _) = self.witness(false);
+        let union = self.union();
+        let pcs = Self::pcs(&union);
+        commit_ligerito_union_circuit(&union, &pcs, Vec::new(), Self::inputs(&z))
+    }
+
+    /// Proves this piece, with the bus challenges fixed from outside when
+    /// `shared` is given. `label` separates the pieces' transcripts.
+    pub fn prove(&self, shared: Option<&SharedChallenges>, label: &[u8], tamper: bool) -> PieceProof {
+        let t = Instant::now();
+        let (z, public) = self.witness(tamper);
+        let witness_ms = t.elapsed().as_secs_f64() * 1e3;
+        let union = self.union();
+        let pcs = Self::pcs(&union);
+        let circuit = self.circuit(shared);
+        let t = Instant::now();
+        let mut ch = FsChallenger::new(b"cas-lean-rows-v0");
+        ch.observe_label(label);
+        let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
+            &union,
+            &circuit,
+            &public,
+            &pcs,
+            Vec::new(),
+            Self::inputs(&z),
+            &mut ch,
+        );
+        PieceProof {
+            proof,
+            commitment,
+            witness_ms,
+            prove_ms: t.elapsed().as_secs_f64() * 1e3,
+        }
+    }
+
+    /// Verifies a piece's proof against its commitment; returns the time
+    /// it took. Under shared challenges this does not check the bus's
+    /// balance, which holds only over all pieces ([`shared_balance`]).
+    pub fn verify(
+        &self,
+        shared: Option<&SharedChallenges>,
+        label: &[u8],
+        commitment: &Commitment,
+        proof: &R1csProofCircuitMerged,
+    ) -> Result<f64, FlockVerifyError> {
+        let union = self.union();
+        let pcs = Self::pcs(&union);
+        let circuit = self.circuit(shared);
+        let c = &self.shape.circuit;
+        let public: Vec<F128> = (0..c.num_public())
+            .map(|i| c.fixed_public(i).expect("every public word is fixed"))
             .collect();
         let t = Instant::now();
         let mut ch = FsChallenger::new(b"cas-lean-rows-v0");
-        let (proof, commitment, _) = prove_fast_ligerito_union_circuit(
-            &union,
-            &self.shape.circuit,
-            &w.public,
-            &pcs,
-            Vec::new(),
-            inputs,
-            &mut ch,
-        );
-        let prove_ms = t.elapsed().as_secs_f64() * 1e3;
-        let proof_bytes = bincode::serialize(&proof).map(|b| b.len()).unwrap_or(0);
-        let t = Instant::now();
-        let mut ch = FsChallenger::new(b"cas-lean-rows-v0");
+        ch.observe_label(label);
         verify_ligerito_union_circuit(
-            &union,
-            &self.shape.circuit,
-            &w.public,
-            &[],
-            &commitment,
-            &proof,
-            &pcs,
-            &mut ch,
+            &union, &circuit, &public, &[], commitment, proof, &pcs, &mut ch,
         )?;
-        let verify_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(t.elapsed().as_secs_f64() * 1e3)
+    }
+
+    /// Fills, proves and verifies alone; `tamper` changes one witness word
+    /// first (the proof must then fail).
+    pub fn prove_and_verify(&self, tamper: bool) -> Result<Report, FlockVerifyError> {
+        let p = self.prove(None, b"", tamper);
+        let proof_bytes = bincode::serialize(&p.proof).map(|b| b.len()).unwrap_or(0);
+        let verify_ms = self.verify(None, b"", &p.commitment, &p.proof)?;
         let tables: Vec<(String, usize, usize, usize)> = self
             .slots
             .iter()
@@ -1446,13 +1610,23 @@ impl LeanCircuit {
             cells: tables.iter().map(|t| t.1 * t.3).sum(),
             ports: tables.iter().map(|t| t.2).sum(),
             tables,
-            build_ms: self.build_ms,
-            witness_ms,
-            prove_ms,
+            build_ms: 0.0,
+            witness_ms: p.witness_ms,
+            prove_ms: p.prove_ms,
             verify_ms,
             proof_bytes,
         })
     }
+}
+
+/// Whether two commitments are the same root.
+pub fn same_commitment(a: &Commitment, b: &Commitment) -> bool {
+    bincode::serialize(a).ok() == bincode::serialize(b).ok()
+}
+
+/// Whether the pieces' shared buses balance together.
+pub fn shared_balance<'a>(proofs: impl IntoIterator<Item = &'a R1csProofCircuitMerged>) -> bool {
+    bus::shared_balance(proofs.into_iter().filter_map(|p| p.wiring.bus.as_ref()))
 }
 
 #[cfg(test)]
@@ -1527,6 +1701,53 @@ F 10 App infer 0 5 0 0 : 7 8 6 9 5
         assert!(LeanCircuit::build(&rows).is_err());
         let c = LeanCircuit::build_with(&rows, false).unwrap();
         assert!(c.prove_and_verify(false).is_err());
+    }
+
+    /// Proves every piece under challenges drawn from all commitments;
+    /// returns whether every piece verified and the buses balance.
+    fn shared(c: &LeanCircuit, cap: usize, drop_last: bool) -> (usize, bool) {
+        let pieces: Vec<Piece> = c.pieces(cap).iter().map(|p| c.piece(p).unwrap()).collect();
+        let statement: Vec<([u8; 32], Commitment)> =
+            pieces.iter().map(|p| (p.digest(), p.commit())).collect();
+        let ch = shared_challenges(&statement);
+        let mut proofs = Vec::new();
+        let mut ok = true;
+        for (i, p) in pieces.iter().enumerate() {
+            let label = (i as u64).to_le_bytes();
+            let pp = p.prove(Some(&ch), &label, false);
+            assert!(same_commitment(&pp.commitment, &statement[i].1), "proving commits as the first phase did");
+            ok &= p.verify(Some(&ch), &label, &statement[i].1, &pp.proof).is_ok();
+            proofs.push(pp.proof);
+        }
+        if drop_last {
+            proofs.pop();
+        }
+        (pieces.len(), ok && shared_balance(&proofs))
+    }
+
+    #[test]
+    fn pieces_share_one_bus() {
+        // Enough copies that each piece is big enough to commit to.
+        let rows = Rows::merge((0..4000).map(|_| Rows::parse(SMALL).unwrap()).collect());
+        let c = LeanCircuit::build(&rows).unwrap();
+        let total: usize = c.chunks().iter().map(|x| x.2).sum();
+        let (n, ok) = shared(&c, total / 2 + 1, false);
+        assert_eq!(n, 2);
+        assert!(ok, "the pieces verify and balance together");
+        assert!(!shared(&c, total / 2 + 1, true).1, "a piece left out unbalances the bus");
+    }
+
+    #[test]
+    fn a_false_beta_is_refused_in_pieces() {
+        let bad = SMALL
+            .replace("F 2 Beta eq 0 5 4 0 : 1", "F 2 Beta eq 0 5 0 0 : 1")
+            .replace("F 3 Trans eq 0 5 4 0 : 2 0", "F 3 Refl eq 0 5 5 0 :")
+            .replace("F 4 Symm eq 0 4 5 0 : 3", "F 4 Refl eq 0 4 4 0 :");
+        let mut parts: Vec<Rows> = (0..3999).map(|_| Rows::parse(SMALL).unwrap()).collect();
+        parts.push(Rows::parse(&bad).unwrap());
+        let c = LeanCircuit::build_with(&Rows::merge(parts), false).unwrap();
+        let total: usize = c.chunks().iter().map(|x| x.2).sum();
+        assert!(!shared(&c, total / 2 + 1, false).1);
     }
 }
 

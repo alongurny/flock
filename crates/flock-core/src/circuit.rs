@@ -817,6 +817,16 @@ impl Circuit {
         Ok(self)
     }
 
+    /// Fix the bus's challenges from outside, for a bus shared by several
+    /// proofs ([`bus::Bus::shared`]). The proof then leaves the bus's two
+    /// products public, and the caller checks them over every piece.
+    pub fn with_shared_challenges(mut self, shared: bus::SharedChallenges) -> Self {
+        let bus = self.bus.as_mut().expect("a shared bus needs a bus");
+        assert_eq!(shared.gamma.len(), bus.width);
+        bus.shared = Some(shared);
+        self
+    }
+
     /// The circuit's tuple bus, if any.
     pub fn bus(&self) -> Option<&Bus> {
         self.bus.as_ref()
@@ -2383,6 +2393,7 @@ mod tests {
         };
         let bus = Bus {
             width: 3,
+            shared: None,
             ports: vec![
                 port(
                     0,
@@ -2562,6 +2573,7 @@ mod tests {
         };
         let bus = Bus {
             width: 2,
+            shared: None,
             ports: vec![
                 request(0, [0, 1]),
                 BusPort {
@@ -2707,6 +2719,7 @@ mod tests {
             .unwrap()
             .with_bus(Bus {
                 width: 1,
+                shared: None,
                 ports: vec![
                     BusPort {
                         ty: 1,
@@ -2751,6 +2764,7 @@ mod tests {
             .unwrap()
             .with_bus(Bus {
                 width: 1,
+                shared: None,
                 ports: vec![port(BusDirection::Send), port(BusDirection::Recv)],
             })
             .expect("a valid bus");
