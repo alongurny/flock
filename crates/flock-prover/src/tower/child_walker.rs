@@ -2108,6 +2108,12 @@ pub(super) struct ChildRegion {
     pub(super) lin_eval_w: Vec<Option<Wire>>,
     /// The z_skip surface, by flavor — see [`ZskipWires`].
     pub(super) zskip: ZskipWires,
+    /// The element assertion's wires (a child with an element class):
+    /// the zerocheck round rhos (r_con is their tail past ν), the lincheck
+    /// rhos reversed (r_col), and the reported A/B evaluation per type.
+    pub(super) el_zc_rho_w: Vec<Wire>,
+    pub(super) el_r_col_w: Vec<Wire>,
+    pub(super) el_eval_w: Vec<(Wire, Wire)>,
     /// The residual close-out's prefix slot (and width) — reusable by a
     /// caller emitting more prefix products into the same builder.
     pub(super) pf: (SlotId, usize),
@@ -2408,6 +2414,7 @@ pub(super) fn emit_child_region(
                 .collect()
         })
         .unwrap_or_default();
+    let mut el_out: (Vec<Wire>, Vec<(Wire, Wire)>) = (Vec::new(), Vec::new());
     if let (Some(el_assert), Some((_, el_lcw, _, _, el_alpha_w))) = (&ct.el_assert, el_pub) {
         let el_eval_w: Vec<(Wire, Wire)> = el_assert
             .evals
@@ -2443,6 +2450,7 @@ pub(super) fn emit_child_region(
             zw,
             ow,
         );
+        el_out = (el_r_col_w, el_eval_w);
     }
     let element_values = el_pub.map(|(_, _, a, b, _)| (a, b));
     let element_point = el_rec.map(|_| &el_zc_rho_w[n_log_i..]);
@@ -2540,6 +2548,9 @@ pub(super) fn emit_child_region(
         mat_eval_w,
         lin_eval_w,
         zskip: zskip_wires(&ct.zskip, &outs, trace, stream, &ww),
+        el_zc_rho_w,
+        el_r_col_w: el_out.0,
+        el_eval_w: el_out.1,
         pf: (pfslot, pf_w),
         child_pub_w: pub_w,
         pub_digest_w,

@@ -185,11 +185,13 @@ const ENV_BODY_WORDS: usize = 4266;
 
 /// The ACC_CHAIN width a lane accumulator needs: per folded group its
 /// published `[live | rho_col | rho_row | value]`, boolean A and B per group,
-/// the linear-identity groups, then sigma, then jagged.
+/// the linear-identity groups, the element A and B per type, then sigma,
+/// then jagged.
 pub(super) fn lane_block_words(acc: &Accumulator) -> usize {
     let w = |c: &MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
     acc.per_type.iter().map(|(a, b)| w(a) + w(b)).sum::<usize>()
         + acc.per_linear.iter().map(w).sum::<usize>()
+        + acc.per_element.iter().map(|(a, b)| w(a) + w(b)).sum::<usize>()
         + acc.sigma.iter().map(|(_, c)| w(c)).sum::<usize>()
         + acc.jagged.iter().map(|(_, c)| w(c)).sum::<usize>()
 }
@@ -267,7 +269,26 @@ pub(super) fn envelope_shape() -> EnvShape {
 
 /// [`envelope_shape`] with an ACC_CHAIN block of `acc_chain_words`: the
 /// same registry and body, the public segment longer by the difference.
+/// A tower over another leaf family (Lean) whose verifier needs a larger
+/// envelope: `(nu*, lanes)` in place of leanXMSS's, for every outer that
+/// tower builds. Process-wide: one tower is built at a time.
+static ENVELOPE_OVERRIDE: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+
+/// Set (or with `None` clear) the envelope override.
+pub(super) fn set_envelope_override(o: Option<(usize, usize)>) {
+    *ENVELOPE_OVERRIDE.lock().unwrap() = o;
+}
+
 pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
+    let mut env = envelope_shape_default(acc_chain_words);
+    if let Some((nu, lanes)) = *ENVELOPE_OVERRIDE.lock().unwrap() {
+        env.nu = nu;
+        env.lanes = lanes;
+    }
+    env
+}
+
+fn envelope_shape_default(acc_chain_words: usize) -> EnvShape {
     EnvShape {
         // The two-child envelope fits at 14 after consolidating the F256
         // residual tables and assigning each independent child verifier to

@@ -176,6 +176,7 @@ pub(super) fn xmss_family(circuit: &XmssCircuit) -> FlFamily<'_> {
         circs: circuit.lincheck_circuits(),
         lane_words: None,
         shared: Some(Dropped::of(&circuit.union())),
+        env_nu: None,
     }
 }
 

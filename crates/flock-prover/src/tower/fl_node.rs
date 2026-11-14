@@ -201,6 +201,9 @@ pub(super) struct FlFamily<'a> {
     /// matrix class under the leaf union's dropped words. `None`: per-claim
     /// binding, per type.
     pub(super) shared: Option<Dropped>,
+    /// The envelope's `nu*` for this family's tower, when it is not the
+    /// leanXMSS one (a Lean leaf's verifier needs more rows).
+    pub(super) env_nu: Option<usize>,
 }
 
 /// A first-level node's application statement, published in the envelope's
@@ -267,6 +270,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         circs: vec![blake_r1cs.csc_lincheck_circuit()],
         lane_words: Some(ENV_ACC_CHAIN_WORDS),
         shared: None,
+        env_nu: None,
     };
     let inners: Vec<&MixedInner> = cps.iter().map(|cp| &cp.inner).collect();
     let core = build_first_level_core(
@@ -394,10 +398,16 @@ pub(super) fn build_first_level_core(
     let n_types = registry.num_boolean();
     assert_eq!(family.mats.len(), n_types, "matrices per boolean type");
     assert_eq!(family.circs.len(), n_types, "a lincheck circuit per type");
-    assert!(
-        registry.element_types().is_empty(),
-        "the leaf class has no element side"
-    );
+    // The element class (a Lean leaf's tables; none for leanXMSS): its
+    // matrices per type and each child's element assertion.
+    let el_types: Vec<_> = registry
+        .element_types()
+        .iter()
+        .map(|s| s.element_type().expect("an element slot's table"))
+        .collect();
+    let el_mats: Vec<ElementMatrices<'_>> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
+    let n_el = el_mats.len();
+    let unions: Vec<UnionInstance<'_>> = inners.iter().map(|i| i.union()).collect();
     let bool_asserts: Vec<_> = inners
         .iter()
         .map(|inner| inner.work.boolean.clone().expect("child boolean work"))
@@ -406,8 +416,12 @@ pub(super) fn build_first_level_core(
 
     // ---- the native fold: boolean + sigma, NO element groups, NO priors ----
     let mats = &family.mats[..];
-    let el_mats: [ElementMatrices; 0] = [];
-    let el_asserts: [(&UnionInstance<'_>, ElementAssertion); 0] = [];
+    let el_asserts: Vec<(&UnionInstance<'_>, ElementAssertion)> = inners
+        .iter()
+        .zip(&unions)
+        .filter_map(|(i, u)| i.work.element.clone().map(|a| (u, a)))
+        .collect();
+    assert_eq!(el_asserts.len(), if n_el > 0 { k_ary } else { 0 }, "element work per child");
     let circs = &family.circs[..];
     // THE JAGGED GROUP (the count win): the children's W-claims fold under
     // the leaf digest — the layout is a shape constant of the ONE leaf
@@ -484,7 +498,7 @@ pub(super) fn build_first_level_core(
     }
     .expect("the first-level fold verifies");
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
-    assert!(acc_v.per_element.is_empty(), "no element group accumulated");
+    assert!(acc_v.discharge_element(&el_mats), "the element group discharges");
     // The boolean fold groups: one per type, or one per matrix class under
     // shared binding — each group's claims are child-major, then
     // type-ascending within the group. Under shared binding the classes
@@ -564,10 +578,23 @@ pub(super) fn build_first_level_core(
         fold_proofs.push(&agg.linear_folds[lg]);
     }
     let n_ab = 2 * groups.len();
-    let sig_g = n_ab + linear.len();
+    // The element folds follow the linear ones (the aggregate's order):
+    // per element type its A and B folds, one claim per child.
+    let el_g = n_ab + linear.len();
+    for t in 0..n_el {
+        let (ca, cb): (Vec<MatrixClaim>, Vec<MatrixClaim>) = el_asserts
+            .iter()
+            .map(|(u, a)| a.claims(u).swap_remove(t))
+            .unzip();
+        fold_claims.push(ca);
+        fold_claims.push(cb);
+        fold_proofs.push(&agg.el_folds[t].0);
+        fold_proofs.push(&agg.el_folds[t].1);
+    }
+    let sig_g = el_g + 2 * n_el;
     fold_claims.push(sigmas.iter().flat_map(|s| s.claims()).collect());
     fold_proofs.push(&agg.sigma_folds[0]);
-    for claims in &fold_claims[..sig_g] {
+    for claims in &fold_claims[..el_g] {
         assert_eq!(claims[0].row.low.len(), 64, "fresh lagrange low");
         assert_eq!(claims[0].col.low.len(), 64, "fresh z_partial low");
     }
@@ -628,7 +655,7 @@ pub(super) fn build_first_level_core(
     let n_bound: Vec<usize> = if family.shared.is_some() {
         want.extend(shared_binding_ops(&bool_asserts, &sigma_refs));
         (0..n_uni)
-            .map(|fi| k_ary * fold_members(fi).len())
+            .map(|fi| if fi < el_g { k_ary * fold_members(fi).len() } else { 0 })
             .collect()
     } else {
         vec![0; n_uni]
@@ -670,6 +697,11 @@ pub(super) fn build_first_level_core(
         let (sigma_locs, v0) = locate_shared_sigma(&sigma_refs, vals_rec, v_sigma);
         let mut prebound: Vec<Vec<ClaimLoc>> = Vec::with_capacity(sig_g);
         for fi in 0..n_uni {
+            if fi >= el_g {
+                // The element folds bind nothing ahead.
+                prebound.push(Vec::new());
+                continue;
+            }
             let members = fold_members(fi);
             prebound.push(
                 (0..k_ary)
@@ -735,8 +767,8 @@ pub(super) fn build_first_level_core(
         .map(|inner| ChildTape::new(inner, family.domain, circs))
         .collect();
     assert!(
-        tapes.iter().all(|t| t.el.is_none()),
-        "boolean-only children"
+        tapes.iter().all(|t| t.el.is_some() == (n_el > 0)),
+        "an element region exactly when the leaf has an element class"
     );
 
     // ---- the outer: k chain-tape regions + the fold region + adjacency ----
@@ -763,6 +795,9 @@ pub(super) fn build_first_level_core(
                 .lane_words
                 .unwrap_or_else(|| lane_block_words(&acc_v)),
         );
+        if let Some(nu) = family.env_nu {
+            assert_eq!(env.nu, nu, "the family's envelope is the override's");
+        }
         let split_b3 = tapes.len() == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = tapes[0].b3_rows;
@@ -1229,7 +1264,7 @@ pub(super) fn build_first_level_core(
             // reported evaluation; then the lagrange lows. Child k's claims
             // in fold `fi`, with the type each names.
             assert_eq!(rk.mat_eval_w.len(), n_types, "child Boolean type count");
-            let child_claims: Vec<(usize, usize, usize)> = (0..sig_g)
+            let child_claims: Vec<(usize, usize, usize)> = (0..el_g)
                 .flat_map(|fi| {
                     let members = fold_members(fi);
                     let base = n_priors + k * members.len();
@@ -1294,6 +1329,23 @@ pub(super) fn build_first_level_core(
                     rk.mat_eval_w[t].1
                 };
                 sb.connect(wv(cl.value_v), value_w);
+            }
+            // element A/B per type: r_con = the zerocheck rhos past ν, r_col
+            // = the lincheck rhos reversed, values to the reported evals.
+            for t in 0..n_el {
+                for fi in [el_g + 2 * t, el_g + 2 * t + 1] {
+                    let cl = &locs[fi].claims[n_priors + k];
+                    sb.connect(wv(cl.row_low_v), ow);
+                    sb.connect(wv(cl.col_low_v), ow);
+                    for j in 0..cl.row_pt_n {
+                        sb.connect(wv(cl.row_pt_v + j), rk.el_zc_rho_w[tk.n_log_i + j]);
+                    }
+                    for j in 0..cl.col_pt_n {
+                        sb.connect(wv(cl.col_pt_v + j), rk.el_r_col_w[j]);
+                    }
+                }
+                sb.connect(wv(locs[el_g + 2 * t].claims[n_priors + k].value_v), rk.el_eval_w[t].0);
+                sb.connect(wv(locs[el_g + 2 * t + 1].claims[n_priors + k].value_v), rk.el_eval_w[t].1);
             }
             // Every claim's lagrange lows are the first's — one published
             // copy binds them all (one stream copy, under shared binding).
@@ -1552,8 +1604,10 @@ pub(super) fn build_first_level_core(
                 per_type: (0..groups.len())
                     .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
                     .collect(),
-                per_element: Vec::new(),
-                per_linear: rebuilt[n_ab..sig_g].to_vec(),
+                per_element: (0..n_el)
+                    .map(|t| (rebuilt[el_g + 2 * t].clone(), rebuilt[el_g + 2 * t + 1].clone()))
+                    .collect(),
+                per_linear: rebuilt[n_ab..el_g].to_vec(),
                 sigma: vec![(leaf_digest, rebuilt[sig_g].clone())],
                 jagged: vec![(leaf_digest, jrebuilt[0].clone())],
             };
