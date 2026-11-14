@@ -851,7 +851,11 @@ impl ShapeBuilder {
                 })
                 .collect();
             let width = first.len();
-            circuit = circuit.with_bus(Bus { width, ports, shared: None })?;
+            circuit = circuit.with_bus(Bus {
+                width,
+                ports,
+                shared: None,
+            })?;
         }
         Ok(CircuitShape {
             registry,
@@ -919,6 +923,29 @@ pub struct CircuitShape {
 }
 
 impl CircuitShape {
+    /// Approximate heap bytes per field, for memory diagnostics.
+    pub fn heap_report(&self) -> Vec<(&'static str, usize)> {
+        let mut r = self.circuit.heap_report();
+        r.push((
+            "steps",
+            self.steps.capacity() * std::mem::size_of::<Step>()
+                + self
+                    .steps
+                    .iter()
+                    .map(|s| (s.inputs.capacity() + s.outputs.capacity()) * 8)
+                    .sum::<usize>(),
+        ));
+        r.push(("steps.count", self.steps.len()));
+        r.push(("inputs", self.inputs.capacity() * 8));
+        r.push(("publics", self.publics.capacity() * 8));
+        r.push(("islands", self.islands.capacity() * 16));
+        r.push((
+            "order+registry_slot",
+            (self.order.capacity() + self.registry_slot.capacity()) * 8,
+        ));
+        r
+    }
+
     /// Where a declared slot landed in the registry. `Registry::new` sorts
     /// class-major, area-descending, so declaration order is not slot order.
     pub fn registry_slot(&self, s: SlotId) -> usize {
@@ -1578,6 +1605,17 @@ pub struct CircuitWitness {
 }
 
 impl CircuitWitness {
+    /// Only the public segment: what a verifier (or a recursive walk of a
+    /// finished proof) reads, without the slot witnesses' memory.
+    pub fn public_only(self) -> Self {
+        Self {
+            public: self.public,
+            witnesses: Vec::new(),
+            rows: Vec::new(),
+            slot_types: Vec::new(),
+        }
+    }
+
     /// A slot's rows in instantiation order, with their concrete type
     /// recovered.
     ///

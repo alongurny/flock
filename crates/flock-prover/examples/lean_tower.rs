@@ -6,6 +6,7 @@
 //! ```text
 //! LEAN_ROWS_NU=NU lean_tower census N OUT          # OUT/census.tsv
 //! LEAN_ROWS_NU=NU lean_tower run N OUT SLOTS [ENV_NU LANES M]
+//! LEAN_ROWS_NU=NU lean_tower probe N OUT SLOTS [ENV_NU LANES M]   # four leaves
 //! ```
 //!
 //! `N` batches (the shared side is side 0, batch k side k + 1), `OUT` the
@@ -40,8 +41,9 @@ fn build(side: usize, n: usize, out: &str) -> LeanCircuit {
                 *outside.entry(t).or_default() += c;
             }
         }
-        let (c, _) = LeanCircuit::build_side(&g, &Rows::default(), Side::Shared, SHARED_BASE, &outside)
-            .unwrap_or_else(|e| panic!("shared side: {e}"));
+        let (c, _) =
+            LeanCircuit::build_side(&g, &Rows::default(), Side::Shared, SHARED_BASE, &outside)
+                .unwrap_or_else(|e| panic!("shared side: {e}"));
         c
     } else {
         let k = side - 1;
@@ -65,6 +67,19 @@ fn census_path(out: &str) -> String {
     format!("{out}/census.tsv")
 }
 
+/// Per table, the widest multiplicity over every side: one leaf circuit.
+fn bits_path(out: &str) -> String {
+    format!("{out}/mult-bits.tsv")
+}
+
+fn read_bits(out: &str) -> Vec<usize> {
+    let text = fs::read_to_string(bits_path(out)).expect("run census first");
+    text.trim()
+        .split('\t')
+        .map(|x| x.parse().unwrap())
+        .collect()
+}
+
 fn read_census(out: &str) -> (usize, Vec<Vec<usize>>) {
     let text = fs::read_to_string(census_path(out)).expect("run census first");
     let mut lines = text.lines();
@@ -78,7 +93,9 @@ fn read_census(out: &str) -> (usize, Vec<Vec<usize>>) {
 /// About `slots` slots, table s taking its share of every side's chunks.
 fn profile(nu: usize, census: &[Vec<usize>], slots: usize) -> Profile {
     let n_tables = census[0].len();
-    let totals: Vec<usize> = (0..n_tables).map(|s| census.iter().map(|r| r[s]).sum()).collect();
+    let totals: Vec<usize> = (0..n_tables)
+        .map(|s| census.iter().map(|r| r[s]).sum())
+        .collect();
     let all: usize = totals.iter().sum();
     let mut v = Vec::new();
     for (s, &t) in totals.iter().enumerate() {
@@ -103,6 +120,59 @@ fn side_leaves(profile: &Profile, counts: &[usize]) -> usize {
         .unwrap_or(0)
 }
 
+/// The process's resident and peak memory, for the progress lines.
+/// Counts live heap bytes, to tell held memory from allocator slack.
+struct Counting;
+static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// SAFETY: forwards to the system allocator and only counts sizes.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        LIVE.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(l) }
+    }
+    // Forwarded, not the default alloc-then-memset: the prover relies on
+    // calloc's lazy zero pages for its big zeroed buffers.
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        LIVE.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc_zeroed(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        LIVE.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
+        LIVE.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        LIVE.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(p, l, n) }
+    }
+}
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+fn rss() -> String {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: glibc's malloc_trim only returns free heap pages to the OS.
+    unsafe {
+        malloc_trim(0);
+    }
+    let st = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let get = |k: &str| {
+        st.lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(0.0, |kb| kb as f64 / 1048576.0)
+    };
+    format!(
+        "rss {:.1} GB, peak {:.1} GB, live {:.1} GB",
+        get("VmRSS:"),
+        get("VmHWM:"),
+        LIVE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1073741824.0
+    )
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let num = |i: usize| a[i].parse::<usize>().unwrap();
@@ -112,19 +182,34 @@ fn main() {
         "census" => {
             let mut text = String::new();
             let mut nu = None;
+            let mut bits: Vec<usize> = Vec::new();
             for side in 0..=n {
                 let c = build(side, n, &out);
-                assert!(nu.is_none_or(|x| x == c.nu), "one nu for every side (set LEAN_ROWS_NU)");
+                assert!(
+                    nu.is_none_or(|x| x == c.nu),
+                    "one nu for every side (set LEAN_ROWS_NU)"
+                );
                 nu = Some(c.nu);
+                let b = c.mult_bits();
+                bits.resize(bits.len().max(b.len()), 0);
+                for (x, y) in bits.iter_mut().zip(b) {
+                    *x = (*x).max(y);
+                }
                 let n_tables = c.chunks().iter().map(|x| x.0 + 1).max().unwrap_or(0);
                 let pt = per_table(&c, n_tables);
                 let counts: Vec<String> = pt.iter().map(|t| t.len().to_string()).collect();
-                eprintln!("side {side}: {} chunks ({:.0} s)", pt.iter().map(Vec::len).sum::<usize>(), t0.elapsed().as_secs_f64());
+                eprintln!(
+                    "side {side}: {} chunks ({:.0} s)",
+                    pt.iter().map(Vec::len).sum::<usize>(),
+                    t0.elapsed().as_secs_f64()
+                );
                 text.push_str(&format!("{side}\t{}\n", counts.join("\t")));
             }
             fs::write(census_path(&out), format!("{}\n{text}", nu.unwrap())).unwrap();
+            let bits: Vec<String> = bits.iter().map(usize::to_string).collect();
+            fs::write(bits_path(&out), bits.join("\t") + "\n").unwrap();
         }
-        "run" => {
+        "run" | "probe" | "sizes" => {
             let slots = num(3);
             let env = LeanEnvelope {
                 nu: a.get(4).map_or(15, |x| x.parse().unwrap()),
@@ -132,6 +217,7 @@ fn main() {
                 m: a.get(6).map_or(30, |x| x.parse().unwrap()),
             };
             let (nu, mut census) = read_census(&out);
+            flock_prover::lean_rows::set_mult_bits(Some(read_bits(&out)));
             let n_tables = census.iter().map(Vec::len).max().unwrap();
             for r in &mut census {
                 r.resize(n_tables, 0);
@@ -147,6 +233,12 @@ fn main() {
             }
             if index.len() % 2 == 1 {
                 index.push((n, usize::MAX));
+            }
+            if a[0] == "probe" {
+                // Four leaves from the middle of the cone: the envelope's fit
+                // and the per-proof costs, before a full run.
+                let at = index.len() / 2 & !1;
+                index = index[at..at + 4].to_vec();
             }
             println!(
                 "profile: nu {nu}, {} slots; {} leaves over {} sides",
@@ -166,6 +258,62 @@ fn main() {
                 let s: Vec<LeafSlot<'_>> = slots.iter().map(|x| x.map(|ch| (c, ch))).collect();
                 leaf(c, &profile, &s).unwrap()
             };
+            if std::env::var_os("LEAN_SPECS").is_some() {
+                let (x, y) = (index[0].0, index[index.len() - 1].0);
+                let (cx, cy) = (
+                    build(x, n, &out).spec_texts(),
+                    build(y, n, &out).spec_texts(),
+                );
+                for (i, (p, q)) in cx.iter().zip(&cy).enumerate() {
+                    if p != q {
+                        println!(
+                            "table {i} differs between sides {x} and {y}:\n  {}\n  {}",
+                            &p[..p.len().min(600)],
+                            &q[..q.len().min(600)]
+                        );
+                    }
+                }
+                println!("{} vs {} tables", cx.len(), cy.len());
+                return;
+            }
+            if a[0] == "sizes" {
+                let (side, l) = index[index.len() / 2];
+                let c = build(side, n, &out);
+                println!("side built ({})", rss());
+                let p = piece_of(&c, l, &census[side]);
+                drop(c);
+                println!("piece built ({})", rss());
+                let sh = p.shape();
+                let cl = sh.clone();
+                println!("shape cloned ({})", rss());
+                drop(cl);
+                println!("  values: {:.1} MB", p.n_values() as f64 * 16.0 / 1e6);
+                for (k, b) in sh.heap_report() {
+                    println!("  {k}: {:.1} MB ({b})", b as f64 / 1e6);
+                }
+                let wires: usize = sh.circuit.wires().iter().map(Vec::len).sum();
+                println!(
+                    "cells mu {}, wire classes {}, wired cells {}, types {}",
+                    sh.circuit.cells().mu(),
+                    sh.circuit.wires().len(),
+                    wires,
+                    sh.registry.types().len()
+                );
+                let mut ent = 0usize;
+                let mut rows = 0usize;
+                for ty in sh.registry.types() {
+                    if let Some(e) = ty.element_type() {
+                        for m in [e.a_0(), e.b_0()] {
+                            rows += m.rows.len();
+                            ent += m.rows.iter().map(Vec::len).sum::<usize>();
+                        }
+                    }
+                }
+                println!("element matrices: {rows} rows, {ent} entries");
+                drop(p);
+                println!("piece dropped ({})", rss());
+                return;
+            }
 
             // ---- FIRST PASS: every leaf's word ----
             let mut words = Vec::with_capacity(index.len());
@@ -177,32 +325,53 @@ fn main() {
                 }
                 let c = &side_c.as_ref().unwrap().1;
                 assert_eq!(c.nu, nu, "the census's nu");
-                words.push(leaf_word(&piece_of(c, l, &census[side])));
+                let p = piece_of(c, l, &census[side]);
+                if std::env::var_os("LEAN_DIGESTS").is_some() {
+                    println!(
+                        "leaf ({side}, {l}): circuit blake3:{:02x?}",
+                        &p.digest()[..6]
+                    );
+                }
+                words.push(leaf_word(&p));
             }
-            println!("first pass: {} leaves committed ({:.0} s)", words.len(), t0.elapsed().as_secs_f64());
+            println!(
+                "first pass: {} leaves committed ({:.0} s, {})",
+                words.len(),
+                t0.elapsed().as_secs_f64(),
+                rss()
+            );
 
             // ---- SECOND PASS: the tower, from the last leaf back ----
-            side_c = None;
-            let c0 = build(index[0].0, n, &out);
-            let p0 = piece_of(&c0, index[0].1, &census[index[0].0]);
-            drop(c0);
+            drop(side_c);
+            let mut pending: Option<(usize, flock_prover::lean_rows::Piece)> = None;
             let t1 = Instant::now();
             let r = prove_lean_tower_streaming(
                 TowerConfig::Chain128,
                 &words,
-                p0,
                 |i| {
-                    let (side, l) = index[i];
-                    if side_c.as_ref().is_none_or(|(s, _)| *s != side) {
-                        side_c = None;
-                        side_c = Some((side, build(side, n, &out)));
+                    // A side's circuit is large: build it, take leaf i and,
+                    // when it is of the same side, leaf i - 1 (asked next),
+                    // and drop it before the leaves prove.
+                    if let Some((j, p)) = pending.take() {
+                        if j == i {
+                            return p;
+                        }
                     }
-                    piece_of(&side_c.as_ref().unwrap().1, l, &census[side])
+                    let (side, l) = index[i];
+                    let c = build(side, n, &out);
+                    let p = piece_of(&c, l, &census[side]);
+                    if i >= 2 && index[i - 1].0 == side {
+                        pending = Some((i - 1, piece_of(&c, index[i - 1].1, &census[side])));
+                    }
+                    p
                 },
                 env,
-                |line| println!("{line} ({:.0} s)", t1.elapsed().as_secs_f64()),
+                |line| println!("{line} ({:.0} s, {})", t1.elapsed().as_secs_f64(), rss()),
             );
             println!("{r:?}");
+            if a[0] == "run" {
+                assert!(r.balanced, "the shared bus balances over the whole cone");
+            }
             println!(
                 "ONE PROOF for the cone: {} leaves; root proof {} KiB; verify {:.1} ms (root proof) + {:.1} ms (root-side checks); wall {:.0} s",
                 r.leaves,

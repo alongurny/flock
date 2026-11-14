@@ -2515,6 +2515,21 @@ pub fn build_node_outer_app(
                             .collect()
                     }
                 };
+                if passenger != want {
+                    for (t, (p, w)) in passenger.iter().zip(&want).enumerate() {
+                        eprintln!(
+                            "passenger {t}: key {:?} vs {:?}; value {:?} vs {:?}; row {}/{} col {}/{}",
+                            p.0,
+                            w.0,
+                            p.1.value,
+                            w.1.value,
+                            p.1.row.point.len(),
+                            w.1.row.point.len(),
+                            p.1.col.point.len(),
+                            w.1.col.point.len()
+                        );
+                    }
+                }
                 assert_eq!(
                     passenger, want,
                     "the published passenger is the child's, plus this node's orphan"

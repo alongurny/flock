@@ -407,6 +407,7 @@ pub(super) fn build_first_level_core(
         k_ary, 2,
         "split-BLAKE recursion supports exactly two children"
     );
+    trace_mem("fl start");
     let inner0 = inners[0];
     for inner in &inners[1..] {
         assert_eq!(
@@ -796,6 +797,7 @@ pub(super) fn build_first_level_core(
         "the jagged entry from located words"
     );
 
+    trace_mem("fl fold done");
     // ---- the child tapes ----
     let tapes: Vec<ChildTape> = inners
         .iter()
@@ -806,6 +808,7 @@ pub(super) fn build_first_level_core(
         "an element region exactly when the leaf has an element class"
     );
 
+    trace_mem("fl tapes done");
     // ---- the outer: k chain-tape regions + the fold region + adjacency ----
     {
         // The transcript is FORKED (the wiring runs on its own chain);
@@ -1551,7 +1554,30 @@ pub(super) fn build_first_level_core(
             );
             env_app_base(&env)
         };
+        trace_mem("fl emitted");
         let shape2 = sb.finish().expect("the first-level node circuit builds");
+        trace_mem("fl shape finished");
+        if std::env::var_os("LEAN_TRACE").is_some() {
+            let c = &shape2.circuit;
+            let fixed: Vec<usize> = (0..c.num_public())
+                .filter(|&i| c.fixed_public(i).is_some())
+                .collect();
+            let wh = blake3::hash(&bincode::serialize(c.wires()).unwrap_or_default());
+            eprintln!(
+                "[fl shape] digest {:02x?} registry {:02x?} counts {:?} publics {} fixed {} (hash {:?}) wires {} blake3:{}",
+                &c.digest()[..4],
+                &shape2.registry.digest()[..4],
+                c.counts(),
+                c.num_public(),
+                fixed.len(),
+                fixed
+                    .iter()
+                    .map(|&i| c.fixed_public(i).unwrap().lo)
+                    .fold(0u128, |a, x| a.wrapping_mul(31).wrapping_add(x as u128)),
+                c.wires().len(),
+                wh.to_hex()
+            );
+        }
         let hint_refs: Vec<&(dyn Any + Sync)> =
             hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         // THE INDEX-FILL RUNNER (setup), the node's path: compile the plan,
@@ -1635,6 +1661,7 @@ pub(super) fn build_first_level_core(
         let mut onlines: Vec<Online> = Vec::with_capacity(reps);
         let mut fin = None;
         for _ in 0..reps {
+            trace_mem("fl online start");
             let t_tapes = Instant::now();
             for inner in inners {
                 record_child_inner_verify(inner, family.domain, circs);
@@ -1644,6 +1671,7 @@ pub(super) fn build_first_level_core(
             // DEFERRED: rows and publics only — the element witnesses are never
             // packed, and the assembly below feeds the prover from the rows.
             let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
+            trace_mem("fl shape run");
             let run_ms = t_run.elapsed().as_secs_f64() * 1e3;
 
             // Child checkers (each child's whole deferred-verifier statement
@@ -1826,6 +1854,7 @@ pub(super) fn build_first_level_core(
             lco.sort_by_key(|(i, _)| *i);
             let lcs2: Vec<&dyn LincheckCircuit> = lco.into_iter().map(|(_, c)| c).collect();
             let asm_ms = t_asm.elapsed().as_secs_f64() * 1e3;
+            trace_mem("fl witness assembled");
             let t_prove = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
             let (oproof, ocommit) = if outer_zerocheck_ag() {
@@ -1857,6 +1886,7 @@ pub(super) fn build_first_level_core(
                 (MixedProof::Rs(p), c)
             };
             let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
+            trace_mem("fl proved");
             let t_ver = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
             oproof
@@ -2045,4 +2075,28 @@ pub(super) fn envelope_content_probe() {
             );
         }
     }
+}
+
+/// With `LEAN_TRACE` set, print a phase name and the process's resident
+/// memory, to place a memory peak inside a node's build.
+pub(super) fn trace_mem(what: &str) {
+    if std::env::var_os("LEAN_TRACE").is_none() {
+        return;
+    }
+    let st = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kb = |k: &str| {
+        st.lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    eprintln!(
+        "[mem] {t:.1} {what}: rss {:.1} GB, peak {:.1} GB",
+        kb("VmRSS") / 1048576.0,
+        kb("VmHWM") / 1048576.0
+    );
 }

@@ -697,7 +697,8 @@ pub(crate) fn verify_bus<C: Challenger>(
             gamma: shared.gamma.clone(),
         }
     } else {
-        let beta = if let Some(target) = grinding.fingerprint_target_for(live_entries(bus, circuit)) {
+        let beta = if let Some(target) = grinding.fingerprint_target_for(live_entries(bus, circuit))
+        {
             let [nonce] = proof.fingerprint_nonce[..] else {
                 return Err(WiringError::BusGkr(
                     crate::product_gkr::ProductGkrError::InvalidGrinding,
@@ -990,7 +991,10 @@ fn prove_mult<C: Challenger>(
                 }
                 out
             })
-            .reduce(|| [F128::ZERO; 3], |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]]);
+            .reduce(
+                || [F128::ZERO; 3],
+                |a, b| [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+            );
         ch.observe_f128_slice(&s);
         let rk = ch.sample_f128();
         claim = interpolate([s[0], claim + s[0], s[1], s[2]], rk);
@@ -1197,14 +1201,17 @@ pub fn multiplicity(port: &BusPort, j: usize, word: impl Fn(usize, usize) -> F12
     if port.mult.is_empty() {
         return Some(1);
     }
-    port.mult.iter().enumerate().try_fold(0u64, |acc, (i, &iota)| {
-        let b = word(iota, j);
-        if b == F128::ZERO {
-            Some(acc)
-        } else if b == F128::ONE {
-            Some(acc | 1 << i)
-        } else {
-            None
-        }
-    })
+    port.mult
+        .iter()
+        .enumerate()
+        .try_fold(0u64, |acc, (i, &iota)| {
+            let b = word(iota, j);
+            if b == F128::ZERO {
+                Some(acc)
+            } else if b == F128::ONE {
+                Some(acc | 1 << i)
+            } else {
+                None
+            }
+        })
 }

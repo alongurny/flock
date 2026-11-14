@@ -54,6 +54,19 @@ static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
 /// ranked by bytes rather than lifting the count.
 const MAX_POOLED: usize = 48;
 
+/// Optional cap on the bytes the `F128` pool retains (0: no cap, the
+/// default). A long run of proofs of different sizes (the Lean recursion
+/// tower: leaves, then first-level nodes, then nodes) otherwise keeps every
+/// size it ever took, up to [`MAX_POOLED`] buffers, and a 15 GB machine runs
+/// out of memory under the next proof. See [`set_byte_budget`].
+static BYTE_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cap the bytes the `F128` pool retains; `None` removes the cap. Over the
+/// cap, each pool's give frees its largest buffers first.
+pub fn set_byte_budget(bytes: Option<usize>) {
+    BYTE_BUDGET.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Take a length-`n` `F128` vector, preferring a pooled buffer (smallest
 /// capacity ≥ `n`); falls back to a fresh uninitialized allocation.
 ///
@@ -166,6 +179,26 @@ pub fn give_f128(v: Vec<F128>) {
             .map(|(i, _)| i)
             .expect("crowded class non-empty");
         pool.swap_remove(victim);
+    }
+    shed(&mut pool);
+}
+
+/// Over the [`set_byte_budget`] cap, free a pool's largest buffers first.
+fn shed<T>(pool: &mut Vec<Vec<T>>) {
+    let budget = BYTE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+    if budget == 0 {
+        return;
+    }
+    let bytes = |p: &Vec<Vec<T>>| {
+        p.iter()
+            .map(|b| b.capacity() * size_of::<T>())
+            .sum::<usize>()
+    };
+    while bytes(pool) > budget {
+        let largest = (0..pool.len())
+            .max_by_key(|&i| pool[i].capacity())
+            .expect("non-empty");
+        pool.swap_remove(largest);
     }
 }
 
@@ -298,6 +331,7 @@ pub fn give_zeroed_f128(mut v: Vec<F128>, dirty: &[Range<usize>]) {
             .expect("pool non-empty");
         pool.swap_remove(victim);
     }
+    shed(&mut pool);
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +395,7 @@ pub fn give_u8(v: Vec<u8>) {
             .expect("pool non-empty");
         pool.swap_remove(smallest);
     }
+    shed(&mut pool);
 }
 
 /// Pre-warm the pool for proves at witness size `2^m`: allocate and

@@ -400,6 +400,47 @@ pub struct Circuit {
 }
 
 impl Circuit {
+    /// Approximate heap bytes per field, for memory diagnostics.
+    pub fn heap_report(&self) -> Vec<(&'static str, usize)> {
+        use std::mem::size_of;
+        let vv = |v: &Vec<Vec<usize>>| {
+            v.capacity() * size_of::<Vec<usize>>()
+                + v.iter().map(|x| x.capacity() * 8).sum::<usize>()
+        };
+        vec![
+            (
+                "cells.slots",
+                self.cells.slots.capacity() * size_of::<CellSlot>(),
+            ),
+            (
+                "cells.gates",
+                self.cells.gates.capacity() * size_of::<GateGeom>(),
+            ),
+            ("wires", vv(&self.wires)),
+            ("sigma", self.sigma.capacity() * 8),
+            (
+                "bus",
+                self.bus.as_ref().map_or(0, |b| {
+                    b.ports
+                        .iter()
+                        .map(|p| {
+                            p.terms.capacity() * size_of::<bus::BusTerm>() + p.mult.capacity() * 8
+                        })
+                        .sum()
+                }),
+            ),
+            ("pruned", self.pruned.capacity()),
+            (
+                "public_columns",
+                self.public_columns
+                    .iter()
+                    .map(|c| c.as_ref().map_or(0, |v| v.capacity() * 4))
+                    .sum(),
+            ),
+            ("gkr_slot", self.gkr_slot.capacity() * 8),
+        ]
+    }
+
     /// Build and validate a circuit. `counts` is one gate count per REGISTRY
     /// type in slot order (types with an empty schema still declare theirs —
     /// the counts determine the union's counts); `num_public` is the number of
@@ -1379,6 +1420,12 @@ impl SigmaAssertion {
                 m.row_marginal_naive(&cw[..m.n_cols()]),
                 "the structure table's row marginal"
             );
+            let rw = c.row.materialize();
+            assert_eq!(
+                m.col_marginal(&rw[..m.n_rows()], m.n_cols()),
+                m.col_marginal_naive(&rw[..m.n_rows()]),
+                "the structure table's column marginal"
+            );
         }
         self.claims()
             .iter()
@@ -1520,6 +1567,19 @@ impl CircuitStructureMatrix<'_> {
         }
         out
     }
+
+    /// The column marginal by definition, which
+    /// [`FoldMatrix::col_marginal`] is checked against.
+    #[cfg(test)]
+    fn col_marginal_naive(&self, w: &[F128]) -> Vec<F128> {
+        (0..self.n_cols())
+            .map(|c| {
+                w.iter()
+                    .enumerate()
+                    .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+            })
+            .collect()
+    }
 }
 
 impl FoldMatrix for CircuitStructureMatrix<'_> {
@@ -1568,13 +1628,20 @@ impl FoldMatrix for CircuitStructureMatrix<'_> {
             }
         }
         // The element planes: one constant for every row.
-        let el: F128 = [SigmaAssertion::ELEMENT_A_PLANE, SigmaAssertion::ELEMENT_B_PLANE]
-            .iter()
-            .flat_map(|&p| (0..base).map(move |slot| (p, slot)))
-            .fold(F128::ZERO, |a, (p, slot)| {
-                let wc = plane(p, slot);
-                if wc.is_zero() { a } else { a + wc * self.entry(0, p * base + slot) }
-            });
+        let el: F128 = [
+            SigmaAssertion::ELEMENT_A_PLANE,
+            SigmaAssertion::ELEMENT_B_PLANE,
+        ]
+        .iter()
+        .flat_map(|&p| (0..base).map(move |slot| (p, slot)))
+        .fold(F128::ZERO, |a, (p, slot)| {
+            let wc = plane(p, slot);
+            if wc.is_zero() {
+                a
+            } else {
+                a + wc * self.entry(0, p * base + slot)
+            }
+        });
         let mut out = vec![F128::ZERO; n_rows];
         let (mut rc, mut rf) = (F128::ZERO, F128::ZERO);
         for (r, dst) in out.iter_mut().enumerate() {
@@ -1630,16 +1697,81 @@ impl FoldMatrix for CircuitStructureMatrix<'_> {
         out
     }
 
+    /// `out[c] = Σ_r w[r]·M[r, c]`, plane by plane as in
+    /// [`Self::row_marginal`]: a live cell column is a row prefix, so the id
+    /// and live planes read two prefix sums of `w`; the sigma plane reads
+    /// every live cell (in parallel over slots); the element planes are row
+    /// constants (`Σ w` times the entry); the Boolean pins are row
+    /// prefixes; only the bus and public columns are summed row by row.
     fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        use rayon::prelude::*;
         assert_eq!(w.len(), self.n_rows());
         assert_eq!(n_cols, self.n_cols());
-        (0..n_cols)
-            .map(|c| {
-                w.iter()
-                    .enumerate()
-                    .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+        let n_rows = w.len();
+        let base = self.base_cols();
+        let nu = self.circuit.cells().nu();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - nu);
+        let counts = &self.mask.counts;
+        let fx = |x: usize| F128::new(x as u64, 0);
+        // pw[k] = Σ_{r<k} w[r]; pf[k] = Σ_{r<k} w[r]·F(r).
+        let mut pw = vec![F128::ZERO; n_rows + 1];
+        let mut pf = vec![F128::ZERO; n_rows + 1];
+        for r in 0..n_rows {
+            pw[r + 1] = pw[r] + w[r];
+            pf[r + 1] = pf[r] + w[r] * fx(r);
+        }
+        let mut out = vec![F128::ZERO; n_cols];
+        let sigma = self.circuit.sigma();
+        let sig: Vec<F128> = (0..cell_cols.min(base))
+            .into_par_iter()
+            .map(|slot| {
+                let cnt = counts[slot].min(n_rows);
+                let row0 = slot << nu;
+                (0..cnt).fold(F128::ZERO, |a, r| a + w[r] * fx(sigma[row0 | r] as usize))
             })
-            .collect()
+            .collect();
+        for slot in 0..cell_cols.min(base) {
+            let cnt = counts[slot].min(n_rows);
+            out[SigmaAssertion::MASKED_ID_PLANE * base + slot] = fx(slot << nu) * pw[cnt] + pf[cnt];
+            out[SigmaAssertion::LIVE_PLANE * base + slot] = pw[cnt];
+            out[SigmaAssertion::SIGMA_PLANE * base + slot] = sig[slot];
+        }
+        for p in [
+            SigmaAssertion::ELEMENT_A_PLANE,
+            SigmaAssertion::ELEMENT_B_PLANE,
+        ] {
+            for slot in 0..base {
+                let e = self.entry(0, p * base + slot);
+                if !e.is_zero() {
+                    out[p * base + slot] = e * pw[n_rows];
+                }
+            }
+        }
+        let registry = self.circuit.registry();
+        for slot in 0..registry.num_boolean().min(base) {
+            let ty = &registry.boolean_types()[slot];
+            if ty.const_pin.is_some() {
+                let cnt = self.circuit.counts()[slot].min(n_rows);
+                out[SigmaAssertion::BOOLEAN_PIN_PLANE * base + slot] = pw[cnt];
+            }
+        }
+        for (p, n) in [
+            (SigmaAssertion::BUS_PLANE, self.bus_cols.len()),
+            (SigmaAssertion::PUBLIC_COLUMN_PLANE, self.public_cols.len()),
+        ] {
+            let cols: Vec<F128> = (0..n.min(base))
+                .into_par_iter()
+                .map(|slot| {
+                    w.iter().enumerate().fold(F128::ZERO, |a, (r, &wr)| {
+                        a + wr * self.entry(r, p * base + slot)
+                    })
+                })
+                .collect();
+            for (slot, v) in cols.into_iter().enumerate() {
+                out[p * base + slot] = v;
+            }
+        }
+        out
     }
 
     fn n_rows(&self) -> usize {
@@ -2741,7 +2873,12 @@ mod tests {
 
     /// Table keys, counts `counts`, and the nine requests spread over types 0
     /// and 2 in a shuffled order.
-    fn lookup_buffer(circuit: &Circuit, reg: &Registry, counts: [u64; 4], rng: &mut Rng) -> Vec<F128> {
+    fn lookup_buffer(
+        circuit: &Circuit,
+        reg: &Registry,
+        counts: [u64; 4],
+        rng: &mut Rng,
+    ) -> Vec<F128> {
         let cells = circuit.cells();
         let mut packed = vec![F128::ZERO; 1usize << (reg.m_total() - 7)];
         let keys: Vec<F128> = (0..4).map(|_| rng.f128()).collect();
@@ -2754,7 +2891,9 @@ mod tests {
         }
         // Three rows of type 0, six of type 2, whatever the counts sum to.
         let order = [4usize, 0, 7, 2, 8, 5, 1, 3, 6];
-        let mut at = order.iter().map(|&i| requests.get(i).copied().unwrap_or_default());
+        let mut at = order
+            .iter()
+            .map(|&i| requests.get(i).copied().unwrap_or_default());
         for (words, rows) in [([0usize, 1], 3usize), ([6, 7], 6)] {
             for row in 0..rows {
                 let (k, j) = at.next().unwrap();
@@ -2779,10 +2918,16 @@ mod tests {
         let mut ch = FsChallenger::new(b"circuit-unit");
         let (_, assertion) =
             verify_wiring_deferred(&circuit, &[], &proof, &mut ch).expect("deferred verify");
-        let m = assertion.bus_mult.as_ref().expect("the multiplicity columns travel");
+        let m = assertion
+            .bus_mult
+            .as_ref()
+            .expect("the multiplicity columns travel");
         assert_eq!(m.columns, circuit.bus().unwrap().mult_tag_columns());
         assert_eq!(m.sigma.len(), 2, "one point per count bit");
-        assert!(assertion.check(&circuit), "the multiplicity columns discharge");
+        assert!(
+            assertion.check(&circuit),
+            "the multiplicity columns discharge"
+        );
         for i in 0..m.values.len() {
             let mut bad = assertion.clone();
             bad.bus_mult.as_mut().unwrap().values[i] += F128::ONE;
@@ -2811,23 +2956,44 @@ mod tests {
 
         let mut rng = Rng::new(0xB05_0101);
         let off = lookup_buffer(&circuit, &reg, [3, 0, 2, 3], &mut rng);
-        assert!(roundtrip(&circuit, &off, &[]).is_err(), "a count off by one");
+        assert!(
+            roundtrip(&circuit, &off, &[]).is_err(),
+            "a count off by one"
+        );
 
         // Row 1 (counted 1) takes a high bit of x: the leaf is no power of f.
         let mut bad = packed.clone();
         bad[circuit.cells().gate_word_addr(5, 1)] = F128::new(2, 0);
-        assert!(roundtrip(&circuit, &bad, &[]).is_err(), "a bit that is not 0 or 1");
+        assert!(
+            roundtrip(&circuit, &bad, &[]).is_err(),
+            "a bit that is not 0 or 1"
+        );
 
         let once = lookup_circuit(&reg, Vec::new());
-        assert_ne!(once.digest(), circuit.digest(), "the counts bind the digest");
+        assert_ne!(
+            once.digest(),
+            circuit.digest(),
+            "the counts bind the digest"
+        );
 
         let mut ch = FsChallenger::new(b"circuit-unit");
         let (proof, claims) = prove_wiring(&circuit, &packed, &[], &mut ch);
-        let mult = proof.bus.as_ref().unwrap().mult.as_ref().expect("the counts' sumcheck");
+        let mult = proof
+            .bus
+            .as_ref()
+            .unwrap()
+            .mult
+            .as_ref()
+            .expect("the counts' sumcheck");
         assert_eq!(mult.sums.len(), 2);
         assert_eq!(mult.rounds.len(), nu);
         assert_eq!(mult.bits.len(), 2);
-        let lens = [mult.sums.len(), mult.rounds.len(), mult.bits.len(), mult.words.len()];
+        let lens = [
+            mult.sums.len(),
+            mult.rounds.len(),
+            mult.bits.len(),
+            mult.words.len(),
+        ];
         let tampered = |edit: &dyn Fn(&mut bus::MultProof)| {
             let mut bad = proof.clone();
             edit(bad.bus.as_mut().unwrap().mult.as_mut().unwrap());
@@ -2839,7 +3005,10 @@ mod tests {
         }
         for i in 0..lens[1] {
             for k in 0..3 {
-                assert!(tampered(&|m| m.rounds[i][k] += F128::ONE).is_err(), "round {i}.{k}");
+                assert!(
+                    tampered(&|m| m.rounds[i][k] += F128::ONE).is_err(),
+                    "round {i}.{k}"
+                );
             }
         }
         for i in 0..lens[2] {
@@ -2917,7 +3086,10 @@ mod tests {
         }
         roundtrip(&circuit, &packed, &[]).expect("nothing counted, nothing asked");
         packed[circuit.cells().gate_word_addr(4, 2)] = F128::ONE;
-        assert!(roundtrip(&circuit, &packed, &[]).is_err(), "one row counted");
+        assert!(
+            roundtrip(&circuit, &packed, &[]).is_err(),
+            "one row counted"
+        );
     }
 
     /// A port that sends and receives the same rows balances whatever its

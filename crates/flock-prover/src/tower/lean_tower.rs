@@ -51,6 +51,9 @@ pub struct LeanTowerReport {
     pub root_verify_ms: f64,
     pub discharge_ms: f64,
     pub root_proof_bytes: usize,
+    /// The cone's shared bus balances (Πsend = Πrecv at the root). Only a
+    /// whole cone balances: a probe over some of its leaves does not.
+    pub balanced: bool,
 }
 
 fn proof_bytes(p: &MixedProof) -> usize {
@@ -60,25 +63,18 @@ fn proof_bytes(p: &MixedProof) -> usize {
     }
 }
 
-/// Prove the tower over `pieces` (uniform leaves of one profile, an even
-/// count of at least four) and verify its root: the statement checks and
+/// Prove the tower over `n` leaves built by `piece` (uniform leaves of
+/// one profile, an even count of at least four; each is built twice, for
+/// its word and for its proof) and verify its root: the statement checks and
 /// the discharge. Panics on any failure; returns the timings.
 pub fn prove_lean_tower(
     cfg: TowerConfig,
-    pieces: Vec<Piece>,
+    n: usize,
+    mut piece: impl FnMut(usize) -> Piece,
     env: LeanEnvelope,
 ) -> LeanTowerReport {
-    let words: Vec<[u8; 32]> = pieces.iter().map(leaf_word).collect();
-    let mut held: Vec<Option<Piece>> = pieces.into_iter().map(Some).collect();
-    let p0 = held[0].take().expect("leaf 0");
-    prove_lean_tower_streaming(
-        cfg,
-        &words,
-        p0,
-        |i| held[i].take().expect("each leaf once"),
-        env,
-        |line| eprintln!("{line}"),
-    )
+    let words: Vec<[u8; 32]> = (0..n).map(|i| leaf_word(&piece(i))).collect();
+    prove_lean_tower_streaming(cfg, &words, piece, env, |line| eprintln!("{line}"))
 }
 
 /// A leaf's word in the commitment tree: its publics digest chained with
@@ -88,14 +84,12 @@ pub fn leaf_word(p: &Piece) -> [u8; 32] {
 }
 
 /// [`prove_lean_tower`] holding one leaf pair at a time: `words` are the
-/// leaves' words from a first pass ([`leaf_word`]), `piece0` is leaf 0
-/// (kept to the end: the lane's tables), and `piece(i)` builds leaf `i`,
-/// asked for in DECREASING order from `n - 1` down to 1 (the spine folds
-/// from the tail). `progress` hears a line per proof.
+/// leaves' words from a first pass ([`leaf_word`]) and `piece(i)` builds
+/// leaf `i`: leaf 0 first (its shape keeps the lane's tables), then in
+/// DECREASING order from `n - 1` down to 0 (the spine folds from the tail). `progress` hears a line per proof.
 pub fn prove_lean_tower_streaming(
     cfg: TowerConfig,
     words: &[[u8; 32]],
-    piece0: Piece,
     mut piece: impl FnMut(usize) -> Piece,
     env: LeanEnvelope,
     mut progress: impl FnMut(&str),
@@ -103,6 +97,13 @@ pub fn prove_lean_tower_streaming(
     let n = words.len();
     assert!(n >= 4 && n % 2 == 0, "leaf pairs, at least two of them");
     set_envelope_override(Some((env.nu, env.lanes, env.m)));
+    // Two leaves, a node and their proofs share 15 GB: cap what the
+    // prover's buffer pool keeps between and within proofs.
+    let pool_gb: usize = std::env::var("LEAN_POOL_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    flock_core::scratch::set_byte_budget(Some(pool_gb << 30));
 
     // ---- THE STATEMENT: the commitment root, and its challenges ----
     let root_digest = lean_cone_root(words);
@@ -111,6 +112,7 @@ pub fn prove_lean_tower_streaming(
 
     // ---- LEAF 0, the lane's table owner ----
     let t = Instant::now();
+    let piece0 = piece(0);
     let leaf0 = build_lean_leaf(&piece0, Some(&ch), &0u64.to_le_bytes());
     assert_eq!(
         lean_leaf_word(&leaf0.built.witness.public, &leaf0.commitment.cap),
@@ -118,7 +120,25 @@ pub fn prove_lean_tower_streaming(
         "leaf 0's word from the first pass"
     );
     let mut leaf_prove_ms = t.elapsed().as_secs_f64() * 1e3;
-    let registry = &leaf0.built.shape.registry;
+    progress(&format!("leaf 0: {leaf_prove_ms:.0} ms"));
+    // Leaf 0's shape owns the lane's tables; its witness and proof drop
+    // here, and first-level node 0 proves it again at the end.
+    let shape0 = leaf0.built.shape.clone();
+    let gate0 = piece0
+        .tower_gate()
+        .expect("a leaf in the tower's posture")
+        .clone();
+    let u = leaf0.union();
+    let jp = JaggedParams::from_heights(
+        &u.jagged_heights(),
+        u.n_log(),
+        leaf0.commitment.params.m - LOG_PACKING,
+    );
+    drop(u);
+    drop(leaf0);
+    drop(piece0);
+    progress("leaf 0's shape kept, its proof dropped");
+    let registry = &shape0.registry;
     let family = FlFamily {
         domain: LEAN_DOMAIN,
         mats: registry
@@ -126,7 +146,7 @@ pub fn prove_lean_tower_streaming(
             .iter()
             .map(|ty| (&ty.a_0, &ty.b_0))
             .collect(),
-        circs: piece0.lincheck_circuits(),
+        circs: vec![gate0.r1cs().csc_lincheck_circuit()],
         lane_words: None,
         shared: None,
         env_nu: Some(env.nu),
@@ -137,13 +157,6 @@ pub fn prove_lean_tower_streaming(
         .map(|s| s.element_type().expect("an element slot's table"))
         .collect();
     let el_mats: Vec<ElementMatrices<'_>> = el_types.iter().map(|t| (t.a_0(), t.b_0())).collect();
-    let u = leaf0.union();
-    let jp = JaggedParams::from_heights(
-        &u.jagged_heights(),
-        u.n_log(),
-        leaf0.commitment.params.m - LOG_PACKING,
-    );
-    drop(u);
     let fl_domain: &'static [u8] = b"cas-lean-fl-node-v0";
     let mut fl_prove_ms = 0.0;
     let mut node_prove_ms = 0.0;
@@ -161,21 +174,19 @@ pub fn prove_lean_tower_streaming(
             l
         };
         let l1 = build(2 * j + 1);
-        let a: MixedInner;
-        let l0 = if j == 0 {
-            &leaf0
-        } else {
-            a = build(2 * j);
-            &a
-        };
+        progress(&format!("leaf {}", 2 * j + 1));
+        let l0: MixedInner = if j == 0 { build(0) } else { build(2 * j) };
+        progress(&format!("leaf {}", 2 * j));
         *leaf_prove_ms += t.elapsed().as_secs_f64() * 1e3;
         let f = build_first_level_core(
             cfg,
             fl_domain,
-            &[l0, &l1],
+            &[&l0, &l1],
             &family,
             &FlApp::LeanBus { seed },
         );
+        drop((l0, l1));
+        release_pool();
         progress(&format!(
             "first-level node {j}: prove {:.0} ms",
             f.t.prove_ms
@@ -195,7 +206,7 @@ pub fn prove_lean_tower_streaming(
                 registry,
                 mats: &family.mats,
                 circs: &family.circs,
-                circuit: &leaf0.built.shape.circuit,
+                circuit: &shape0.circuit,
                 params: &jp,
                 priors: $priors,
                 claims_base,
@@ -217,6 +228,7 @@ pub fn prove_lean_tower_streaming(
         Some(lane!(&base_priors)),
         None,
     );
+    release_pool();
     node_prove_ms += base.online.prove_ms;
     progress(&format!("base node: prove {:.0} ms", base.online.prove_ms));
     let (fl0, base, root) = if k == 2 {
@@ -243,6 +255,7 @@ pub fn prove_lean_tower_streaming(
                     forge: false,
                 }),
             );
+            release_pool();
             node_prove_ms += nd.online.prove_ms;
             progress(&format!(
                 "spine node {i}: prove {:.0} ms",
@@ -281,10 +294,10 @@ pub fn prove_lean_tower_streaming(
         seed,
         "the challenges' seed"
     );
-    assert_eq!(p[a + 4], p[a + 5], "the shared bus balances over the cone");
+    let balanced = p[a + 4] == p[a + 5];
     assert_ne!(p[a + 4], F128::ZERO, "a nonzero product");
     let lane_acc = root.lane_acc.as_ref().expect("the lane accumulator");
-    let leaf_circuit = &leaf0.built.shape.circuit;
+    let leaf_circuit = &shape0.circuit;
     assert!(lane_acc.discharge(&family.mats), "the lane's boolean class");
     assert!(
         lane_acc.discharge_element(&el_mats),
@@ -309,6 +322,7 @@ pub fn prove_lean_tower_streaming(
     .expect("the main fold and passenger discharge");
     let discharge_ms = t.elapsed().as_secs_f64() * 1e3;
     set_envelope_override(None);
+    flock_core::scratch::set_byte_budget(None);
     LeanTowerReport {
         leaves: n,
         leaf_prove_ms,
@@ -317,6 +331,7 @@ pub fn prove_lean_tower_streaming(
         root_verify_ms: root.online.verify_ms,
         discharge_ms,
         root_proof_bytes: proof_bytes(&root.lo.proof),
+        balanced,
     }
 }
 
@@ -337,20 +352,14 @@ fn lean_tower_spine() {
     }
     let n: Vec<usize> = per_table.iter().map(|t| t.len()).collect();
     let profile = Profile::even(c.nu, &n, 8);
-    let pieces: Vec<Piece> = profile
-        .deal(&per_table, 8)
-        .iter()
-        .map(|d| {
-            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
-            leaf(&c, &profile, &slots).unwrap()
-        })
-        .collect();
-    for (i, p) in pieces.iter().enumerate() {
-        eprintln!("leaf {i}: {} rows", p.rows());
-    }
+    let deal = profile.deal(&per_table, 8);
     let r = prove_lean_tower(
         super::test_config(),
-        pieces,
+        8,
+        |i| {
+            let slots: Vec<LeafSlot<'_>> = deal[i].iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            leaf(&c, &profile, &slots).unwrap()
+        },
         LeanEnvelope {
             nu: 15,
             lanes: 40,
@@ -358,4 +367,19 @@ fn lean_tower_spine() {
         },
     );
     eprintln!("{r:?}");
+    assert!(r.balanced, "the shared bus balances over the whole cone");
+}
+
+/// Release the prover's scratch pool after a node's proof.
+///
+/// The pool keeps a proof's big buffers for the next proof. Leaves reuse
+/// each other's, and a first-level node reuses its leaves' (cleared before
+/// it, the node's prove grows the pool past 15 GB: every buffer size it
+/// takes once stays pooled). But a node's buffers, kept, sit under the next
+/// two leaves' proves and push them out of memory, so the pool is released
+/// after each node and not after a leaf.
+fn release_pool() {
+    if std::env::var_os("LEAN_KEEP_POOL").is_none() {
+        flock_core::scratch::clear();
+    }
 }

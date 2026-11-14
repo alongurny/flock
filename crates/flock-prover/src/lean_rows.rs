@@ -1326,7 +1326,37 @@ pub struct Report {
     pub proof_bytes: usize,
 }
 
+/// Fixed multiplicity widths per table (see [`set_mult_bits`]).
+static MULT_BITS: std::sync::Mutex<Option<Vec<usize>>> = std::sync::Mutex::new(None);
+
+/// Fix each table's multiplicity bit width, for circuits built after this
+/// call (`None`: each side takes the width its own counts need). Sides of
+/// one cone built with the cone's widths share one leaf circuit.
+pub fn set_mult_bits(bits: Option<Vec<usize>>) {
+    *MULT_BITS.lock().unwrap() = bits;
+}
+
 impl LeanCircuit {
+    /// Per table, the widest multiplicity of its send ports (0: none).
+    pub fn mult_bits(&self) -> Vec<usize> {
+        self.specs
+            .iter()
+            .map(|s| {
+                s.ports
+                    .iter()
+                    .filter(|p| p.send)
+                    .map(|p| p.mult.len())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
+    /// Each table spec, as text, to compare two sides' leaf circuits.
+    pub fn spec_texts(&self) -> Vec<String> {
+        self.specs.iter().map(|s| format!("{s:?}")).collect()
+    }
+
     pub fn build(rows: &Rows) -> Result<LeanCircuit, String> {
         Self::build_with(rows, true)
     }
@@ -1730,8 +1760,22 @@ impl LeanCircuit {
                             .unwrap_or(0)
                     })
                     .collect();
-                let bits = (64 - counts.iter().max().copied().unwrap_or(0).leading_zeros()).max(1)
+                let need = (64 - counts.iter().max().copied().unwrap_or(0).leading_zeros()).max(1)
                     as usize;
+                // A fixed width per table keeps every side's leaf one
+                // circuit (the recursion tower folds one leaf circuit).
+                let bits = match MULT_BITS.lock().unwrap().as_ref() {
+                    Some(w) => {
+                        let b = w.get(s).copied().unwrap_or(need);
+                        if need > b {
+                            return Err(format!(
+                                "table {s} needs {need} multiplicity bits, the fixed width is {b}"
+                            ));
+                        }
+                        b
+                    }
+                    None => need,
+                };
                 let first = specs[s].cols.len();
                 for _ in 0..bits {
                     specs[s].src(Src::Bit);
@@ -2192,6 +2236,21 @@ impl Piece {
     }
 
     /// The lincheck circuits the verifier needs: the boolean slot's.
+    /// The piece's circuit shape.
+    /// Number of input values held.
+    pub fn n_values(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn shape(&self) -> &CircuitShape {
+        &self.shape
+    }
+
+    /// The tower posture's boolean gate (it owns the lincheck circuit).
+    pub fn tower_gate(&self) -> Option<&BooleanGate> {
+        self.tower.as_ref().map(|(_, g)| g)
+    }
+
     pub fn lincheck_circuits(&self) -> Vec<&dyn LincheckCircuit> {
         self.tower
             .iter()

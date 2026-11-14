@@ -120,6 +120,11 @@ pub(super) fn build_lean_leaf(
     assert!(sigma.check(&built.shape.circuit), "sigma discharges");
     drop(union);
     let _: Option<F128> = None;
+    // The proof is made: keep the statement, drop the slot witnesses.
+    let built = flock_core::circuit::builder::BuiltCircuit {
+        shape: built.shape,
+        witness: built.witness.public_only(),
+    };
     MixedInner {
         nu: piece.nu,
         built,

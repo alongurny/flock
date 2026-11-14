@@ -45,6 +45,8 @@ pub(super) const KEY_TRANSPOSE_DOT: usize = 892;
 /// loud, never silent.
 pub(super) struct EnvShape {
     pub(super) nu: usize,
+    /// The passenger block's width ([`ENV_PASS_WORDS`] unless overridden).
+    pub(super) pass_words: usize,
     pub(super) spread_w: usize,
     pub(super) pf_w: usize,
     /// Historical counts* oracle values. Shipped envelope proofs use
@@ -215,6 +217,9 @@ pub(super) const ENV_ACC_MAIN_WORDS: usize = 1152;
 /// ancestors.
 pub(super) const ENV_PASS_WORDS: usize = 96;
 
+/// The passenger width under a Lean envelope override.
+const LEAN_PASS_WORDS: usize = 160;
+
 /// FREE COUNTS ARE UNCONDITIONAL (the count win shipped, 2026-08-09): under
 /// the envelope, children declare their own per-type row counts — the
 /// heights reach a parent only as folded claims on the jagged layout,
@@ -238,7 +243,7 @@ pub(super) fn env_app_base(env: &EnvShape) -> usize {
 }
 
 pub(super) fn env_pass_base(env: &EnvShape) -> usize {
-    env_app_base(env) - ENV_PASS_WORDS
+    env_app_base(env) - env.pass_words
 }
 
 pub(super) fn env_acc_main_base(env: &EnvShape) -> usize {
@@ -302,6 +307,11 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
     if let Some((nu, lanes, _)) = *ENVELOPE_OVERRIDE.lock().unwrap() {
         env.nu = nu;
         env.lanes = lanes;
+        // A Lean leaf's jagged claim is wide (one column coordinate per
+        // committed column bit): its passenger entry alone takes about 65
+        // words, so the sigma and jagged entries together outgrow 96.
+        env.publics += LEAN_PASS_WORDS - env.pass_words;
+        env.pass_words = LEAN_PASS_WORDS;
     }
     env
 }
@@ -375,6 +385,7 @@ fn envelope_shape_default(acc_chain_words: usize) -> EnvShape {
             + ENV_ACC_MAIN_WORDS
             + ENV_PASS_WORDS
             + ENV_APP_WORDS,
+        pass_words: ENV_PASS_WORDS,
         // The committed lane count — the ONE piece of a child's layout that
         // stays circuit structure (the parent hashes `num_lanes`-word
         // leaves), so it is pinned while everything count-shaped rides the
@@ -634,7 +645,7 @@ pub(super) fn pad_envelope_counts(
     // this outer has no content for is zeros, built exactly as the padding
     // is.
     let body =
-        env.publics - env.acc_chain_words - ENV_ACC_MAIN_WORDS - ENV_PASS_WORDS - ENV_APP_WORDS;
+        env.publics - env.acc_chain_words - ENV_ACC_MAIN_WORDS - env.pass_words - ENV_APP_WORDS;
     debug_assert_eq!(body, ENV_BODY_WORDS);
     let live_pub = sb.public_len();
     report.push(format!("publics {live_pub}/{body}"));
@@ -648,7 +659,7 @@ pub(super) fn pad_envelope_counts(
         for (name, w, width) in [
             ("acc_chain", tail.acc_chain, env.acc_chain_words),
             ("acc_main", tail.acc_main, ENV_ACC_MAIN_WORDS),
-            ("pass", tail.pass, ENV_PASS_WORDS),
+            ("pass", tail.pass, env.pass_words),
             ("app", tail.app, ENV_APP_WORDS),
         ] {
             report.push(format!("{name} {}/{width}", w.len()));
