@@ -1068,11 +1068,15 @@ impl<'p> ChildTape<'p> {
         let (yr_len, w_resid) =
             walker_common::parse_residual_rotation(proof, &geo, &levels, &w_coords);
 
+        // The element claims lead the pd list as [(r, ec), (r', z_eval)]:
+        // the z claim is the second by position, never found by value (two
+        // claims can share a value, and the circuit must not depend on it).
         let z_ix = el_assert.as_ref().map(|assertion| {
-            gammas_o
-                .iter()
-                .position(|pd| vals_rec[pd.val_v] == assertion.z_eval)
-                .expect("element z_eval is an absorbed packed-direct value")
+            assert_eq!(
+                vals_rec[gammas_o[1].val_v], assertion.z_eval,
+                "the element z claim is the second packed-direct claim"
+            );
+            1
         });
 
         ChildTape {

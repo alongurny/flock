@@ -272,16 +272,29 @@ pub(super) fn envelope_shape() -> EnvShape {
 /// A tower over another leaf family (Lean) whose verifier needs a larger
 /// envelope: `(nu*, lanes)` in place of leanXMSS's, for every outer that
 /// tower builds. Process-wide: one tower is built at a time.
-static ENVELOPE_OVERRIDE: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+static ENVELOPE_OVERRIDE: std::sync::Mutex<Option<(usize, usize, usize)>> = std::sync::Mutex::new(None);
 
-/// Set (or with `None` clear) the envelope override.
-pub(super) fn set_envelope_override(o: Option<(usize, usize)>) {
+/// Set (or with `None` clear) the envelope override: `(nu*, lanes*, m*)`,
+/// m* the dense floor every outer commits at.
+/// Process-wide: a test that sets it must not run beside other tower
+/// tests (the Lean probes are ignored and run alone). A tower parameter
+/// replaces it once the Lean tower has its own driver.
+pub(super) fn set_envelope_override(o: Option<(usize, usize, usize)>) {
     *ENVELOPE_OVERRIDE.lock().unwrap() = o;
+}
+
+/// The dense floor m* every envelope outer commits at (one m for every
+/// node kind, so a parent's walk of the child's PCS is one shape).
+pub(super) fn envelope_floor_m() -> usize {
+    ENVELOPE_OVERRIDE
+        .lock()
+        .unwrap()
+        .map_or(super::config::ENVELOPE_FLOOR_M, |o| o.2)
 }
 
 pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
     let mut env = envelope_shape_default(acc_chain_words);
-    if let Some((nu, lanes)) = *ENVELOPE_OVERRIDE.lock().unwrap() {
+    if let Some((nu, lanes, _)) = *ENVELOPE_OVERRIDE.lock().unwrap() {
         env.nu = nu;
         env.lanes = lanes;
     }

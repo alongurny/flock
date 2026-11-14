@@ -266,7 +266,7 @@ fn lean_first_level_node() {
         shared: None,
         env_nu: Some(15),
     };
-    crate::tower::envelope::set_envelope_override(Some((15, 40)));
+    crate::tower::envelope::set_envelope_override(Some((15, 40, 30)));
     let t = std::time::Instant::now();
     let core = build_first_level_core(
         test_config(),
@@ -284,6 +284,82 @@ fn lean_first_level_node() {
         t.elapsed(),
         core.t.prove_ms,
         core.t.verify_ms,
+        bytes / 1024
+    );
+    crate::tower::envelope::set_envelope_override(None);
+}
+
+/// Probe: an internal node over two first-level nodes, each over two
+/// Lean leaves of one profile, all four sharing one bus.
+#[test]
+#[ignore] // Heavier — run with `-- --ignored`.
+#[cfg(not(target_arch = "aarch64"))]
+fn lean_internal_node() {
+    use crate::{
+        lean_rows::{LeafSlot, Profile, leaf, shared_challenges},
+        tower::{FlApp, FlFamily, build_first_level_core, build_node_outer_app, test_config},
+    };
+    let small = include_str!("../../tests/data/lean_small.rows");
+    let rows = Rows::merge((0..4000).map(|_| Rows::parse(small).unwrap()).collect());
+    let c = LeanCircuit::build(&rows).unwrap();
+    let mut per_table: Vec<Vec<usize>> = vec![Vec::new(); c.chunks().iter().map(|x| x.0 + 1).max().unwrap()];
+    for (s, ch, _) in c.chunks() {
+        per_table[s].push(ch);
+    }
+    let n: Vec<usize> = per_table.iter().map(|t| t.len()).collect();
+    let profile = Profile::even(c.nu, &n, 4);
+    let leaves: Vec<_> = profile
+        .deal(&per_table, 4)
+        .iter()
+        .map(|d| {
+            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            leaf(&c, &profile, &slots).unwrap()
+        })
+        .collect();
+    let statement: Vec<_> = leaves.iter().map(|p| (p.digest(), p.commit())).collect();
+    let ch = shared_challenges(&statement);
+    let inners: Vec<MixedInner> = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, p)| build_lean_leaf(p, Some(&ch), &(i as u64).to_le_bytes()))
+        .collect();
+    let registry = &inners[0].built.shape.registry;
+    let family = FlFamily {
+        domain: LEAN_DOMAIN,
+        mats: registry.boolean_types().iter().map(|ty| (&ty.a_0, &ty.b_0)).collect(),
+        circs: leaves[0].lincheck_circuits(),
+        lane_words: None,
+        shared: None,
+        env_nu: Some(15),
+    };
+    crate::tower::envelope::set_envelope_override(Some((15, 40, 30)));
+    let fls: Vec<_> = (0..2)
+        .map(|j| {
+            build_first_level_core(
+                test_config(),
+                b"cas-lean-fl-node-v0",
+                &[&inners[2 * j], &inners[2 * j + 1]],
+                &family,
+                &FlApp::Batches { per_leaf: 1 },
+            )
+        })
+        .collect();
+    assert_eq!(
+        fls[0].lo.shape.circuit.digest(),
+        fls[1].lo.shape.circuit.digest(),
+        "one first-level circuit for every pair of Lean leaves"
+    );
+    let t = std::time::Instant::now();
+    let out = build_node_outer_app(test_config(), &[&fls[0].lo, &fls[1].lo], None, None, None);
+    let bytes = match &out.lo.proof {
+        MixedProof::Rs(p) => bincode::serialize(p).unwrap().len(),
+        MixedProof::Ag(p) => bincode::serialize(p).unwrap().len(),
+    };
+    eprintln!(
+        "internal node over two Lean first-level nodes: built in {:?}; prove {:.0} ms, verify {:.1} ms, proof {} KiB",
+        t.elapsed(),
+        out.online.prove_ms,
+        out.online.verify_ms,
         bytes / 1024
     );
     crate::tower::envelope::set_envelope_override(None);

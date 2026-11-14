@@ -118,6 +118,6 @@ pub(super) const ENVELOPE_FLOOR_M: usize = 29;
 /// STATEMENT data, like the counts.
 pub(super) fn outer_union<'r>(registry: &'r Registry, counts: Vec<usize>) -> UnionInstance<'r> {
     let mut u = UnionInstance::new(registry, counts);
-    u.set_dense_floor(ENVELOPE_FLOOR_M);
+    u.set_dense_floor(super::envelope::envelope_floor_m());
     u
 }
