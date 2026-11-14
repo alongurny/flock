@@ -1840,6 +1840,175 @@ impl LeanCircuit {
     }
 }
 
+/// The shape every leaf of a recursive proof shares: the slot capacity
+/// `2^nu` and each slot's table. Leaves of one profile are one circuit (one
+/// digest), which the recursion tower needs; each slot holds one chunk of
+/// its table, or none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Profile {
+    pub nu: usize,
+    pub slots: Vec<usize>,
+}
+
+/// One slot's content: a chunk `c` of table `s` of a built side.
+pub type LeafSlot<'a> = Option<(&'a LeanCircuit, usize)>;
+
+impl Profile {
+    /// A profile for `leaves` leaves over chunk counts per table: table `s`
+    /// takes `ceil(n_s / leaves)` slots in every leaf (tables in order).
+    pub fn even(nu: usize, chunks: &[usize], leaves: usize) -> Profile {
+        let mut slots = Vec::new();
+        for (s, &n) in chunks.iter().enumerate() {
+            slots.extend(std::iter::repeat_n(s, n.div_ceil(leaves.max(1))));
+        }
+        Profile { nu, slots }
+    }
+
+    /// Deal `chunks` (per table, in order: (side, chunk)) to `leaves`
+    /// leaves: leaf `l` takes table `s`'s chunks `[l·k_s, (l+1)·k_s)`.
+    /// Returns per leaf, per slot, the chunk or `None`.
+    pub fn deal<T: Copy>(&self, per_table: &[Vec<T>], leaves: usize) -> Vec<Vec<Option<T>>> {
+        let mut out = vec![Vec::with_capacity(self.slots.len()); leaves];
+        let mut seen = vec![0usize; per_table.len()];
+        for &s in &self.slots {
+            let k = self.slots.iter().filter(|&&x| x == s).count();
+            let i = seen[s];
+            seen[s] += 1;
+            for (l, leaf) in out.iter_mut().enumerate() {
+                leaf.push(per_table[s].get(l * k + i).copied());
+            }
+        }
+        out
+    }
+}
+
+/// A leaf of `profile`: each slot full (`2^nu` rows), padded with rows that
+/// count zero times. Every port is counted (a port without counts gets a
+/// one-bit live column, 1 on a real row, 0 on padding), every row carries
+/// its slot's chunk word (a public input: `chunk·2^32`, so a row's id is
+/// that word plus its row tag, the same ids as [`LeanCircuit::piece`]),
+/// and the verifier's words (`Pub`, range values) are public inputs, not
+/// part of the circuit. Built in the tower's posture.
+pub fn leaf(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> Result<Piece, String> {
+    let nu = profile.nu;
+    if slots.len() != profile.slots.len() {
+        return Err("one entry per profile slot".into());
+    }
+    let mut sb = ShapeBuilder::new(nu);
+    let mut values = Vec::new();
+    let mut out_slots = Vec::new();
+    let gate = crate::leanxmss::gadgets::swap_gate(nu).map_err(|e| format!("{e:?}"))?;
+    let bslot = sb.slot(gate.clone());
+    let w: Vec<Wire> = (0..3)
+        .map(|k| {
+            values.push(F128::ZERO);
+            if k == 0 { sb.public_input() } else { sb.input() }
+        })
+        .collect();
+    sb.gate(bslot, &w);
+    for (k, &s) in profile.slots.iter().enumerate() {
+        let sp = &proto.specs[s];
+        let (rows, chunk_no): (&[Vec<F128>], u64) = match slots[k] {
+            Some((c, ch)) => {
+                if c.nu != nu {
+                    return Err(format!("a side at nu {} in a profile at nu {nu}", c.nu));
+                }
+                let t = &c.tables[s];
+                (
+                    &t[ch << nu..((ch + 1) << nu).min(t.len())],
+                    (c.chunk_base[s] + ch) as u64,
+                )
+            }
+            None => (&[], 0),
+        };
+        // The spec's columns, then the chunk word, then a live bit per port
+        // without counts.
+        let mut cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
+        let word_col = cols.len();
+        cols.push(Col::In);
+        let mut live_col = vec![None; sp.ports.len()];
+        for (pi, p) in sp.ports.iter().enumerate() {
+            if p.mult.is_empty() {
+                live_col[pi] = Some(cols.len());
+                cols.push(Col::In);
+            }
+        }
+        let io = io_index(&cols);
+        let slot = sb.slot(Gate::new(cols.clone()));
+        for (pi, p) in sp.ports.iter().enumerate() {
+            let terms = p
+                .t
+                .iter()
+                .map(|t| match *t {
+                    T::C(c) => BusTerm::word(io[c]),
+                    T::K(v) => BusTerm {
+                        word: None,
+                        constant: v,
+                        row: None,
+                    },
+                    T::Id => BusTerm {
+                        word: Some(io[word_col]),
+                        constant: F128::ZERO,
+                        row: Some(RowTag {
+                            offset: 0,
+                            div: 1,
+                            modulo: 0,
+                        }),
+                    },
+                })
+                .collect();
+            let dir = if p.send {
+                BusDirection::Send
+            } else {
+                BusDirection::Recv
+            };
+            let mult = match live_col[pi] {
+                Some(y) => vec![io[y]],
+                None => p.mult.iter().map(|&c| io[c]).collect(),
+            };
+            sb.bus_port_counted(slot, dir, terms, mult);
+        }
+        values.push(int(chunk_no << 32));
+        let word_w = sb.public_input();
+        let n_live = live_col.iter().flatten().count();
+        let zero_row = vec![F128::ZERO; sp.cols.len()];
+        for j in 0..1usize << nu {
+            let (z, live) = match rows.get(j) {
+                Some(z) => (z, F128::ONE),
+                None => (&zero_row, F128::ZERO),
+            };
+            let mut wires: Vec<Wire> = Vec::new();
+            for (y, c) in sp.cols.iter().enumerate() {
+                if !matches!(c.0, Col::In) {
+                    continue;
+                }
+                values.push(z[y]);
+                wires.push(if matches!(c.1, Some(Src::RangeV(_)) | Some(Src::Pub(_))) {
+                    sb.public_input()
+                } else {
+                    sb.input()
+                });
+            }
+            // The chunk word: every row the same public wire.
+            wires.push(word_w);
+            for _ in 0..n_live {
+                values.push(live);
+                wires.push(sb.input());
+            }
+            sb.gate(slot, &wires);
+        }
+        out_slots.push((slot, sp.name.clone(), 1usize << nu, sp.ports.len(), cols.len()));
+    }
+    let shape = sb.finish().map_err(|e| format!("{e:?}"))?;
+    Ok(Piece {
+        nu,
+        shape,
+        values,
+        slots: out_slots,
+        tower: Some((bslot, gate)),
+    })
+}
+
 /// The bus challenges every piece shares: drawn after every piece's
 /// circuit digest and commitment, in order.
 pub fn shared_challenges(statement: &[([u8; 32], Commitment)]) -> SharedChallenges {
@@ -2032,6 +2201,14 @@ impl Piece {
         }
     }
 
+    /// The public segment: the circuit's fixed words, or (a leaf, whose
+    /// chunk words and verifier words are inputs) the witness run's.
+    pub fn public(&self) -> Vec<F128> {
+        let c = &self.shape.circuit;
+        let fixed: Option<Vec<F128>> = (0..c.num_public()).map(|i| c.fixed_public(i)).collect();
+        fixed.unwrap_or_else(|| self.witness(false).1)
+    }
+
     /// Verifies a piece's proof against its commitment; returns the time
     /// it took. Under shared challenges this does not check the bus's
     /// balance, which holds only over all pieces ([`shared_balance`]).
@@ -2045,10 +2222,7 @@ impl Piece {
         let union = self.union();
         let pcs = Self::pcs(&union);
         let circuit = self.circuit(shared);
-        let c = &self.shape.circuit;
-        let public: Vec<F128> = (0..c.num_public())
-            .map(|i| c.fixed_public(i).expect("every public word is fixed"))
-            .collect();
+        let public = self.public();
         let t = Instant::now();
         let mut ch = self.challenger(label);
         let lcs = self.lincheck_circuits();
@@ -2195,6 +2369,42 @@ mod tests {
         p.verify(None, b"", &pp.commitment, &pp.proof).expect("the tower piece verifies");
         let bad = p.prove(None, b"", true);
         assert!(p.verify(None, b"", &bad.commitment, &bad.proof).is_err());
+    }
+
+    /// Two leaves of one profile: one circuit, the same ids as the pieces,
+    /// and together they verify and balance under shared challenges.
+    #[test]
+    fn leaves_share_one_bus() {
+        let rows = Rows::merge((0..4000).map(|_| Rows::parse(SMALL).unwrap()).collect());
+        let c = LeanCircuit::build(&rows).unwrap();
+        let mut per_table: Vec<Vec<usize>> = vec![Vec::new(); c.tables.len()];
+        for (s, ch, _) in c.chunks() {
+            per_table[s].push(ch);
+        }
+        let n: Vec<usize> = per_table.iter().map(|t| t.len()).collect();
+        let profile = Profile::even(c.nu, &n, 2);
+        let dealt = profile.deal(&per_table, 2);
+        let leaves: Vec<Piece> = dealt
+            .iter()
+            .map(|d| {
+                let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+                leaf(&c, &profile, &slots).unwrap()
+            })
+            .collect();
+        assert_eq!(leaves[0].digest(), leaves[1].digest(), "one circuit for every leaf");
+        let statement: Vec<([u8; 32], Commitment)> =
+            leaves.iter().map(|p| (p.digest(), p.commit())).collect();
+        let ch = shared_challenges(&statement);
+        let mut proofs = Vec::new();
+        for (i, p) in leaves.iter().enumerate() {
+            let label = (i as u64).to_le_bytes();
+            let pp = p.prove(Some(&ch), &label, false);
+            p.verify(Some(&ch), &label, &statement[i].1, &pp.proof).expect("the leaf verifies");
+            proofs.push(pp.proof);
+        }
+        assert!(shared_balance(&proofs), "the leaves balance together");
+        proofs.pop();
+        assert!(!shared_balance(&proofs), "a leaf left out unbalances the bus");
     }
 
     #[test]
