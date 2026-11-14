@@ -16,9 +16,7 @@
 
 use std::{collections::HashMap, fs, path::Path, time::Instant};
 
-use flock_core::{
-    circuit::bus::SharedChallenges, pcs::Commitment, proof::R1csProofCircuitMerged,
-};
+use flock_core::{circuit::bus::SharedChallenges, pcs::Commitment, proof::R1csProofCircuitMerged};
 use flock_prover::lean_rows::{
     Cone, LeanCircuit, Rows, SHARED_BASE, Side, Tuple, same_commitment, shared_balance,
     shared_challenges,
@@ -50,7 +48,12 @@ fn build_batch(k: usize, out: &str) -> (LeanCircuit, HashMap<Tuple, u64>) {
         .unwrap_or_else(|e| panic!("batch {k}: {e}"));
     // What is left is asked of the shared side: terms and declarations.
     let bad: Vec<_> = left.keys().filter(|t| ![1, 3].contains(&tag(t))).collect();
-    assert!(bad.is_empty(), "batch {k} asks for {} tuples no one gives, e.g. {:?}", bad.len(), bad[0]);
+    assert!(
+        bad.is_empty(),
+        "batch {k} asks for {} tuples no one gives, e.g. {:?}",
+        bad.len(),
+        bad[0]
+    );
     (c, left)
 }
 
@@ -62,11 +65,20 @@ fn build_shared(n: usize, out: &str) -> LeanCircuit {
             *outside.entry(t).or_default() += c;
         }
     }
-    let (c, left) = LeanCircuit::build_side(&g, &Rows::default(), Side::Shared, SHARED_BASE, &outside)
-        .unwrap_or_else(|e| panic!("shared side: {e}"));
+    let (c, left) =
+        LeanCircuit::build_side(&g, &Rows::default(), Side::Shared, SHARED_BASE, &outside)
+            .unwrap_or_else(|e| panic!("shared side: {e}"));
     let bad: Vec<_> = left.keys().filter(|t| tag(t) != 6).collect();
-    assert!(bad.is_empty(), "the batches ask for {} tuples the shared side lacks, e.g. {:?}", bad.len(), bad[0]);
-    eprintln!("shared side: {} checked declarations await their goals", left.len());
+    assert!(
+        bad.is_empty(),
+        "the batches ask for {} tuples the shared side lacks, e.g. {:?}",
+        bad.len(),
+        bad[0]
+    );
+    eprintln!(
+        "shared side: {} checked declarations await their goals",
+        left.len()
+    );
     c
 }
 
@@ -90,13 +102,18 @@ fn prove(c: &LeanCircuit, cap: usize, name: &str, out: &str) {
         assert_eq!(p.digest(), st[i].0, "the circuit of the first phase");
         let label = format!("cas-lean-cone {name} {i}").into_bytes();
         let pp = p.prove(Some(&ch), &label, false);
-        assert!(same_commitment(&pp.commitment, &st[i].1), "the commitment of the first phase");
+        assert!(
+            same_commitment(&pp.commitment, &st[i].1),
+            "the commitment of the first phase"
+        );
         let (prove_ms, witness_ms) = (pp.prove_ms, pp.witness_ms);
         let path = format!("{out}/{name}.{i}.proof");
         write(&path, &pp.proof);
         drop(pp);
         let proof: R1csProofCircuitMerged = read(&path);
-        let verify_ms = p.verify(Some(&ch), &label, &st[i].1, &proof).expect("the piece verifies");
+        let verify_ms = p
+            .verify(Some(&ch), &label, &st[i].1, &proof)
+            .expect("the piece verifies");
         println!(
             "{name}.{i}\trows {}\twitness {witness_ms:.0} ms\tprove {prove_ms:.0} ms\tverify {verify_ms:.1} ms\tproof {} KiB",
             p.rows(),
@@ -106,7 +123,9 @@ fn prove(c: &LeanCircuit, cap: usize, name: &str, out: &str) {
 }
 
 fn names(n: usize) -> Vec<String> {
-    std::iter::once("s".to_string()).chain((0..n).map(|k| k.to_string())).collect()
+    std::iter::once("s".to_string())
+        .chain((0..n).map(|k| k.to_string()))
+        .collect()
 }
 
 fn main() {
@@ -132,7 +151,8 @@ fn main() {
                 for f in files {
                     let text = fs::read_to_string(Path::new(dir).join(f)).unwrap();
                     let r = Rows::parse(&text).unwrap_or_else(|e| panic!("{f}: {e}"));
-                    cone.add(r, &mut batch).unwrap_or_else(|e| panic!("{f}: {e}"));
+                    cone.add(r, &mut batch)
+                        .unwrap_or_else(|e| panic!("{f}: {e}"));
                 }
                 let (_, _, nf) = batch.counts();
                 facts += nf;
@@ -162,8 +182,10 @@ fn main() {
         }
         "challenges" => {
             let (cnt, out) = (n(1), &a[2]);
-            let st: Statement =
-                names(cnt).iter().flat_map(|m| read::<Statement>(format!("{out}/{m}.commit"))).collect();
+            let st: Statement = names(cnt)
+                .iter()
+                .flat_map(|m| read::<Statement>(format!("{out}/{m}.commit")))
+                .collect();
             write(format!("{out}/challenges"), &shared_challenges(&st));
             println!("{} pieces, challenges drawn", st.len());
         }
@@ -192,7 +214,11 @@ fn main() {
                 st.extend(s);
             }
             let ch: SharedChallenges = read(format!("{out}/challenges"));
-            assert_eq!(ch, shared_challenges(&st), "challenges drawn from every commitment");
+            assert_eq!(
+                ch,
+                shared_challenges(&st),
+                "challenges drawn from every commitment"
+            );
             let ok = shared_balance(&proofs);
             println!(
                 "{} pieces, {} KiB of proofs, balance {}",

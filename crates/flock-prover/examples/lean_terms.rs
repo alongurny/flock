@@ -8,7 +8,10 @@ fn main() {
     let dir = std::env::args().nth(1).expect("a directory");
     let mut global: HashMap<String, u32> = HashMap::new();
     let (mut terms, mut decls, mut facts, mut files) = (0usize, 0usize, 0usize, 0usize);
-    let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
     paths.sort();
     for p in paths {
         let text = std::fs::read_to_string(&p).unwrap();
@@ -38,5 +41,8 @@ fn main() {
             }
         }
     }
-    println!("{files} files: terms {terms}, shared across files at most {}, decls {decls}, facts {facts}", global.len());
+    println!(
+        "{files} files: terms {terms}, shared across files at most {}, decls {decls}, facts {facts}",
+        global.len()
+    );
 }

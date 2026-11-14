@@ -66,70 +66,99 @@ impl ColumnSchema for IrSchema {
 
     fn columns<V: ColumnVisitor>(&self, v: &mut V) -> IrCols<V::Value> {
         IrCols {
-            i: (0..self.inputs).map(|n| v.word_aligned(&format!("i{n}"), ColumnRole::Input, 128)).collect(),
-            o: (0..self.outputs).map(|n| v.word_aligned(&format!("o{n}"), ColumnRole::Output, 128)).collect(),
-            w: if self.ands > 0 { v.bits("w", ColumnRole::Witness, self.ands, 1) } else { Vec::new() },
+            i: (0..self.inputs)
+                .map(|n| v.word_aligned(&format!("i{n}"), ColumnRole::Input, 128))
+                .collect(),
+            o: (0..self.outputs)
+                .map(|n| v.word_aligned(&format!("o{n}"), ColumnRole::Output, 128))
+                .collect(),
+            w: if self.ands > 0 {
+                v.bits("w", ColumnRole::Witness, self.ands, 1)
+            } else {
+                Vec::new()
+            },
         }
     }
 }
 
 /// The circuit as Flock constraints: one product per AND node, XORs free.
 pub fn lower(c: &Circuit) -> BooleanCircuit {
-    CircuitBuilder::compile(IrSchema { inputs: c.inputs, outputs: c.outputs, ands: c.ands }, |b, cols| {
-        let mut e: Vec<Expr> = Vec::with_capacity(c.nodes.len());
-        let mut w = cols.w.iter();
-        for (n, node) in c.nodes.iter().enumerate() {
-            let x = match *node {
-                Node::Const if n == 0 => b.zero(),
-                Node::Const => b.one().into(),
-                Node::In(j) => cols.i[j as usize / 128][j as usize % 128].into(),
-                Node::Xor(x, y) => b.xor2(e[x.0 as usize], e[y.0 as usize]),
-                Node::And(x, y) => {
-                    let out = *w.next().unwrap();
-                    b.define_and(out, e[x.0 as usize], e[y.0 as usize]);
-                    out.into()
-                }
-            };
-            e.push(x);
-        }
-        for z in &c.zero {
-            if z.0 != 0 {
-                b.assert_zero(e[z.0 as usize]);
+    CircuitBuilder::compile(
+        IrSchema {
+            inputs: c.inputs,
+            outputs: c.outputs,
+            ands: c.ands,
+        },
+        |b, cols| {
+            let mut e: Vec<Expr> = Vec::with_capacity(c.nodes.len());
+            let mut w = cols.w.iter();
+            for (n, node) in c.nodes.iter().enumerate() {
+                let x = match *node {
+                    Node::Const if n == 0 => b.zero(),
+                    Node::Const => b.one().into(),
+                    Node::In(j) => cols.i[j as usize / 128][j as usize % 128].into(),
+                    Node::Xor(x, y) => b.xor2(e[x.0 as usize], e[y.0 as usize]),
+                    Node::And(x, y) => {
+                        let out = *w.next().unwrap();
+                        b.define_and(out, e[x.0 as usize], e[y.0 as usize]);
+                        out.into()
+                    }
+                };
+                e.push(x);
             }
-        }
-        for (j, o) in c.out.iter().enumerate() {
-            b.define_linear(cols.o[j / 128][j % 128], e[o.0 as usize]);
-        }
-    })
+            for z in &c.zero {
+                if z.0 != 0 {
+                    b.assert_zero(e[z.0 as usize]);
+                }
+            }
+            for (j, o) in c.out.iter().enumerate() {
+                b.define_linear(cols.o[j / 128][j % 128], e[o.0 as usize]);
+            }
+        },
+    )
     .circuit()
     .clone()
 }
 
 /// The compression gate and its packer, built once for each table size.
 pub(crate) fn compression(nu: usize) -> (BooleanGate, Arc<CompressPacker>) {
-    static GATES: Mutex<Option<HashMap<usize, (BooleanGate, Arc<CompressPacker>)>>> = Mutex::new(None);
+    static GATES: Mutex<Option<HashMap<usize, (BooleanGate, Arc<CompressPacker>)>>> =
+        Mutex::new(None);
     if let Some(g) = GATES.lock().unwrap().get_or_insert_default().get(&nu) {
         return g.clone();
     }
     let g = compress_gate(nu).unwrap().with_zeroed_linear_words();
     let made = (g.clone(), Arc::new(CompressPacker::new(&g)));
-    GATES.lock().unwrap().get_or_insert_default().insert(nu, made.clone());
+    GATES
+        .lock()
+        .unwrap()
+        .get_or_insert_default()
+        .insert(nu, made.clone());
     made
 }
 
 /// The gate of one kind of row of a type, built once for each table size.
 fn gate(t: &Type, kind: Kind, nu: usize, native: bool) -> (BooleanGate, usize, usize) {
-    gate_of(format!("{}/{kind:?}", t.alias), nu, native, || cas_ir::circuit(t, kind))
+    gate_of(format!("{}/{kind:?}", t.alias), nu, native, || {
+        cas_ir::circuit(t, kind)
+    })
 }
 
 /// The key rows' gate ([`cas_ir::key_circuit`]).
 fn key_gate(bits: usize, nu: usize, native: bool) -> (BooleanGate, usize, usize) {
-    gate_of(format!("key/{bits}"), nu, native, || cas_ir::key_circuit(bits))
+    gate_of(format!("key/{bits}"), nu, native, || {
+        cas_ir::key_circuit(bits)
+    })
 }
 
 /// A row circuit's gate, built once for each name and table size: the gate,
 /// its input words and its AND gates.
-fn gate_of(name: String, nu: usize, native: bool, make: impl FnOnce() -> Circuit) -> (BooleanGate, usize, usize) {
+fn gate_of(
+    name: String,
+    nu: usize,
+    native: bool,
+    make: impl FnOnce() -> Circuit,
+) -> (BooleanGate, usize, usize) {
     type Key = (String, usize, bool);
     static GATES: Mutex<Option<HashMap<Key, (BooleanGate, usize, usize)>>> = Mutex::new(None);
     let key = (name, nu, native);
@@ -139,8 +168,10 @@ fn gate_of(name: String, nu: usize, native: bool, make: impl FnOnce() -> Circuit
     let c = make();
     let ins: Vec<String> = (0..c.inputs).map(|n| format!("i{n}")).collect();
     let outs: Vec<String> = (0..c.outputs).map(|n| format!("o{n}")).collect();
-    let (ins, outs): (Vec<&str>, Vec<&str>) =
-        (ins.iter().map(String::as_str).collect(), outs.iter().map(String::as_str).collect());
+    let (ins, outs): (Vec<&str>, Vec<&str>) = (
+        ins.iter().map(String::as_str).collect(),
+        outs.iter().map(String::as_str).collect(),
+    );
     let mut g = BooleanGate::new(&c.name, &lower(&c), &ins, &outs, nu)
         .unwrap_or_else(|e| panic!("{}: {e:?}", c.name))
         .with_zeroed_linear_words();
@@ -148,18 +179,28 @@ fn gate_of(name: String, nu: usize, native: bool, make: impl FnOnce() -> Circuit
     if native {
         let c = Arc::new(c);
         g = g.with_native(move |i, o| {
-            let words: Vec<u128> = i.iter().map(|w| u128::from(w.lo) | u128::from(w.hi) << 64).collect();
-            let out = c.eval(&words).unwrap_or_else(|| panic!("{}: not valid", c.name));
+            let words: Vec<u128> = i
+                .iter()
+                .map(|w| u128::from(w.lo) | u128::from(w.hi) << 64)
+                .collect();
+            let out = c
+                .eval(&words)
+                .unwrap_or_else(|| panic!("{}: not valid", c.name));
             o.extend(out.iter().map(|&w| F128::new(w as u64, (w >> 64) as u64)));
         });
     }
-    GATES.lock().unwrap().get_or_insert_default().insert(key, (g.clone(), inputs, ands));
+    GATES
+        .lock()
+        .unwrap()
+        .get_or_insert_default()
+        .insert(key, (g.clone(), inputs, ands));
     (g, inputs, ands)
 }
 
 pub(crate) fn words(block: &[u8]) -> [F128; 4] {
     std::array::from_fn(|i| {
-        let w = |o: usize| u64::from_le_bytes(block[16 * i + o..16 * i + o + 8].try_into().unwrap());
+        let w =
+            |o: usize| u64::from_le_bytes(block[16 * i + o..16 * i + o + 8].try_into().unwrap());
         F128::new(w(0), w(8))
     })
 }
@@ -200,7 +241,11 @@ enum Src {
     /// Blob `blob`'s own key.
     Own { blob: usize },
     /// Key `field` of row `row` of blob `blob`'s plan.
-    Held { blob: usize, row: usize, field: usize },
+    Held {
+        blob: usize,
+        row: usize,
+        field: usize,
+    },
 }
 
 /// The key lookup: the count's bits, and each key row's source, whether its
@@ -300,7 +345,15 @@ impl TypedCircuit {
     /// the constraints, which gives a witness (a bad one) for any blob.
     /// The keys the blobs hold are not looked up.
     pub fn new(blobs: &[(&Type, usize)], native: bool) -> Self {
-        let blobs: Vec<Blob<'_>> = blobs.iter().map(|&(t, len)| Blob { t, len, role: Role::New, code: 0 }).collect();
+        let blobs: Vec<Blob<'_>> = blobs
+            .iter()
+            .map(|&(t, len)| Blob {
+                t,
+                len,
+                role: Role::New,
+                code: 0,
+            })
+            .collect();
         Self::build(&blobs, false, native)
     }
 
@@ -317,7 +370,10 @@ impl TypedCircuit {
     fn build(blobs: &[Blob<'_>], lookup: bool, native: bool) -> Self {
         let plans: Vec<Vec<cas_ir::Row>> = blobs
             .iter()
-            .map(|b| cas_ir::plan(b.t, b.len).unwrap_or_else(|| panic!("no {} has {} bytes", b.t.alias, b.len)))
+            .map(|b| {
+                cas_ir::plan(b.t, b.len)
+                    .unwrap_or_else(|| panic!("no {} has {} bytes", b.t.alias, b.len))
+            })
             .collect();
         let lens: Vec<usize> = blobs.iter().map(|b| b.len).collect();
         let compressions: usize = lens.iter().map(|&len| compressions(len.div_ceil(64))).sum();
@@ -325,7 +381,10 @@ impl TypedCircuit {
         let mut tables: Vec<(&Type, Kind, usize)> = Vec::new();
         for (b, plan) in blobs.iter().zip(&plans) {
             for r in plan {
-                match tables.iter_mut().find(|x| x.0.alias == b.t.alias && x.1 == r.kind) {
+                match tables
+                    .iter_mut()
+                    .find(|x| x.0.alias == b.t.alias && x.1 == r.kind)
+                {
                     Some(x) => x.2 += 1,
                     None => tables.push((b.t, r.kind, 1)),
                 }
@@ -349,7 +408,17 @@ impl TypedCircuit {
                         Kind::Rec => b.t.list.as_ref().unwrap().0.keys.len(),
                     };
                     let new = b.role == Role::New;
-                    key_rows.extend((0..fields).map(|field| (Src::Held { blob: i, row, field }, new, !new)));
+                    key_rows.extend((0..fields).map(|field| {
+                        (
+                            Src::Held {
+                                blob: i,
+                                row,
+                                field,
+                            },
+                            new,
+                            !new,
+                        )
+                    }));
                 }
             }
         }
@@ -359,7 +428,15 @@ impl TypedCircuit {
         let (zero, one) = (F128::new(0, 0), F128::new(1, 0));
         let empty = ctl(CHUNK_START | CHUNK_END | ROOT, 0);
         let mut consts = Consts::default();
-        for v in [iv()[0], iv()[1], zero, one, empty, ctl(PARENT, 64), ctl(PARENT | ROOT, 64)] {
+        for v in [
+            iv()[0],
+            iv()[1],
+            zero,
+            one,
+            empty,
+            ctl(PARENT, 64),
+            ctl(PARENT | ROOT, 64),
+        ] {
             consts.add(v);
         }
         for (&len, plan) in lens.iter().zip(&plans) {
@@ -419,8 +496,18 @@ impl TypedCircuit {
             sb.bus_port_counted(s, BusDirection::Send, tuple(), (4..4 + bits).collect());
             (s, inputs)
         });
-        let slot = |alias: &str, kind: Kind| slots[tables.iter().position(|x| x.0.alias == alias && x.1 == kind).unwrap()].0;
-        let wires: Vec<Wire> = consts.values.iter().map(|&v| sb.fixed_public_input(v)).collect();
+        let slot = |alias: &str, kind: Kind| {
+            slots[tables
+                .iter()
+                .position(|x| x.0.alias == alias && x.1 == kind)
+                .unwrap()]
+            .0
+        };
+        let wires: Vec<Wire> = consts
+            .values
+            .iter()
+            .map(|&v| sb.fixed_public_input(v))
+            .collect();
         let wire = |v: F128| wires[consts.index[&(v.lo, v.hi)]];
         let (iv, zero, one) = ([wire(iv()[0]), wire(iv()[1])], wire(zero), wire(one));
         let bit = |b: bool| if b { one } else { zero };
@@ -430,7 +517,12 @@ impl TypedCircuit {
             sb.gate(cs, &[iv[0], iv[1], zero, zero, zero, zero, wire(empty)]);
             padding += 1;
         }
-        let pads = tables.iter().map(|x| x.2).zip(&slots).map(|(c, &s)| (c, s)).chain(keys_slot.map(|s| (key_rows.len(), s)));
+        let pads = tables
+            .iter()
+            .map(|x| x.2)
+            .zip(&slots)
+            .map(|(c, &s)| (c, s))
+            .chain(keys_slot.map(|s| (key_rows.len(), s)));
         for (count, (s, inputs)) in pads {
             let mut row = vec![zero; inputs];
             row[inputs - 1] = one;
@@ -449,7 +541,9 @@ impl TypedCircuit {
             let key = [sb.public_input(), sb.public_input()];
             own.push(key);
             let blocks = len.div_ceil(64);
-            let m: Vec<[Wire; 4]> = (0..blocks).map(|_| std::array::from_fn(|_| sb.input())).collect();
+            let m: Vec<[Wire; 4]> = (0..blocks)
+                .map(|_| std::array::from_fn(|_| sb.input()))
+                .collect();
             // The chaining value of each chunk, then the chunks joined as
             // BLAKE3 joins them: the left side takes the largest power of
             // two below the count.
@@ -463,19 +557,40 @@ impl TypedCircuit {
                 let n = (blocks - 16 * chunk).min(16);
                 for j in 0..n {
                     let b = m[16 * chunk + j];
-                    let out = sb.gate(cs, &[cv[0], cv[1], b[0], b[1], b[2], b[3], wire(block_ctl(len, chunk, j, n))]);
+                    let out = sb.gate(
+                        cs,
+                        &[
+                            cv[0],
+                            cv[1],
+                            b[0],
+                            b[1],
+                            b[2],
+                            b[3],
+                            wire(block_ctl(len, chunk, j, n)),
+                        ],
+                    );
                     cv = [out[0], out[1]];
                 }
                 leaves.push(cv);
             }
-            fn join(sb: &mut ShapeBuilder, cs: SlotId, iv: [Wire; 2], ctl: [Wire; 2], l: &[[Wire; 2]], root: bool) -> [Wire; 2] {
+            fn join(
+                sb: &mut ShapeBuilder,
+                cs: SlotId,
+                iv: [Wire; 2],
+                ctl: [Wire; 2],
+                l: &[[Wire; 2]],
+                root: bool,
+            ) -> [Wire; 2] {
                 if l.len() == 1 {
                     return l[0];
                 }
                 let left = l.len().next_power_of_two() / 2;
                 let a = join(sb, cs, iv, ctl, &l[..left], false);
                 let b = join(sb, cs, iv, ctl, &l[left..], false);
-                let out = sb.gate(cs, &[iv[0], iv[1], a[0], a[1], b[0], b[1], ctl[usize::from(root)]]);
+                let out = sb.gate(
+                    cs,
+                    &[iv[0], iv[1], a[0], a[1], b[0], b[1], ctl[usize::from(root)]],
+                );
                 [out[0], out[1]]
             }
             let parents = [wire(ctl(PARENT, 64)), wire(ctl(PARENT | ROOT, 64))];
@@ -494,20 +609,32 @@ impl TypedCircuit {
             let mut blob_held = Vec::new();
             for r in plan {
                 rows += 1;
-                let mut inputs: Vec<Wire> = m[r.block..r.block + r.blocks].iter().flatten().copied().collect();
+                let mut inputs: Vec<Wire> = m[r.block..r.block + r.blocks]
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect();
                 let s = slot(t.alias, r.kind);
                 // The last word, zero, leaves the row on.
                 blob_held.push(match r.kind {
                     Kind::Head => {
                         inputs.push(zero);
                         let codes = sb.gate(s, &inputs);
-                        codes.iter().enumerate().map(|(i, &c)| (field(r.block, i), c)).collect()
+                        codes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &c)| (field(r.block, i), c))
+                            .collect()
                     }
                     Kind::Rec => {
                         inputs.extend([prev[0], prev[1], bit(r.first), zero]);
                         let codes = sb.gate(s, &inputs);
                         prev = [m[r.block][0], m[r.block][1]];
-                        codes.iter().enumerate().map(|(i, &c)| (field(r.block, i), c)).collect()
+                        codes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &c)| (field(r.block, i), c))
+                            .collect()
                     }
                     Kind::Step => {
                         inputs.extend(&state);
@@ -517,7 +644,12 @@ impl TypedCircuit {
                         vec![(field(r.block, 0), out[STATE])]
                     }
                     Kind::Text => {
-                        inputs.extend([text, wire(word(cas_ir::inside(r.bytes))), bit(r.last), zero]);
+                        inputs.extend([
+                            text,
+                            wire(word(cas_ir::inside(r.bytes))),
+                            bit(r.last),
+                            zero,
+                        ]);
                         text = sb.gate(s, &inputs)[0];
                         Vec::new()
                     }
@@ -530,7 +662,9 @@ impl TypedCircuit {
         if let Some((s, _)) = keys_slot {
             for &(src, must, counts) in &key_rows {
                 let (k, code) = match src {
-                    Src::Own { blob } => (own[blob], wire(F128::new(u64::from(blobs[blob].code), 0))),
+                    Src::Own { blob } => {
+                        (own[blob], wire(F128::new(u64::from(blobs[blob].code), 0)))
+                    }
                     Src::Held { blob, row, field } => held[blob][row][field],
                 };
                 let mut inputs = vec![k[0], k[1], code, bit(must)];
@@ -542,7 +676,11 @@ impl TypedCircuit {
         let shape = sb.finish().expect("well formed");
         let plan = shape.fill_plan();
         let consts = consts.values;
-        let lookup = lookup.then(|| Lookup { bits, rows: key_rows, codes: blobs.iter().map(|b| b.code).collect() });
+        let lookup = lookup.then(|| Lookup {
+            bits,
+            rows: key_rows,
+            codes: blobs.iter().map(|b| b.code).collect(),
+        });
         TypedCircuit {
             lens,
             types: blobs.iter().map(|b| b.t.alias).collect(),
@@ -613,13 +751,17 @@ impl TypedCircuit {
             .map(|&(src, _, _)| asked.remove(&tuple(src)).unwrap_or(0))
             .collect();
         if let Some(((k, c), _)) = asked.iter().next() {
-            panic!("the key {} of code {c} is held but not found", k.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            panic!(
+                "the key {} of code {c} is held but not found",
+                k.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
         }
         counts
     }
 
     pub fn witness(&self, keys: &[[u8; 32]], blobs: &[Vec<u8>]) -> CircuitWitness {
-        self.shape.run_filled_deferred(&self.plan, &self.values(keys, Some(blobs)), &[])
+        self.shape
+            .run_filled_deferred(&self.plan, &self.values(keys, Some(blobs)), &[])
     }
 
     fn union(&self) -> UnionInstance<'_> {
@@ -673,7 +815,12 @@ impl TypedCircuit {
         let mut by_slot: Vec<(usize, &dyn LincheckCircuit)> = self
             .gadgets
             .iter()
-            .map(|(id, g)| (self.shape.registry_slot(*id), g.r1cs().csc_lincheck_circuit() as _))
+            .map(|(id, g)| {
+                (
+                    self.shape.registry_slot(*id),
+                    g.r1cs().csc_lincheck_circuit() as _,
+                )
+            })
             .collect();
         by_slot.sort_by_key(|&(slot, _)| slot);
         let circuits: Vec<&dyn LincheckCircuit> = by_slot.into_iter().map(|(_, c)| c).collect();
@@ -750,8 +897,15 @@ mod tests {
     fn prove_lookup(blobs: &[(&str, Role, u8, Vec<u8>)]) -> Result<(), FlockVerifyError> {
         let types = cas_ir::types();
         let t = |a: &str| types.iter().find(|t| t.alias == a).unwrap();
-        let spec: Vec<Blob<'_>> =
-            blobs.iter().map(|(a, role, code, b)| Blob { t: t(a), len: b.len(), role: *role, code: *code }).collect();
+        let spec: Vec<Blob<'_>> = blobs
+            .iter()
+            .map(|(a, role, code, b)| Blob {
+                t: t(a),
+                len: b.len(),
+                role: *role,
+                code: *code,
+            })
+            .collect();
         let keys: Vec<[u8; 32]> = blobs.iter().map(|b| key(&b.3)).collect();
         let bytes: Vec<Vec<u8>> = blobs.iter().map(|b| b.3.clone()).collect();
         let c = TypedCircuit::with_lookup(&spec, true);

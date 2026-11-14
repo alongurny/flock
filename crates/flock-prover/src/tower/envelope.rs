@@ -191,7 +191,11 @@ pub(super) fn lane_block_words(acc: &Accumulator) -> usize {
     let w = |c: &MatrixClaim| 2 + c.col.point.len() + c.row.point.len();
     acc.per_type.iter().map(|(a, b)| w(a) + w(b)).sum::<usize>()
         + acc.per_linear.iter().map(w).sum::<usize>()
-        + acc.per_element.iter().map(|(a, b)| w(a) + w(b)).sum::<usize>()
+        + acc
+            .per_element
+            .iter()
+            .map(|(a, b)| w(a) + w(b))
+            .sum::<usize>()
         + acc.sigma.iter().map(|(_, c)| w(c)).sum::<usize>()
         + acc.jagged.iter().map(|(_, c)| w(c)).sum::<usize>()
 }
@@ -272,7 +276,8 @@ pub(super) fn envelope_shape() -> EnvShape {
 /// A tower over another leaf family (Lean) whose verifier needs a larger
 /// envelope: `(nu*, lanes)` in place of leanXMSS's, for every outer that
 /// tower builds. Process-wide: one tower is built at a time.
-static ENVELOPE_OVERRIDE: std::sync::Mutex<Option<(usize, usize, usize)>> = std::sync::Mutex::new(None);
+static ENVELOPE_OVERRIDE: std::sync::Mutex<Option<(usize, usize, usize)>> =
+    std::sync::Mutex::new(None);
 
 /// Set (or with `None` clear) the envelope override: `(nu*, lanes*, m*)`,
 /// m* the dense floor every outer commits at.

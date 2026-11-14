@@ -18,7 +18,10 @@ fn main() {
     let a: Vec<String> = std::env::args().filter(|a| a != "--bench").collect();
     let (alias, file) = (&a[1], &a[2]);
     let max: usize = a.get(3).map_or(usize::MAX, |n| n.parse().unwrap());
-    let rows: usize = std::env::var("CAS_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(120_000);
+    let rows: usize = std::env::var("CAS_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120_000);
     let data = std::fs::read(file).unwrap();
     let (mut keys, mut blobs, mut p) = (Vec::new(), Vec::new(), 0);
     while p < data.len() && blobs.len() < max {
@@ -33,7 +36,10 @@ fn main() {
     let types = cas_ir::types();
     let t = types.iter().find(|t| t.alias == alias).expect("a type");
     let longest = blobs.iter().map(Vec::len).max().unwrap_or(0);
-    println!("{alias}: {} blobs, the longest {longest} bytes", blobs.len());
+    println!(
+        "{alias}: {} blobs, the longest {longest} bytes",
+        blobs.len()
+    );
 
     let (mut at, mut batch) = (0, 0);
     let (mut sum_blobs, mut sum_bytes, mut sum_comp, mut sum_rows) = (0, 0, 0, 0);
@@ -61,7 +67,8 @@ fn main() {
             let w = circuit.witness(k, b);
             let proof = circuit.prove(&w);
             let tp = start.elapsed();
-            let size = bincode::serialize(&proof.proof).unwrap().len() + bincode::serialize(&proof.commitment).unwrap().len();
+            let size = bincode::serialize(&proof.proof).unwrap().len()
+                + bincode::serialize(&proof.commitment).unwrap().len();
             let start = Instant::now();
             circuit.verify(k, &proof).expect("verifies");
             let tv = start.elapsed();
@@ -70,13 +77,20 @@ fn main() {
             }
             let mut bad = k.to_vec();
             bad[0][0] ^= 1;
-            assert!(circuit.verify(&bad, &proof).is_err(), "a wrong key must be rejected");
+            assert!(
+                circuit.verify(&bad, &proof).is_err(),
+                "a wrong key must be rejected"
+            );
             println!(
                 "batch {batch}: {n} blobs, {bytes} bytes, {} compressions, {} type rows; setup {ts:?} witness+prove {tp:?} verify {tv:?} proof {size} bytes",
                 circuit.rows.0, circuit.rows.1
             );
-            (sum_blobs, sum_bytes, sum_comp, sum_rows) =
-                (sum_blobs + n, sum_bytes + bytes, sum_comp + circuit.rows.0, sum_rows + circuit.rows.1);
+            (sum_blobs, sum_bytes, sum_comp, sum_rows) = (
+                sum_blobs + n,
+                sum_bytes + bytes,
+                sum_comp + circuit.rows.0,
+                sum_rows + circuit.rows.1,
+            );
             (setup, prove, verify) = (setup + ts, prove + tp, verify + tv);
             break;
         }
@@ -96,7 +110,10 @@ fn main() {
     let n = blobs.len().min(64);
     let (mut keys, mut blobs) = (keys[..n].to_vec(), blobs[..n].to_vec());
     let blocks: Vec<usize> = blobs.iter().map(|b| b.len() / 64).collect();
-    let i = blobs.iter().position(|b| !b.is_empty()).expect("a blob with a block");
+    let i = blobs
+        .iter()
+        .position(|b| !b.is_empty())
+        .expect("a blob with a block");
     let c = cas_ir::circuits(t);
     let end = (0..blobs[i].len())
         .rev()

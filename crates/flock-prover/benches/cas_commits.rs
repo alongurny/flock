@@ -16,11 +16,20 @@ fn main() {
     let data = std::fs::read(&a[1]).unwrap();
     let types = cas_ir::types();
     let ty = |alias: &str| {
-        let alias = if alias == "note" || alias == "author" { "text" } else { alias };
-        types.iter().find(|t| t.alias == alias).unwrap_or_else(|| panic!("no type {alias}"))
+        let alias = if alias == "note" || alias == "author" {
+            "text"
+        } else {
+            alias
+        };
+        types
+            .iter()
+            .find(|t| t.alias == alias)
+            .unwrap_or_else(|| panic!("no type {alias}"))
     };
     let (mut p, mut commit, mut done) = (0, 0, 0);
-    println!("commit,blobs,bytes,compressions,rows,nu,setup_s,prove_s,prove_again_s,verify_s,proof_bytes");
+    println!(
+        "commit,blobs,bytes,compressions,rows,nu,setup_s,prove_s,prove_again_s,verify_s,proof_bytes"
+    );
     while p < data.len() && done < count {
         let n = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
         p += 4;
@@ -53,7 +62,8 @@ fn main() {
             let w = circuit.witness(&keys, &blobs);
             let proof = circuit.prove(&w);
             let tp = start.elapsed();
-            let size = bincode::serialize(&proof.proof).unwrap().len() + bincode::serialize(&proof.commitment).unwrap().len();
+            let size = bincode::serialize(&proof.proof).unwrap().len()
+                + bincode::serialize(&proof.commitment).unwrap().len();
             let start = Instant::now();
             circuit.verify(&keys, &proof).expect("verifies");
             let tv = start.elapsed();

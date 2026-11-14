@@ -80,7 +80,11 @@ pub fn runs_circuit() -> BooleanCircuit {
         // Key differs from the previous key, unless this is the first block.
         let mut acc = one;
         for i in 0..256 {
-            let (k, p) = if i < 128 { (c.m0[i], c.p0[i]) } else { (c.m1[i - 128], c.p1[i - 128]) };
+            let (k, p) = if i < 128 {
+                (c.m0[i], c.p0[i])
+            } else {
+                (c.m1[i - 128], c.p1[i - 128])
+            };
             let diff = b.xor2(k, p);
             let eq = b.xor2(diff, one);
             b.define_and(c.same[i], acc, eq);
@@ -120,7 +124,10 @@ pub fn runs_gate(nu: usize) -> Result<BooleanGate, BooleanGateError> {
     .map(|g| {
         g.with_native(|i, _| {
             let first = i[6].lo & 1 == 1;
-            assert!(first || (i[0], i[1]) != (i[4], i[5]), "cas.runs: repeated key");
+            assert!(
+                first || (i[0], i[1]) != (i[4], i[5]),
+                "cas.runs: repeated key"
+            );
             assert!(i[2].lo != 0, "cas.runs: zero count");
             assert!(i[2].hi == 0 && i[3] == F128::new(0, 0), "cas.runs: padding");
         })
@@ -129,7 +136,8 @@ pub fn runs_gate(nu: usize) -> Result<BooleanGate, BooleanGateError> {
 
 fn words(block: &[u8]) -> [F128; 4] {
     std::array::from_fn(|i| {
-        let w = |o: usize| u64::from_le_bytes(block[16 * i + o..16 * i + o + 8].try_into().unwrap());
+        let w =
+            |o: usize| u64::from_le_bytes(block[16 * i + o..16 * i + o + 8].try_into().unwrap());
         F128::new(w(0), w(8))
     })
 }
@@ -166,13 +174,16 @@ impl RunsCircuit {
         let rg = runs_gate(nu).unwrap().with_zeroed_linear_words();
         let cs = sb.slot(cg.clone());
         let rs = sb.slot(rg.clone());
-        let iv = Self::constants()[..2].iter().map(|&v| sb.fixed_public_input(v)).collect::<Vec<_>>();
-        let consts: Vec<Wire> =
-            Self::constants()[2..].iter().map(|&v| sb.fixed_public_input(v)).collect();
+        let iv = Self::constants()[..2]
+            .iter()
+            .map(|&v| sb.fixed_public_input(v))
+            .collect::<Vec<_>>();
+        let consts: Vec<Wire> = Self::constants()[2..]
+            .iter()
+            .map(|&v| sb.fixed_public_input(v))
+            .collect();
         let (zero, one) = (consts[0], consts[1]);
-        let flag = |j: usize| {
-            consts[2 + usize::from(j == 0) + 2 * usize::from(j == k - 1)]
-        };
+        let flag = |j: usize| consts[2 + usize::from(j == 0) + 2 * usize::from(j == k - 1)];
         for _ in 0..n {
             let island = sb.begin_island();
             let key = [sb.public_input(), sb.public_input()];
@@ -182,7 +193,18 @@ impl RunsCircuit {
                 let m: [Wire; 4] = std::array::from_fn(|_| sb.input());
                 let out = sb.gate(cs, &[cv[0], cv[1], m[0], m[1], m[2], m[3], flag(j)]);
                 cv = [out[0], out[1]];
-                sb.gate(rs, &[m[0], m[1], m[2], m[3], prev[0], prev[1], if j == 0 { one } else { zero }]);
+                sb.gate(
+                    rs,
+                    &[
+                        m[0],
+                        m[1],
+                        m[2],
+                        m[3],
+                        prev[0],
+                        prev[1],
+                        if j == 0 { one } else { zero },
+                    ],
+                );
                 prev = [m[0], m[1]];
             }
             sb.connect(cv[0], key[0]);
@@ -192,7 +214,14 @@ impl RunsCircuit {
         let shape = sb.finish().expect("well formed");
         let plan = shape.fill_plan();
         let packer = CompressPacker::new(&cg);
-        RunsCircuit { n, k, shape, plan, gadgets: vec![(cs, cg), (rs, rg)], packer }
+        RunsCircuit {
+            n,
+            k,
+            shape,
+            plan,
+            gadgets: vec![(cs, cg), (rs, rg)],
+            packer,
+        }
     }
 
     /// IV (2), zero, one, then the control words indexed `first + 2·last`.
@@ -231,7 +260,8 @@ impl RunsCircuit {
     }
 
     pub fn witness(&self, keys: &[[u8; 32]], blobs: &[Vec<u8>]) -> CircuitWitness {
-        self.shape.run_filled_deferred(&self.plan, &self.values(keys, Some(blobs)), &[])
+        self.shape
+            .run_filled_deferred(&self.plan, &self.values(keys, Some(blobs)), &[])
     }
 
     fn union(&self) -> UnionInstance<'_> {
@@ -285,7 +315,12 @@ impl RunsCircuit {
         let mut by_slot: Vec<(usize, &dyn LincheckCircuit)> = self
             .gadgets
             .iter()
-            .map(|(id, g)| (self.shape.registry_slot(*id), g.r1cs().csc_lincheck_circuit() as _))
+            .map(|(id, g)| {
+                (
+                    self.shape.registry_slot(*id),
+                    g.r1cs().csc_lincheck_circuit() as _,
+                )
+            })
             .collect();
         by_slot.sort_by_key(|&(slot, _)| slot);
         let circuits: Vec<&dyn LincheckCircuit> = by_slot.into_iter().map(|(_, c)| c).collect();

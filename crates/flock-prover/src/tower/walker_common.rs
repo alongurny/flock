@@ -245,7 +245,11 @@ pub(super) fn walk_bus_gkr(
         assert_eq!(sh.gamma.len(), width, "one shared γ per coordinate");
         let (v, j) = take_observes(ops, i, 1 + width, vc_at);
         assert_eq!(vals_rec[v], sh.beta, "the shared β on the stream");
-        assert_eq!(&vals_rec[v + 1..v + 1 + width], &sh.gamma[..], "the shared γs on the stream");
+        assert_eq!(
+            &vals_rec[v + 1..v + 1 + width],
+            &sh.gamma[..],
+            "the shared γs on the stream"
+        );
         i = j;
         (Some(v), usize::MAX, usize::MAX, Vec::new())
     } else {
@@ -311,7 +315,12 @@ pub(super) fn walk_bus_gkr(
 
 /// Consume observe ops worth `n` values from `i`; returns the first value
 /// index and the op after them.
-fn take_observes(ops: &[Op], mut i: usize, n: usize, vc_at: &impl Fn(usize) -> (usize, usize)) -> (usize, usize) {
+fn take_observes(
+    ops: &[Op],
+    mut i: usize,
+    n: usize,
+    vc_at: &impl Fn(usize) -> (usize, usize),
+) -> (usize, usize) {
     let (v0, _) = vc_at(i);
     let mut got = 0;
     while got < n {
@@ -363,7 +372,11 @@ pub(super) fn walk_bus_mult(
     let n = m.sums.len();
     let (sums_v, j) = take_observes(ops, i, n, vc_at);
     i = j;
-    assert_eq!(&vals_rec[sums_v..sums_v + n], &m.sums[..], "the sums on the stream");
+    assert_eq!(
+        &vals_rec[sums_v..sums_v + n],
+        &m.sums[..],
+        "the sums on the stream"
+    );
     let (mut lam_fins, mut mu_fins) = (Vec::with_capacity(n), Vec::with_capacity(n));
     let mut lam_ch = usize::MAX;
     for g in 0..2 * n {
@@ -373,7 +386,11 @@ pub(super) fn walk_bus_mult(
             lam_ch = c;
         }
         assert_eq!(c, lam_ch + g, "the batching challenges are adjacent");
-        if g < n { lam_fins.push(f) } else { mu_fins.push(f) }
+        if g < n {
+            lam_fins.push(f)
+        } else {
+            mu_fins.push(f)
+        }
     }
     let mut rounds = Vec::with_capacity(m.rounds.len());
     let mut r = Vec::with_capacity(m.rounds.len());
@@ -386,9 +403,17 @@ pub(super) fn walk_bus_mult(
         r.push(chals[c]);
     }
     let (bits_v, j) = take_observes(ops, i, m.bits.len(), vc_at);
-    assert_eq!(&vals_rec[bits_v..bits_v + m.bits.len()], &m.bits[..], "the bits on the stream");
+    assert_eq!(
+        &vals_rec[bits_v..bits_v + m.bits.len()],
+        &m.bits[..],
+        "the bits on the stream"
+    );
     let (words_v, _) = take_observes(ops, j, m.words.len(), vc_at);
-    assert_eq!(&vals_rec[words_v..words_v + m.words.len()], &m.words[..], "the words on the stream");
+    assert_eq!(
+        &vals_rec[words_v..words_v + m.words.len()],
+        &m.words[..],
+        "the words on the stream"
+    );
     crate::tower::gkr::MultRec {
         sums_v,
         lam_ch,

@@ -30,18 +30,20 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use serde::{Deserialize, Serialize};
 
 use flock_core::{
+    challenger::Challenger,
     challenger::FsChallenger,
     circuit::{
-        boolean::BooleanGate,
-        builder::{CircuitShape, CircuitWitness, GateType, ShapeBuilder, SlotId, SlotWitness, Wire},
         Circuit,
+        boolean::BooleanGate,
+        builder::{
+            CircuitShape, CircuitWitness, GateType, ShapeBuilder, SlotId, SlotWitness, Wire,
+        },
         bus::{self, BusDirection, BusTerm, RowTag, SharedChallenges},
     },
-    challenger::Challenger,
-    pcs::Commitment,
-    proof::R1csProofCircuitMerged,
     element_r1cs::{ElementTableBuilder, ElementTableType},
+    pcs::Commitment,
     pcs::PcsParams,
+    proof::R1csProofCircuitMerged,
     schedule::{IoWord, TableType},
     union::UnionInstance,
     verifier::{FlockVerifyError, verify_ligerito_union_circuit},
@@ -238,8 +240,12 @@ impl Rows {
                     };
                     local.levels.push(row);
                 }
-                Some("S") => local.lists.push((w[2] == "cons").then(|| (n(3).unwrap(), n(4).unwrap()))),
-                Some("C") => local.ctxs.push((w[2] == "push").then(|| (n(3).unwrap(), n(4).unwrap()))),
+                Some("S") => local
+                    .lists
+                    .push((w[2] == "cons").then(|| (n(3).unwrap(), n(4).unwrap()))),
+                Some("C") => local
+                    .ctxs
+                    .push((w[2] == "push").then(|| (n(3).unwrap(), n(4).unwrap()))),
                 Some("G") => {
                     goal_line = Some((
                         (n(1)?, n(2)?),
@@ -338,7 +344,11 @@ impl Rows {
                         ty: if more { Some(n(8)? as usize) } else { None },
                         kind: if more { n(7)? } else { 0 },
                         key: if more { (n(5)?, n(6)?) } else { (0, 0) },
-                        order: if more { w[9].parse().map_err(|e| format!("{e}: {line}"))? } else { 0 },
+                        order: if more {
+                            w[9].parse().map_err(|e| format!("{e}: {line}"))?
+                        } else {
+                            0
+                        },
                         checked: false,
                     });
                 }
@@ -404,7 +414,20 @@ impl Rows {
         // as a row of its own, and every judgement's owner.
         let mut goals = Vec::new();
         if let Some((key, g)) = goal_line {
-            let [kind, levels, ty, value, ti, te, vi_, ve_, _prop, order, _empty] = g[..] else {
+            let [
+                kind,
+                levels,
+                ty,
+                value,
+                ti,
+                te,
+                vi_,
+                ve_,
+                _prop,
+                order,
+                _empty,
+            ] = g[..]
+            else {
                 return Err(format!("a goal row of {} fields", g.len() + 2));
             };
             let decl = match decls.iter().position(|d| d.key == key) {
@@ -436,7 +459,11 @@ impl Rows {
             goals.push(GoalRec {
                 decl,
                 ty: (fact(ti)?, fact(te)?),
-                value: if vi_ >= 0 { Some((fact(vi_)?, fact(ve_)?)) } else { None },
+                value: if vi_ >= 0 {
+                    Some((fact(vi_)?, fact(ve_)?))
+                } else {
+                    None
+                },
             });
         }
         Ok(Rows {
@@ -821,7 +848,10 @@ impl Of {
     /// Whether the table belongs to the shared part of a cone (terms and
     /// declarations) rather than to a batch of judgements.
     fn shared(self) -> bool {
-        matches!(self, Of::Term(_) | Of::DeclChecked | Of::DeclBlock | Of::DeclFree)
+        matches!(
+            self,
+            Of::Term(_) | Of::DeclChecked | Of::DeclBlock | Of::DeclFree
+        )
     }
 }
 
@@ -866,20 +896,40 @@ fn spec(of: Of) -> Spec {
         Of::Goal(with_value) => {
             let mut s = Spec::new(if with_value { "goal" } else { "goal_ax" });
             let own = |p| E::Own(p);
-            let (d, lv, ty) = (s.val(own(Part::X(0))), s.val(own(Part::X(1))), s.val(own(Part::X(3))));
+            let (d, lv, ty) = (
+                s.val(own(Part::X(0))),
+                s.val(own(Part::X(1))),
+                s.val(own(Part::X(3))),
+            );
             let o = s.val(own(Part::R));
             // A premise in the empty context (id 0), owned by this goal.
             let fact = |s: &mut Spec, j: usize, tag: u64, x: [T; 4]| {
                 let id = s.val(E::Prem(j, Part::Id));
                 let r = s.val(E::Prem(j, Part::R));
-                s.recv([k(TAG_FACT), tc(id), k(tag), x[0], x[1], x[2], x[3], tc(r), tc(o)]);
+                s.recv([
+                    k(TAG_FACT),
+                    tc(id),
+                    k(tag),
+                    x[0],
+                    x[1],
+                    x[2],
+                    x[3],
+                    tc(r),
+                    tc(o),
+                ]);
             };
             let sv = s.val(E::Prem(0, Part::X(2)));
             let su = s.val(E::Prem(1, Part::X(2)));
             fact(&mut s, 0, F_INFER, [Z, tc(ty), tc(sv), Z]);
             fact(&mut s, 1, F_EQ, [Z, tc(sv), tc(su), Z]);
             let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
-            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), Some(tc(u)), Some(Z)], None);
+            s.term(
+                su,
+                TR::PFld(1, 2),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), Some(tc(u)), Some(Z)],
+                None,
+            );
             let v = if with_value {
                 let v = s.val(own(Part::X(2)));
                 let t = s.val(E::Prem(2, Part::X(2)));
@@ -984,7 +1034,17 @@ fn fact_spec(rule: &str) -> Spec {
     let fld = |s: &mut Spec, i: usize| s.val(own(Part::X(i)));
     let one = T::K(F128::ONE);
     let send = |s: &mut Spec, tag: u64, x: [T; 4]| {
-        s.send([k(TAG_FACT), T::Id, k(tag), x[0], x[1], x[2], x[3], tc(r), tc(o)])
+        s.send([
+            k(TAG_FACT),
+            T::Id,
+            k(tag),
+            x[0],
+            x[1],
+            x[2],
+            x[3],
+            tc(r),
+            tc(o),
+        ])
     };
     // A citation names an earlier declaration: owner ≥ order + 1.
     let earlier = |s: &mut Spec, ord: usize, tr: TR| {
@@ -1534,7 +1594,9 @@ impl LeanCircuit {
                     TR::Own => own,
                     TR::Fld(x) => b.facts[own].raw[*x] as usize,
                     TR::PFld(j, x) => b.facts[prem_of(of, own, *j)].raw[*x] as usize,
-                    TR::Child(t, c) => g.terms[go(t, own, of, g, b, prem_of)].child[*c].expect("a child"),
+                    TR::Child(t, c) => {
+                        g.terms[go(t, own, of, g, b, prem_of)].child[*c].expect("a child")
+                    }
                 }
             }
             go(tr, own, of, g, b, &prem_of)
@@ -1756,7 +1818,11 @@ impl LeanCircuit {
             let w: Vec<Wire> = (0..3)
                 .map(|k| {
                     values.push(F128::ZERO);
-                    if k == 0 { sb.fixed_public_input(F128::ZERO) } else { sb.input() }
+                    if k == 0 {
+                        sb.fixed_public_input(F128::ZERO)
+                    } else {
+                        sb.input()
+                    }
                 })
                 .collect();
             sb.gate(slot, &w);
@@ -1835,7 +1901,10 @@ impl LeanCircuit {
         let t = Instant::now();
         let piece = self.whole().expect("a valid shape");
         let mut r = piece.prove_and_verify(tamper)?;
-        r.build_ms = self.build_ms + t.elapsed().as_secs_f64() * 1e3 - r.witness_ms - r.prove_ms - r.verify_ms;
+        r.build_ms = self.build_ms + t.elapsed().as_secs_f64() * 1e3
+            - r.witness_ms
+            - r.prove_ms
+            - r.verify_ms;
         Ok(r)
     }
 }
@@ -1889,7 +1958,11 @@ impl Profile {
 /// that word plus its row tag, the same ids as [`LeanCircuit::piece`]),
 /// and the verifier's words (`Pub`, range values) are public inputs, not
 /// part of the circuit. Built in the tower's posture.
-pub fn leaf(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> Result<Piece, String> {
+pub fn leaf(
+    proto: &LeanCircuit,
+    profile: &Profile,
+    slots: &[LeafSlot<'_>],
+) -> Result<Piece, String> {
     let nu = profile.nu;
     if slots.len() != profile.slots.len() {
         return Err("one entry per profile slot".into());
@@ -1902,7 +1975,11 @@ pub fn leaf(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> R
     let w: Vec<Wire> = (0..3)
         .map(|k| {
             values.push(F128::ZERO);
-            if k == 0 { sb.public_input() } else { sb.input() }
+            if k == 0 {
+                sb.public_input()
+            } else {
+                sb.input()
+            }
         })
         .collect();
     sb.gate(bslot, &w);
@@ -1936,27 +2013,26 @@ pub fn leaf(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> R
         let io = io_index(&cols);
         let slot = sb.slot(Gate::new(cols.clone()));
         for (pi, p) in sp.ports.iter().enumerate() {
-            let terms = p
-                .t
-                .iter()
-                .map(|t| match *t {
-                    T::C(c) => BusTerm::word(io[c]),
-                    T::K(v) => BusTerm {
-                        word: None,
-                        constant: v,
-                        row: None,
-                    },
-                    T::Id => BusTerm {
-                        word: Some(io[word_col]),
-                        constant: F128::ZERO,
-                        row: Some(RowTag {
-                            offset: 0,
-                            div: 1,
-                            modulo: 0,
-                        }),
-                    },
-                })
-                .collect();
+            let terms =
+                p.t.iter()
+                    .map(|t| match *t {
+                        T::C(c) => BusTerm::word(io[c]),
+                        T::K(v) => BusTerm {
+                            word: None,
+                            constant: v,
+                            row: None,
+                        },
+                        T::Id => BusTerm {
+                            word: Some(io[word_col]),
+                            constant: F128::ZERO,
+                            row: Some(RowTag {
+                                offset: 0,
+                                div: 1,
+                                modulo: 0,
+                            }),
+                        },
+                    })
+                    .collect();
             let dir = if p.send {
                 BusDirection::Send
             } else {
@@ -1997,7 +2073,13 @@ pub fn leaf(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> R
             }
             sb.gate(slot, &wires);
         }
-        out_slots.push((slot, sp.name.clone(), 1usize << nu, sp.ports.len(), cols.len()));
+        out_slots.push((
+            slot,
+            sp.name.clone(),
+            1usize << nu,
+            sp.ports.len(),
+            cols.len(),
+        ));
     }
     let shape = sb.finish().map_err(|e| format!("{e:?}"))?;
     Ok(Piece {
@@ -2135,7 +2217,10 @@ impl Piece {
 
     /// The shape and its witness, for a recursion leaf.
     pub fn built(&self) -> crate::lean_rows::BuiltParts<'_> {
-        BuiltParts { shape: &self.shape, values: &self.values }
+        BuiltParts {
+            shape: &self.shape,
+            values: &self.values,
+        }
     }
 
     pub fn union_instance(&self) -> UnionInstance<'_> {
@@ -2155,7 +2240,9 @@ impl Piece {
     fn circuit(&self, shared: Option<&SharedChallenges>) -> std::borrow::Cow<'_, Circuit> {
         match shared {
             None => std::borrow::Cow::Borrowed(&self.shape.circuit),
-            Some(s) => std::borrow::Cow::Owned(self.shape.circuit.clone().with_shared_challenges(s.clone())),
+            Some(s) => std::borrow::Cow::Owned(
+                self.shape.circuit.clone().with_shared_challenges(s.clone()),
+            ),
         }
     }
 
@@ -2166,8 +2253,15 @@ impl Piece {
         &self,
         shared: Option<&SharedChallenges>,
         label: &[u8],
-    ) -> (flock_core::circuit::builder::BuiltCircuit, R1csProofCircuitMerged, Commitment) {
-        assert!(self.tower.is_some(), "a tower leaf is a piece in the tower's posture");
+    ) -> (
+        flock_core::circuit::builder::BuiltCircuit,
+        R1csProofCircuitMerged,
+        Commitment,
+    ) {
+        assert!(
+            self.tower.is_some(),
+            "a tower leaf is a piece in the tower's posture"
+        );
         let pp = self.prove(shared, label, false);
         let (_, _, witness) = self.witness(false);
         let mut shape = self.shape.clone();
@@ -2189,7 +2283,12 @@ impl Piece {
 
     /// Proves this piece, with the bus challenges fixed from outside when
     /// `shared` is given. `label` separates the pieces' transcripts.
-    pub fn prove(&self, shared: Option<&SharedChallenges>, label: &[u8], tamper: bool) -> PieceProof {
+    pub fn prove(
+        &self,
+        shared: Option<&SharedChallenges>,
+        label: &[u8],
+        tamper: bool,
+    ) -> PieceProof {
         let t = Instant::now();
         let (z, public, w) = self.witness(tamper);
         let witness_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -2349,8 +2448,13 @@ mod tests {
         for (i, p) in pieces.iter().enumerate() {
             let label = (i as u64).to_le_bytes();
             let pp = p.prove(Some(&ch), &label, false);
-            assert!(same_commitment(&pp.commitment, &statement[i].1), "proving commits as the first phase did");
-            ok &= p.verify(Some(&ch), &label, &statement[i].1, &pp.proof).is_ok();
+            assert!(
+                same_commitment(&pp.commitment, &statement[i].1),
+                "proving commits as the first phase did"
+            );
+            ok &= p
+                .verify(Some(&ch), &label, &statement[i].1, &pp.proof)
+                .is_ok();
             proofs.push(pp.proof);
         }
         if drop_last {
@@ -2368,7 +2472,10 @@ mod tests {
         let (n, ok) = shared(&c, total / 2 + 1, false);
         assert_eq!(n, 2);
         assert!(ok, "the pieces verify and balance together");
-        assert!(!shared(&c, total / 2 + 1, true).1, "a piece left out unbalances the bus");
+        assert!(
+            !shared(&c, total / 2 + 1, true).1,
+            "a piece left out unbalances the bus"
+        );
     }
 
     /// A piece in the recursion tower's posture (a boolean slot, the
@@ -2380,7 +2487,8 @@ mod tests {
         let p = c.piece_with(&c.pieces(usize::MAX)[0], true).unwrap();
         assert!(p.lincheck_circuits().len() == 1);
         let pp = p.prove(None, b"", false);
-        p.verify(None, b"", &pp.commitment, &pp.proof).expect("the tower piece verifies");
+        p.verify(None, b"", &pp.commitment, &pp.proof)
+            .expect("the tower piece verifies");
         let bad = p.prove(None, b"", true);
         assert!(p.verify(None, b"", &bad.commitment, &bad.proof).is_err());
     }
@@ -2405,7 +2513,11 @@ mod tests {
                 leaf(&c, &profile, &slots).unwrap()
             })
             .collect();
-        assert_eq!(leaves[0].digest(), leaves[1].digest(), "one circuit for every leaf");
+        assert_eq!(
+            leaves[0].digest(),
+            leaves[1].digest(),
+            "one circuit for every leaf"
+        );
         let statement: Vec<([u8; 32], Commitment)> =
             leaves.iter().map(|p| (p.digest(), p.commit())).collect();
         let ch = shared_challenges(&statement);
@@ -2413,12 +2525,16 @@ mod tests {
         for (i, p) in leaves.iter().enumerate() {
             let label = (i as u64).to_le_bytes();
             let pp = p.prove(Some(&ch), &label, false);
-            p.verify(Some(&ch), &label, &statement[i].1, &pp.proof).expect("the leaf verifies");
+            p.verify(Some(&ch), &label, &statement[i].1, &pp.proof)
+                .expect("the leaf verifies");
             proofs.push(pp.proof);
         }
         assert!(shared_balance(&proofs), "the leaves balance together");
         proofs.pop();
-        assert!(!shared_balance(&proofs), "a leaf left out unbalances the bus");
+        assert!(
+            !shared_balance(&proofs),
+            "a leaf left out unbalances the bus"
+        );
     }
 
     #[test]
@@ -2495,8 +2611,13 @@ impl Cone {
             let i = match self.decls.get(&d.key) {
                 Some(&i) => {
                     let e = &self.shared.decls[i];
-                    if (e.unfold, e.levels, e.kind, e.order) != (d.unfold, d.levels, d.kind, d.order) {
-                        return Err(format!("declaration {:?} differs between derivations", d.key));
+                    if (e.unfold, e.levels, e.kind, e.order)
+                        != (d.unfold, d.levels, d.kind, d.order)
+                    {
+                        return Err(format!(
+                            "declaration {:?} differs between derivations",
+                            d.key
+                        ));
                     }
                     i
                 }
@@ -2580,7 +2701,9 @@ impl Cone {
                     match theirs {
                         None => *theirs = Some(x),
                         Some(y) if *y == x => {}
-                        Some(_) => return Err(format!("declaration {:?} has two types or values", d.key)),
+                        Some(_) => {
+                            return Err(format!("declaration {:?} has two types or values", d.key));
+                        }
                     }
                 }
             }

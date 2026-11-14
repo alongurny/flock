@@ -37,10 +37,10 @@ use {
 use crate::{
     r1cs_hashes::fs_chain::{FsChainTrace, IV},
     tower::{
-        BusRec, CollapsedSlots, ElPiopRec, MultWires, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind,
+        BusRec, CollapsedSlots, ElPiopRec, EnvShape, F128, F256, FsChallenger, GkrRec, HashKind,
         InnerPd, KEY_HORNER_STEP, KEY_SQUARE_CHAIN, KEY_TRANSPOSE_DOT, LeafEvalGate,
-        LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec, OpenLevel,
-        PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
+        LeafEvalGate256, Lvl, MacGate, MergedChain, MixedInner, MixedProof, MpRec, MultWires,
+        OpenLevel, PdRec, RoundRec, SLOT_WORDS, ShapeBuilder, UnionInstance, Wire, ag_seed_bytes,
         assertion_mac, bytes_payload_mask, cap_payloads, cap_wires, check_residual_publics,
         circuit_structure_claim_wires, cw, declare_envelope_slots, decode_ag_point,
         emit_boolean_reported_check, emit_bus, emit_element_reported_check, emit_fiat_shamir_chain,
@@ -830,11 +830,10 @@ impl<'p> ChildTape<'p> {
                         v.push(cells.gate_claim_point(iota, &m.r));
                     }
                     for (i, iota) in bus.mult_words() {
-                        let sigma: Vec<F128> = m
-                            .r
-                            .iter()
-                            .map(|&x| flock_core::circuit::bus::frob_inv(x, i))
-                            .collect();
+                        let sigma: Vec<F128> =
+                            m.r.iter()
+                                .map(|&x| flock_core::circuit::bus::frob_inv(x, i))
+                                .collect();
                         v.push(cells.gate_claim_point(iota, &sigma));
                     }
                 }
@@ -1816,10 +1815,17 @@ impl<'p> ChildTape<'p> {
                     let prefix = s.layout.region_prefix(nu_i);
                     let mut w = F128::ONE;
                     for (j, &x) in el_assert.r_con[kappa..].iter().enumerate() {
-                        w *= if (prefix >> j) & 1 == 1 { x } else { F128::ONE + x };
+                        w *= if (prefix >> j) & 1 == 1 {
+                            x
+                        } else {
+                            F128::ONE + x
+                        };
                     }
                     let dot = |c: &[F128]| -> F128 {
-                        eq_con.iter().zip(c).fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
+                        eq_con
+                            .iter()
+                            .zip(c)
+                            .fold(F128::ZERO, |acc, (e, v)| acc + *e * *v)
                     };
                     a_sum += w * dot(s.ty.a_const());
                     b_sum += w * dot(s.ty.b_const());

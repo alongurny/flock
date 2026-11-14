@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use crate::{
     cas_typed::{
-        CHUNK_END, CHUNK_START, Consts, PARENT, ROOT, ROWS, TypedProof, block_ctl, compression, iv, key_words, words,
+        CHUNK_END, CHUNK_START, Consts, PARENT, ROOT, ROWS, TypedProof, block_ctl, compression, iv,
+        key_words, words,
     },
     leanxmss::{
         circuit::XmssCircuit,
@@ -80,17 +81,28 @@ impl ChunkCircuit {
     pub fn new(len: usize, opened: &[usize], sides: usize) -> Self {
         let chunks = len.div_ceil(1024).max(1);
         assert!((1..=2).contains(&sides));
-        assert!(!opened.is_empty() && opened.windows(2).all(|w| w[0] < w[1]) && opened.iter().all(|&c| c < chunks));
+        assert!(
+            !opened.is_empty()
+                && opened.windows(2).all(|w| w[0] < w[1])
+                && opened.iter().all(|&c| c < chunks)
+        );
         assert!(len > 0, "the empty blob has no chunk to open");
         let mut ps = Vec::new();
         pieces(0, chunks, opened, &mut ps);
         let blocks_of = |c: usize| (len.div_ceil(64) - 16 * c).min(16);
-        let compressions = sides * opened.iter().map(|&c| blocks_of(c)).sum::<usize>()
-            + sides * (ps.len() - 1);
+        let compressions =
+            sides * opened.iter().map(|&c| blocks_of(c)).sum::<usize>() + sides * (ps.len() - 1);
 
         let mut consts = Consts::default();
         let (zero, empty) = (F128::new(0, 0), ctl(CHUNK_START | CHUNK_END | ROOT, 0));
-        for v in [iv()[0], iv()[1], zero, empty, ctl(PARENT, 64), ctl(PARENT | ROOT, 64)] {
+        for v in [
+            iv()[0],
+            iv()[1],
+            zero,
+            empty,
+            ctl(PARENT, 64),
+            ctl(PARENT | ROOT, 64),
+        ] {
             consts.add(v);
         }
         for &c in opened {
@@ -99,20 +111,30 @@ impl ChunkCircuit {
                 consts.add(block_ctl(len, c, j, n));
             }
         }
-        let nu = compressions.next_multiple_of(ROWS).next_power_of_two().trailing_zeros().max(8) as usize;
+        let nu = compressions
+            .next_multiple_of(ROWS)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(8) as usize;
         let mut sb = ShapeBuilder::new(nu);
         sb.prune_unwired();
         sb.open_public_columns();
         sb.pack_live_slots();
         let (cg, packer) = compression(nu);
         let cs = sb.slot(cg.clone());
-        let wires: Vec<Wire> = consts.values.iter().map(|&v| sb.fixed_public_input(v)).collect();
+        let wires: Vec<Wire> = consts
+            .values
+            .iter()
+            .map(|&v| sb.fixed_public_input(v))
+            .collect();
         let wire = |v: F128| wires[consts.index[&(v.lo, v.hi)]];
         let (ivw, zw) = ([wire(iv()[0]), wire(iv()[1])], wire(zero));
         for _ in compressions..compressions.next_multiple_of(ROWS) {
             sb.gate(cs, &[ivw[0], ivw[1], zw, zw, zw, zw, wire(empty)]);
         }
-        let keys: Vec<[Wire; 2]> = (0..sides).map(|_| [sb.public_input(), sb.public_input()]).collect();
+        let keys: Vec<[Wire; 2]> = (0..sides)
+            .map(|_| [sb.public_input(), sb.public_input()])
+            .collect();
         // Inputs in piece order: a closed subtree's two words, or each
         // side's blocks of an opened chunk.
         let mut leaves: Vec<Vec<[Wire; 2]>> = vec![Vec::new(); sides];
@@ -127,10 +149,23 @@ impl ChunkCircuit {
                 Piece::Open(c) => {
                     let n = blocks_of(c);
                     for l in leaves.iter_mut() {
-                        let m: Vec<[Wire; 4]> = (0..n).map(|_| std::array::from_fn(|_| sb.input())).collect();
+                        let m: Vec<[Wire; 4]> = (0..n)
+                            .map(|_| std::array::from_fn(|_| sb.input()))
+                            .collect();
                         let mut cv = ivw;
                         for (j, b) in m.iter().enumerate() {
-                            let out = sb.gate(cs, &[cv[0], cv[1], b[0], b[1], b[2], b[3], wire(block_ctl(len, c, j, n))]);
+                            let out = sb.gate(
+                                cs,
+                                &[
+                                    cv[0],
+                                    cv[1],
+                                    b[0],
+                                    b[1],
+                                    b[2],
+                                    b[3],
+                                    wire(block_ctl(len, c, j, n)),
+                                ],
+                            );
                             cv = [out[0], out[1]];
                         }
                         l.push(cv);
@@ -142,7 +177,9 @@ impl ChunkCircuit {
         let parents = [wire(ctl(PARENT, 64)), wire(ctl(PARENT | ROOT, 64))];
         for (side, l) in leaves.iter().enumerate() {
             let mut at = 0;
-            let root = join(&mut sb, cs, ivw, parents, 0, chunks, opened, l, &mut at, true);
+            let root = join(
+                &mut sb, cs, ivw, parents, 0, chunks, opened, l, &mut at, true,
+            );
             assert_eq!(at, l.len());
             sb.connect(root[0], keys[side][0]);
             sb.connect(root[1], keys[side][1]);
@@ -174,7 +211,11 @@ impl ChunkCircuit {
                 Piece::Closed(lo, hi) => {
                     let cv = subtree_cv(&blobs[0], lo, hi);
                     if self.sides == 2 {
-                        assert_eq!(cv, subtree_cv(&blobs[1], lo, hi), "the blobs differ outside the opened chunks");
+                        assert_eq!(
+                            cv,
+                            subtree_cv(&blobs[1], lo, hi),
+                            "the blobs differ outside the opened chunks"
+                        );
                     }
                     v.extend(key_words(&cv));
                 }
@@ -197,7 +238,8 @@ impl ChunkCircuit {
     /// prover has.
     pub fn witness(&self, keys: &[[u8; 32]], blobs: &[Vec<u8>]) -> CircuitWitness {
         assert!(blobs.iter().all(|b| b.len() == self.len));
-        self.shape.run_filled_deferred(&self.plan, &self.values(keys, Some(blobs)), &[])
+        self.shape
+            .run_filled_deferred(&self.plan, &self.values(keys, Some(blobs)), &[])
     }
 
     fn union(&self) -> UnionInstance<'_> {
@@ -217,7 +259,10 @@ impl ChunkCircuit {
         let rows = witness.rows::<BooleanGate>(*id);
         assert_eq!(gate.name(), compress::NAME);
         let packer = &*self.packer;
-        let input = UnionSlotProverInput::in_place(move |dst| packer.pack_into(rows, dst), gate.r1cs().csc_lincheck_circuit());
+        let input = UnionSlotProverInput::in_place(
+            move |dst| packer.pack_into(rows, dst),
+            gate.r1cs().csc_lincheck_circuit(),
+        );
         let mut challenger = Self::challenger();
         let (proof, commitment, _) = crate::leanxmss::circuit::prove_circuit(
             &union,
@@ -234,7 +279,8 @@ impl ChunkCircuit {
     pub fn verify(&self, keys: &[[u8; 32]], proof: &TypedProof) -> Result<(), FlockVerifyError> {
         let union = self.union();
         let pcs = XmssCircuit::pcs_params(&union);
-        let circuits: Vec<&dyn LincheckCircuit> = vec![self.gadget.1.r1cs().csc_lincheck_circuit() as _];
+        let circuits: Vec<&dyn LincheckCircuit> =
+            vec![self.gadget.1.r1cs().csc_lincheck_circuit() as _];
         let mut challenger = Self::challenger();
         crate::leanxmss::circuit::verify_circuit(
             &union,
@@ -271,7 +317,18 @@ fn join(
     let left = (hi - lo).next_power_of_two() / 2;
     let a = join(sb, cs, iv, parents, lo, lo + left, opened, l, at, false);
     let b = join(sb, cs, iv, parents, lo + left, hi, opened, l, at, false);
-    let out = sb.gate(cs, &[iv[0], iv[1], a[0], a[1], b[0], b[1], parents[usize::from(root)]]);
+    let out = sb.gate(
+        cs,
+        &[
+            iv[0],
+            iv[1],
+            a[0],
+            a[1],
+            b[0],
+            b[1],
+            parents[usize::from(root)],
+        ],
+    );
     [out[0], out[1]]
 }
 
@@ -291,7 +348,9 @@ mod tests {
     use super::*;
 
     fn blob(len: usize, seed: u8) -> Vec<u8> {
-        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
     }
 
     #[test]
@@ -308,7 +367,10 @@ mod tests {
             c.verify(&[key], &proof).expect("verifies");
             let mut other = key;
             other[0] ^= 1;
-            assert!(c.verify(&[other], &proof).is_err(), "a proof is of its key only");
+            assert!(
+                c.verify(&[other], &proof).is_err(),
+                "a proof is of its key only"
+            );
         }
     }
 
@@ -317,7 +379,8 @@ mod tests {
         let b = blob(700, 3);
         let key = *blake3::hash(&b).as_bytes();
         let c = ChunkCircuit::new(700, &[0], 1);
-        c.verify(&[key], &c.prove(&c.witness(&[key], &[b]))).expect("verifies");
+        c.verify(&[key], &c.prove(&c.witness(&[key], &[b])))
+            .expect("verifies");
     }
 
     #[test]
@@ -327,7 +390,10 @@ mod tests {
         let mut new = old.clone();
         new[5 * 1024 + 17] ^= 0xff;
         new[13 * 1024] ^= 1;
-        let keys = [*blake3::hash(&old).as_bytes(), *blake3::hash(&new).as_bytes()];
+        let keys = [
+            *blake3::hash(&old).as_bytes(),
+            *blake3::hash(&new).as_bytes(),
+        ];
         let c = ChunkCircuit::new(len, &[5, 13], 2);
         let proof = c.prove(&c.witness(&keys, &[old.clone(), new.clone()]));
         c.verify(&keys, &proof).expect("verifies");
@@ -345,7 +411,10 @@ mod tests {
         let old = blob(len, 7);
         let mut new = old.clone();
         new[3000] ^= 1;
-        let keys = [*blake3::hash(&old).as_bytes(), *blake3::hash(&new).as_bytes()];
+        let keys = [
+            *blake3::hash(&old).as_bytes(),
+            *blake3::hash(&new).as_bytes(),
+        ];
         let c = ChunkCircuit::new(len, &[0], 2);
         c.witness(&keys, &[old, new]);
     }

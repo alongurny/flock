@@ -13,9 +13,9 @@ use aggregate::{
 use bincode::serialize;
 use flock_core::{
     aggregate,
+    aggregate::ElementMatrices,
     aggregate::{Accumulator, Dropped, TypeMatrices},
     circuit::{Circuit, WiringError},
-    aggregate::ElementMatrices,
     element_r1cs::union::ElementAssertion,
     lincheck::{LincheckCircuit, SkipPoint},
     matrix_fold::{FoldProof, JaggedAssertion, JaggedClaim},
@@ -783,8 +783,18 @@ pub fn build_node_outer_app(
         // The element folds follow the linear ones (the aggregate's order).
         let n_el_l = lagg.el_folds.len();
         for (t, (fa, fb)) in lagg.el_folds.iter().enumerate() {
-            lclaims.push(ln.priors.iter().map(|p| p.per_element[t].0.clone()).collect());
-            lclaims.push(ln.priors.iter().map(|p| p.per_element[t].1.clone()).collect());
+            lclaims.push(
+                ln.priors
+                    .iter()
+                    .map(|p| p.per_element[t].0.clone())
+                    .collect(),
+            );
+            lclaims.push(
+                ln.priors
+                    .iter()
+                    .map(|p| p.per_element[t].1.clone())
+                    .collect(),
+            );
             lproofs.push(fa);
             lproofs.push(fb);
         }
@@ -908,9 +918,9 @@ pub fn build_node_outer_app(
         assert_chain_replays(&ops, &trace, chals);
 
         let env = match lane.as_ref().map(|l| l.family) {
-            Some(LaneFamily::Batches { block_words, .. } | LaneFamily::Lean { block_words, .. }) => {
-                envelope_shape_with_lane(block_words)
-            }
+            Some(
+                LaneFamily::Batches { block_words, .. } | LaneFamily::Lean { block_words, .. },
+            ) => envelope_shape_with_lane(block_words),
             _ => envelope_shape(),
         };
         let split_b3 = n_kids == 2;
@@ -1810,7 +1820,15 @@ pub fn build_node_outer_app(
                 let (l, r) = (&regions[0].child_pub_w, &regions[1].child_pub_w);
                 let d = sb.gate(
                     cs.q.b3,
-                    &[iv2[0], iv2[1], l[off], l[off + 1], r[off], r[off + 1], params],
+                    &[
+                        iv2[0],
+                        iv2[1],
+                        l[off],
+                        l[off + 1],
+                        r[off],
+                        r[off + 1],
+                        params,
+                    ],
                 );
                 sb.connect(l[off + 2], r[off + 2]);
                 sb.connect(l[off + 3], r[off + 3]);
@@ -2564,13 +2582,15 @@ pub fn build_node_outer_app(
                             .map(|g| (lrebuilt[2 * g].clone(), lrebuilt[2 * g + 1].clone()))
                             .collect(),
                         per_element: (0..n_el_l)
-                            .map(|t| (lrebuilt[e0 + 2 * t].clone(), lrebuilt[e0 + 2 * t + 1].clone()))
+                            .map(|t| {
+                                (
+                                    lrebuilt[e0 + 2 * t].clone(),
+                                    lrebuilt[e0 + 2 * t + 1].clone(),
+                                )
+                            })
                             .collect(),
                         per_linear: lrebuilt[2 * n_groups..e0].to_vec(),
-                        sigma: vec![(
-                            lane_ref.circuit.digest(),
-                            lrebuilt[e0 + 2 * n_el_l].clone(),
-                        )],
+                        sigma: vec![(lane_ref.circuit.digest(), lrebuilt[e0 + 2 * n_el_l].clone())],
                         jagged: vec![(lane_ref.circuit.digest(), ljrebuilt[0].clone())],
                     };
                     assert_eq!(

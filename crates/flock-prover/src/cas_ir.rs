@@ -46,7 +46,11 @@ fn node(and: bool, a: B, b: B) -> B {
             return *n;
         }
         let n = B(ir.nodes.len() as u32);
-        ir.nodes.push(if and { Node::And(a, b) } else { Node::Xor(a, b) });
+        ir.nodes.push(if and {
+            Node::And(a, b)
+        } else {
+            Node::Xor(a, b)
+        });
         ir.memo.insert((and, a, b), n);
         n
     })
@@ -87,14 +91,30 @@ fn any(v: &[B]) -> B {
     v.iter().fold(F, |a, &b| a.or(b))
 }
 fn eq_const(x: &[B], c: u8) -> B {
-    all(&(0..8).map(|i| if c >> (7 - i) & 1 == 1 { x[i] } else { x[i].not() }).collect::<Vec<_>>())
+    all(&(0..8)
+        .map(|i| {
+            if c >> (7 - i) & 1 == 1 {
+                x[i]
+            } else {
+                x[i].not()
+            }
+        })
+        .collect::<Vec<_>>())
 }
 /// One-hot of the number `x` holds, most significant bit first.
 fn decode(x: &[B]) -> Vec<B> {
     let n = x.len();
     (0..1usize << n)
         .map(|v| {
-            all(&(0..n).map(|i| if v >> (n - 1 - i) & 1 == 1 { x[i] } else { x[i].not() }).collect::<Vec<_>>())
+            all(&(0..n)
+                .map(|i| {
+                    if v >> (n - 1 - i) & 1 == 1 {
+                        x[i]
+                    } else {
+                        x[i].not()
+                    }
+                })
+                .collect::<Vec<_>>())
         })
         .collect()
 }
@@ -163,7 +183,13 @@ fn tag_bad(t: &[B], n: u8) -> B {
 fn key_code(k: &KeyF, tag: Option<&[B]>) -> Vec<B> {
     (0..8)
         .map(|b| match tag {
-            None => if k.targets[0] >> b & 1 == 1 { T } else { F },
+            None => {
+                if k.targets[0] >> b & 1 == 1 {
+                    T
+                } else {
+                    F
+                }
+            }
             Some(t) => k
                 .targets
                 .iter()
@@ -241,7 +267,17 @@ pub fn text_grammar() -> Grammar {
     // States: 0 start, 1 one more, 2 two more, 3 after E0, 4 after ED,
     // 5 after F0, 6 three more, 7 after F4, 8 after C2.
     let mut d = vec![vec![None; 12]; 9];
-    for (class, to) in [(0, 0), (4, 1), (5, 3), (6, 2), (7, 4), (8, 5), (9, 6), (10, 7), (11, 8)] {
+    for (class, to) in [
+        (0, 0),
+        (4, 1),
+        (5, 3),
+        (6, 2),
+        (7, 4),
+        (8, 5),
+        (9, 6),
+        (10, 7),
+        (11, 8),
+    ] {
         d[0][class] = Some(to);
     }
     for c in 1..=3 {
@@ -258,7 +294,11 @@ pub fn text_grammar() -> Grammar {
     d[8][3] = Some(0);
     let mut accept = vec![false; 9];
     accept[0] = true;
-    Grammar { classes, delta: d, accept }
+    Grammar {
+        classes,
+        delta: d,
+        accept,
+    }
 }
 
 /// `prose`: UTF-8 with no control character but the line feed.
@@ -339,7 +379,11 @@ pub fn semver_grammar() -> Grammar {
     for s in [7, 8, 10, 12, 13, 15] {
         accept[s] = true;
     }
-    Grammar { classes, delta: d, accept }
+    Grammar {
+        classes,
+        delta: d,
+        accept,
+    }
 }
 
 impl Grammar {
@@ -347,7 +391,11 @@ impl Grammar {
     pub fn accepts(&self, b: &[u8]) -> bool {
         let mut s = 0;
         for &x in b {
-            let Some(c) = self.classes.iter().position(|rs| rs.iter().any(|&(lo, hi)| (lo..=hi).contains(&x))) else {
+            let Some(c) = self
+                .classes
+                .iter()
+                .position(|rs| rs.iter().any(|&(lo, hi)| (lo..=hi).contains(&x)))
+            else {
                 return false;
             };
             match self.delta[s][c] {
@@ -376,7 +424,11 @@ fn in_range(x: &[B], lo: u8, hi: u8) -> B {
         return eq_const(x, lo);
     }
     let above = ge_const(x, lo);
-    if hi == 255 { above } else { above.and(ge_const(x, hi + 1).not()) }
+    if hi == 255 {
+        above
+    } else {
+        above.and(ge_const(x, hi + 1).not())
+    }
 }
 
 /// The row for one 64-byte block of a text. Inputs: the block's four
@@ -395,12 +447,17 @@ pub fn text_circuit(t: &Type) -> Circuit {
         let mut bad = F;
         for i in 0..64 {
             let (x, inside) = (&blk[8 * i..8 * i + 8], inp[5 * 128 + i]);
-            let cl: Vec<B> =
-                g.classes.iter().map(|rs| rs.iter().fold(F, |a, &(lo, hi)| a.xor(in_range(x, lo, hi)))).collect();
+            let cl: Vec<B> = g
+                .classes
+                .iter()
+                .map(|rs| rs.iter().fold(F, |a, &(lo, hi)| a.xor(in_range(x, lo, hi))))
+                .collect();
             let mut next = vec![F; n];
             for s in 0..n {
                 for (to, next) in next.iter_mut().enumerate() {
-                    let on = (0..cl.len()).filter(|&c| g.delta[s][c] == Some(to)).fold(F, |a, c| a.xor(cl[c]));
+                    let on = (0..cl.len())
+                        .filter(|&c| g.delta[s][c] == Some(to))
+                        .fold(F, |a, c| a.xor(cl[c]));
                     *next = next.xor(st[s].and(on));
                 }
             }
@@ -416,7 +473,12 @@ pub fn text_circuit(t: &Type) -> Circuit {
 
 impl Rec {
     fn tags(&self) -> Vec<u8> {
-        self.keys.iter().filter(|k| k.union > 0).map(|k| k.union).chain(self.choices.iter().copied()).collect()
+        self.keys
+            .iter()
+            .filter(|k| k.union > 0)
+            .map(|k| k.union)
+            .chain(self.choices.iter().copied())
+            .collect()
     }
     /// The blocks of a record with no name.
     pub fn blocks(&self) -> usize {
@@ -426,8 +488,16 @@ impl Rec {
 }
 
 fn key(optional: bool, targets: &'static [u8]) -> KeyF {
-    let union = if targets.len() > 1 { targets.len() as u8 } else { 0 };
-    KeyF { optional, union, targets }
+    let union = if targets.len() > 1 {
+        targets.len() as u8
+    } else {
+        0
+    };
+    KeyF {
+        optional,
+        union,
+        targets,
+    }
 }
 
 /// The codes of the types a key may name (the manifest's tag bytes).
@@ -444,7 +514,12 @@ pub mod code {
     pub const NONE: u8 = 0;
 }
 fn rec(keys: Vec<KeyF>, choices: Vec<u8>, ints: Vec<bool>, name: bool) -> Rec {
-    Rec { keys, choices, ints, name }
+    Rec {
+        keys,
+        choices,
+        ints,
+        name,
+    }
 }
 
 /// The formats of cas `version/src/typed.rs`, in the same words.
@@ -456,52 +531,114 @@ pub fn types() -> Vec<Type> {
             alias: "directory",
             head: None,
             // raw | symlink | directory | exec
-            list: Some((rec(vec![key(false, &[NONE, NONE, DIRECTORY, NONE])], vec![], vec![], true), Order::Sorted)),
+            list: Some((
+                rec(
+                    vec![key(false, &[NONE, NONE, DIRECTORY, NONE])],
+                    vec![],
+                    vec![],
+                    true,
+                ),
+                Order::Sorted,
+            )),
             nonempty: false,
             text: None,
         },
         Type {
             alias: "commit",
             head: Some(rec(
-                vec![one(false, &[DIRECTORY]), one(false, &[AUTHOR]), one(true, &[ANNOTATION])],
+                vec![
+                    one(false, &[DIRECTORY]),
+                    one(false, &[AUTHOR]),
+                    one(true, &[ANNOTATION]),
+                ],
                 vec![],
                 vec![false],
                 false,
             )),
             // A parent commit has a proof of its own.
-            list: Some((rec(vec![one(false, &[NONE]), one(true, &[ANNOTATION])], vec![], vec![], false), Order::Sorted)),
+            list: Some((
+                rec(
+                    vec![one(false, &[NONE]), one(true, &[ANNOTATION])],
+                    vec![],
+                    vec![],
+                    false,
+                ),
+                Order::Sorted,
+            )),
             nonempty: false,
             text: None,
         },
         Type {
             alias: "annotation",
             head: Some(rec(vec![one(true, &[NOTE])], vec![], vec![], false)),
-            list: Some((rec(vec![key(false, &[ANNOTATION, LINES])], vec![], vec![], true), Order::Sorted)),
+            list: Some((
+                rec(vec![key(false, &[ANNOTATION, LINES])], vec![], vec![], true),
+                Order::Sorted,
+            )),
             nonempty: false,
             text: None,
         },
         Type {
             alias: "lines",
-            head: Some(rec(vec![one(true, &[NOTE]), one(true, &[RUNS]), one(true, &[RUNS])], vec![], vec![], false)),
+            head: Some(rec(
+                vec![one(true, &[NOTE]), one(true, &[RUNS]), one(true, &[RUNS])],
+                vec![],
+                vec![],
+                false,
+            )),
             list: None,
             nonempty: false,
             text: None,
         },
-        Type { alias: "text", head: None, list: None, nonempty: false, text: Some(text_grammar()) },
-        Type { alias: "prose", head: None, list: None, nonempty: false, text: Some(prose_grammar()) },
-        Type { alias: "tag", head: None, list: None, nonempty: false, text: Some(semver_grammar()) },
+        Type {
+            alias: "text",
+            head: None,
+            list: None,
+            nonempty: false,
+            text: Some(text_grammar()),
+        },
+        Type {
+            alias: "prose",
+            head: None,
+            list: None,
+            nonempty: false,
+            text: Some(prose_grammar()),
+        },
+        Type {
+            alias: "tag",
+            head: None,
+            list: None,
+            nonempty: false,
+            text: Some(semver_grammar()),
+        },
         Type {
             alias: "runs",
             head: None,
-            list: Some((rec(vec![one(true, &[NOTE])], vec![], vec![true], false), Order::Runs)),
+            list: Some((
+                rec(vec![one(true, &[NOTE])], vec![], vec![true], false),
+                Order::Runs,
+            )),
             nonempty: true,
             text: None,
         },
         Type {
             alias: "release",
-            head: Some(rec(vec![one(false, &[DIRECTORY]), one(false, &[TAG])], vec![], vec![], false)),
+            head: Some(rec(
+                vec![one(false, &[DIRECTORY]), one(false, &[TAG])],
+                vec![],
+                vec![],
+                false,
+            )),
             // A release it follows has a proof of its own.
-            list: Some((rec(vec![one(false, &[NONE]), one(false, &[PROSE])], vec![4], vec![], false), Order::Sorted)),
+            list: Some((
+                rec(
+                    vec![one(false, &[NONE]), one(false, &[PROSE])],
+                    vec![4],
+                    vec![],
+                    false,
+                ),
+                Order::Sorted,
+            )),
             nonempty: false,
             text: None,
         },
@@ -525,12 +662,18 @@ pub struct Circuit {
     pub ands: usize,
 }
 
-fn build(name: String, inputs: usize, outputs: usize, f: impl FnOnce(&[B]) -> (Vec<B>, Vec<B>)) -> Circuit {
+fn build(
+    name: String,
+    inputs: usize,
+    outputs: usize,
+    f: impl FnOnce(&[B]) -> (Vec<B>, Vec<B>),
+) -> Circuit {
     IR.with(|ir| {
         let mut ir = ir.borrow_mut();
         ir.memo.clear();
         ir.nodes = vec![Node::Const, Node::Const];
-        ir.nodes.extend((0..(inputs as u32 + 1) * 128).map(Node::In));
+        ir.nodes
+            .extend((0..(inputs as u32 + 1) * 128).map(Node::In));
     });
     let inp: Vec<B> = (0..(inputs as u32 + 1) * 128).map(|i| B(i + 2)).collect();
     let (zero, mut out) = f(&inp[..inputs * 128]);
@@ -541,7 +684,15 @@ fn build(name: String, inputs: usize, outputs: usize, f: impl FnOnce(&[B]) -> (V
     out.resize(outputs * 128, F);
     let nodes = IR.with(|ir| std::mem::take(&mut ir.borrow_mut().nodes));
     let ands = nodes.iter().filter(|n| matches!(n, Node::And(..))).count();
-    Circuit { name, inputs, outputs, nodes, zero, out, ands }
+    Circuit {
+        name,
+        inputs,
+        outputs,
+        nodes,
+        zero,
+        out,
+        ands,
+    }
 }
 
 impl Circuit {
@@ -573,7 +724,9 @@ impl Circuit {
 /// The bits of `n` bytes starting at input word `word`, each byte's most
 /// significant bit first. A word holds 16 bytes, the first in its low bits.
 fn bytes(inp: &[B], word: usize, n: usize) -> Vec<B> {
-    (0..n).flat_map(|p| (0..8).map(move |i| inp[(word + p / 16) * 128 + 8 * (p % 16) + (7 - i)])).collect()
+    (0..n)
+        .flat_map(|p| (0..8).map(move |i| inp[(word + p / 16) * 128 + 8 * (p % 16) + (7 - i)]))
+        .collect()
 }
 
 /// A record with no name is wrong.
@@ -612,28 +765,33 @@ pub fn rec_circuit(t: &Type, head: bool) -> Circuit {
     let s = r.blocks();
     let inputs = 4 * s + if head { 0 } else { 3 };
     let outputs = r.keys.len();
-    build(format!("cas.{}.{}", t.alias, if head { "head" } else { "rec" }), inputs, outputs, |inp| {
-        let x = bytes(inp, 0, 64 * s);
-        let mut codes = Vec::new();
-        let mut tag = 256 * r.keys.len();
-        for k in &r.keys {
-            let mut c = key_code(k, (k.union > 0).then(|| &x[tag..tag + 8]));
-            if k.union > 0 {
-                tag += 8;
+    build(
+        format!("cas.{}.{}", t.alias, if head { "head" } else { "rec" }),
+        inputs,
+        outputs,
+        |inp| {
+            let x = bytes(inp, 0, 64 * s);
+            let mut codes = Vec::new();
+            let mut tag = 256 * r.keys.len();
+            for k in &r.keys {
+                let mut c = key_code(k, (k.union > 0).then(|| &x[tag..tag + 8]));
+                if k.union > 0 {
+                    tag += 8;
+                }
+                c.resize(128, F);
+                codes.extend(c);
             }
-            c.resize(128, F);
-            codes.extend(c);
-        }
-        let mut zero = vec![rec_bad(r, &x)];
-        if let Some(order) = order {
-            let prev = bytes(inp, 4 * s, 32);
-            let first = inp[(4 * s + 2) * 128];
-            let (gt, eq) = compare(&x[..256], &prev, F, T);
-            let wrong = if order == Order::Sorted { gt.not() } else { eq };
-            zero.push(wrong.and(first.not()));
-        }
-        (zero, codes)
-    })
+            let mut zero = vec![rec_bad(r, &x)];
+            if let Some(order) = order {
+                let prev = bytes(inp, 4 * s, 32);
+                let first = inp[(4 * s + 2) * 128];
+                let (gt, eq) = compare(&x[..256], &prev, F, T);
+                let wrong = if order == Order::Sorted { gt.not() } else { eq };
+                zero.push(wrong.and(first.not()));
+            }
+            (zero, codes)
+        },
+    )
 }
 
 /// Name bytes in a head block after key, tag and length.
@@ -668,7 +826,9 @@ impl State {
         let last = |i: usize| at((STATE - 1) * 128 + i);
         State {
             head: (0..N * 8).map(at).collect(),
-            slot: (0..SLOTS).map(|j| (0..512).map(|i| at(N * 8 + 512 * j + i)).collect()).collect(),
+            slot: (0..SLOTS)
+                .map(|j| (0..512).map(|i| at(N * 8 + 512 * j + i)).collect())
+                .collect(),
             gt: last(0),
             eq: last(1),
             left: (0..8).map(|i| last(2 + i)).collect(),
@@ -703,83 +863,117 @@ pub fn step_circuit(t: &Type) -> Circuit {
     let (r, _) = t.list.as_ref().expect("a list");
     assert!(r.name && r.keys.len() == 1 && r.choices.is_empty() && r.ints.is_empty());
     let k = r.keys[0];
-    build(format!("cas.{}.step", t.alias), 4 + STATE + 1, STATE + 1, |inp| {
-        let blk = bytes(inp, 0, 64);
-        let s = State::read(inp, 4);
-        let last = inp[(4 + STATE) * 128];
+    build(
+        format!("cas.{}.step", t.alias),
+        4 + STATE + 1,
+        STATE + 1,
+        |inp| {
+            let blk = bytes(inp, 0, 64);
+            let s = State::read(inp, 4);
+            let last = inp[(4 + STATE) * 128];
 
-        let cont = any(&s.left);
-        let is_head = cont.not();
-        // Read as the head block of an entry.
-        let (tag, len, name) = (&blk[256..264], &blk[264..272], &blk[272..512]);
-        let mut hbad = if k.union > 0 { tag_bad(tag, k.union) } else { F };
-        if !k.optional {
-            hbad = hbad.or(any(&blk[..256]).not());
-        }
-        let big = len[0].or(len[1]).or(len[2]);
-        let hot = decode(&len[3..8]);
-        hbad = hbad.or(big.not().and(hot[0]));
-        let inside: Vec<B> = below(&hot, 31)[..N].iter().map(|&b| b.or(big)).collect();
-        let (wrong, hdots) = name_bytes(name, &inside, F);
-        hbad = hbad.or(wrong).or(big.not().and(hot[1]).and(eq_const(&name[0..8], b'.')));
-        // The entry before was greater than the one before it.
-        hbad = hbad.or(s.gt.not());
-        let over = big.or(hot[31]);
-        let mut borrow = F;
-        let mut diff = vec![F; 8];
-        for i in (0..8).rev() {
-            let c = 30u8 >> (7 - i) & 1 == 1;
-            diff[i] = if c { len[i].not().xor(borrow) } else { len[i].xor(borrow) };
-            borrow = if c { len[i].not().or(borrow) } else { len[i].not().and(borrow) };
-        }
-        let hleft: Vec<B> = diff.iter().map(|&d| d.and(over)).collect();
-        let (hgt, heq) = compare(name, &s.head, F, T);
-
-        // Read as a continuation block: 64 name bytes, or the last ones.
-        let ge64 = s.left[0].or(s.left[1]);
-        let hot6 = decode(&s.left[2..8]);
-        let cin: Vec<B> = below(&hot6, 64).iter().map(|&b| b.or(ge64)).collect();
-        let (cbad, cdots) = name_bytes(&blk, &cin, s.dots);
-        let mut cleft = vec![s.left[0].and(s.left[1]), s.left[0].and(s.left[1].not())];
-        cleft.extend(s.left[2..].iter().map(|&b| b.and(ge64)));
-        let mut old = vec![F; 512];
-        for j in 0..SLOTS {
-            let sel = s.idx[j].and(s.pv[j]);
-            for i in 0..512 {
-                old[i] = old[i].xor(sel.and(s.slot[j][i]));
+            let cont = any(&s.left);
+            let is_head = cont.not();
+            // Read as the head block of an entry.
+            let (tag, len, name) = (&blk[256..264], &blk[264..272], &blk[272..512]);
+            let mut hbad = if k.union > 0 {
+                tag_bad(tag, k.union)
+            } else {
+                F
+            };
+            if !k.optional {
+                hbad = hbad.or(any(&blk[..256]).not());
             }
-        }
-        let (cgt, ceq) = compare(&blk, &old, s.gt, s.eq);
-
-        let head: Vec<B> = (0..N * 8).map(|i| B::mux(is_head, name[i], s.head[i])).collect();
-        let mut slot = s.slot.clone();
-        let (mut pv, mut cv, mut idx) = (vec![F; SLOTS], vec![F; SLOTS], vec![F; SLOTS]);
-        for j in 0..SLOTS {
-            let w = cont.and(s.idx[j]);
-            for i in 0..512 {
-                slot[j][i] = B::mux(w, blk[i], s.slot[j][i]);
+            let big = len[0].or(len[1]).or(len[2]);
+            let hot = decode(&len[3..8]);
+            hbad = hbad.or(big.not().and(hot[0]));
+            let inside: Vec<B> = below(&hot, 31)[..N].iter().map(|&b| b.or(big)).collect();
+            let (wrong, hdots) = name_bytes(name, &inside, F);
+            hbad = hbad
+                .or(wrong)
+                .or(big.not().and(hot[1]).and(eq_const(&name[0..8], b'.')));
+            // The entry before was greater than the one before it.
+            hbad = hbad.or(s.gt.not());
+            let over = big.or(hot[31]);
+            let mut borrow = F;
+            let mut diff = vec![F; 8];
+            for i in (0..8).rev() {
+                let c = 30u8 >> (7 - i) & 1 == 1;
+                diff[i] = if c {
+                    len[i].not().xor(borrow)
+                } else {
+                    len[i].xor(borrow)
+                };
+                borrow = if c {
+                    len[i].not().or(borrow)
+                } else {
+                    len[i].not().and(borrow)
+                };
             }
-            pv[j] = B::mux(is_head, s.cv[j], s.pv[j]);
-            cv[j] = is_head.not().and(s.cv[j].or(s.idx[j]));
-            idx[j] = if j == 0 { is_head } else { cont.and(s.idx[j - 1]) };
-        }
-        let next = State {
-            head,
-            slot,
-            pv,
-            cv,
-            idx,
-            left: (0..8).map(|i| B::mux(is_head, hleft[i], cleft[i])).collect(),
-            gt: B::mux(is_head, hgt, cgt),
-            eq: B::mux(is_head, heq, ceq),
-            dots: B::mux(is_head, hdots, cdots),
-        };
-        let zero = vec![B::mux(is_head, hbad, cbad), last.and(any(&next.left).or(next.gt.not()))];
-        let mut out = next.write();
-        out.resize(STATE * 128, F);
-        out.extend(key_code(&k, (k.union > 0).then(|| tag)).into_iter().map(|b| b.and(is_head)));
-        (zero, out)
-    })
+            let hleft: Vec<B> = diff.iter().map(|&d| d.and(over)).collect();
+            let (hgt, heq) = compare(name, &s.head, F, T);
+
+            // Read as a continuation block: 64 name bytes, or the last ones.
+            let ge64 = s.left[0].or(s.left[1]);
+            let hot6 = decode(&s.left[2..8]);
+            let cin: Vec<B> = below(&hot6, 64).iter().map(|&b| b.or(ge64)).collect();
+            let (cbad, cdots) = name_bytes(&blk, &cin, s.dots);
+            let mut cleft = vec![s.left[0].and(s.left[1]), s.left[0].and(s.left[1].not())];
+            cleft.extend(s.left[2..].iter().map(|&b| b.and(ge64)));
+            let mut old = vec![F; 512];
+            for j in 0..SLOTS {
+                let sel = s.idx[j].and(s.pv[j]);
+                for i in 0..512 {
+                    old[i] = old[i].xor(sel.and(s.slot[j][i]));
+                }
+            }
+            let (cgt, ceq) = compare(&blk, &old, s.gt, s.eq);
+
+            let head: Vec<B> = (0..N * 8)
+                .map(|i| B::mux(is_head, name[i], s.head[i]))
+                .collect();
+            let mut slot = s.slot.clone();
+            let (mut pv, mut cv, mut idx) = (vec![F; SLOTS], vec![F; SLOTS], vec![F; SLOTS]);
+            for j in 0..SLOTS {
+                let w = cont.and(s.idx[j]);
+                for i in 0..512 {
+                    slot[j][i] = B::mux(w, blk[i], s.slot[j][i]);
+                }
+                pv[j] = B::mux(is_head, s.cv[j], s.pv[j]);
+                cv[j] = is_head.not().and(s.cv[j].or(s.idx[j]));
+                idx[j] = if j == 0 {
+                    is_head
+                } else {
+                    cont.and(s.idx[j - 1])
+                };
+            }
+            let next = State {
+                head,
+                slot,
+                pv,
+                cv,
+                idx,
+                left: (0..8)
+                    .map(|i| B::mux(is_head, hleft[i], cleft[i]))
+                    .collect(),
+                gt: B::mux(is_head, hgt, cgt),
+                eq: B::mux(is_head, heq, ceq),
+                dots: B::mux(is_head, hdots, cdots),
+            };
+            let zero = vec![
+                B::mux(is_head, hbad, cbad),
+                last.and(any(&next.left).or(next.gt.not())),
+            ];
+            let mut out = next.write();
+            out.resize(STATE * 128, F);
+            out.extend(
+                key_code(&k, (k.union > 0).then(|| tag))
+                    .into_iter()
+                    .map(|b| b.and(is_head)),
+            );
+            (zero, out)
+        },
+    )
 }
 
 // A blob as rows.
@@ -838,7 +1032,14 @@ pub fn plan(t: &Type, len: usize) -> Option<Vec<Row>> {
         if blocks < h.blocks() {
             return None;
         }
-        rows.push(Row { kind: Kind::Head, block: 0, blocks: h.blocks(), first: true, last: true, bytes: 64 * h.blocks() });
+        rows.push(Row {
+            kind: Kind::Head,
+            block: 0,
+            blocks: h.blocks(),
+            first: true,
+            last: true,
+            bytes: 64 * h.blocks(),
+        });
         p = h.blocks();
     }
     match &t.list {
@@ -860,11 +1061,14 @@ pub fn plan(t: &Type, len: usize) -> Option<Vec<Row>> {
             if (blocks - p) % s != 0 {
                 return None;
             }
-            rows.extend(
-                (p..blocks)
-                    .step_by(s)
-                    .map(|b| Row { kind: Kind::Rec, block: b, blocks: s, first: b == p, last: b + s == blocks, bytes: 64 * s }),
-            );
+            rows.extend((p..blocks).step_by(s).map(|b| Row {
+                kind: Kind::Rec,
+                block: b,
+                blocks: s,
+                first: b == p,
+                last: b + s == blocks,
+                bytes: 64 * s,
+            }));
         }
     }
     Some(rows)
@@ -891,7 +1095,11 @@ pub fn circuit(t: &Type, kind: Kind) -> Circuit {
 /// The word whose bit `i` says byte `i` of a block is inside a text that
 /// has `bytes` bytes in the block.
 pub fn inside(bytes: usize) -> u128 {
-    if bytes >= 64 { u128::from(u64::MAX) } else { (1u128 << bytes) - 1 }
+    if bytes >= 64 {
+        u128::from(u64::MAX)
+    } else {
+        (1u128 << bytes) - 1
+    }
 }
 
 pub fn circuits(t: &Type) -> Circuits {
@@ -928,8 +1136,10 @@ pub fn keys(t: &Type, c: &Circuits, blob: &[u8]) -> Option<Vec<Vec<([u8; 32], u8
     let mut text = 1u128;
     let mut prev = [0u128; 2];
     for r in rows {
-        let mut inputs: Vec<u128> =
-            blob[64 * r.block..64 * (r.block + r.blocks)].chunks_exact(64).flat_map(words).collect();
+        let mut inputs: Vec<u128> = blob[64 * r.block..64 * (r.block + r.blocks)]
+            .chunks_exact(64)
+            .flat_map(words)
+            .collect();
         let m = [inputs[0], inputs[1]];
         let out = match r.kind {
             Kind::Head => {
@@ -966,7 +1176,10 @@ pub fn keys(t: &Type, c: &Circuits, blob: &[u8]) -> Option<Vec<Vec<([u8; 32], u8
             }
             Kind::Head | Kind::Rec => {
                 prev = m;
-                o.iter().enumerate().map(|(i, &c)| (at(i), c as u8)).collect()
+                o.iter()
+                    .enumerate()
+                    .map(|(i, &c)| (at(i), c as u8))
+                    .collect()
             }
         });
     }

@@ -443,7 +443,11 @@ pub(super) fn build_first_level_core(
         .zip(&unions)
         .filter_map(|(i, u)| i.work.element.clone().map(|a| (u, a)))
         .collect();
-    assert_eq!(el_asserts.len(), if n_el > 0 { k_ary } else { 0 }, "element work per child");
+    assert_eq!(
+        el_asserts.len(),
+        if n_el > 0 { k_ary } else { 0 },
+        "element work per child"
+    );
     let circs = &family.circs[..];
     // THE JAGGED GROUP (the count win): the children's W-claims fold under
     // the leaf digest — the layout is a shape constant of the ONE leaf
@@ -520,7 +524,10 @@ pub(super) fn build_first_level_core(
     }
     .expect("the first-level fold verifies");
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
-    assert!(acc_v.discharge_element(&el_mats), "the element group discharges");
+    assert!(
+        acc_v.discharge_element(&el_mats),
+        "the element group discharges"
+    );
     // The boolean fold groups: one per type, or one per matrix class under
     // shared binding — each group's claims are child-major, then
     // type-ascending within the group. Under shared binding the classes
@@ -677,7 +684,13 @@ pub(super) fn build_first_level_core(
     let n_bound: Vec<usize> = if family.shared.is_some() {
         want.extend(shared_binding_ops(&bool_asserts, &sigma_refs));
         (0..n_uni)
-            .map(|fi| if fi < el_g { k_ary * fold_members(fi).len() } else { 0 })
+            .map(|fi| {
+                if fi < el_g {
+                    k_ary * fold_members(fi).len()
+                } else {
+                    0
+                }
+            })
             .collect()
     } else {
         vec![0; n_uni]
@@ -1366,8 +1379,14 @@ pub(super) fn build_first_level_core(
                         sb.connect(wv(cl.col_pt_v + j), rk.el_r_col_w[j]);
                     }
                 }
-                sb.connect(wv(locs[el_g + 2 * t].claims[n_priors + k].value_v), rk.el_eval_w[t].0);
-                sb.connect(wv(locs[el_g + 2 * t + 1].claims[n_priors + k].value_v), rk.el_eval_w[t].1);
+                sb.connect(
+                    wv(locs[el_g + 2 * t].claims[n_priors + k].value_v),
+                    rk.el_eval_w[t].0,
+                );
+                sb.connect(
+                    wv(locs[el_g + 2 * t + 1].claims[n_priors + k].value_v),
+                    rk.el_eval_w[t].1,
+                );
             }
             // Every claim's lagrange lows are the first's — one published
             // copy binds them all (one stream copy, under shared binding).
@@ -1665,7 +1684,12 @@ pub(super) fn build_first_level_core(
                     .map(|t| (rebuilt[2 * t].clone(), rebuilt[2 * t + 1].clone()))
                     .collect(),
                 per_element: (0..n_el)
-                    .map(|t| (rebuilt[el_g + 2 * t].clone(), rebuilt[el_g + 2 * t + 1].clone()))
+                    .map(|t| {
+                        (
+                            rebuilt[el_g + 2 * t].clone(),
+                            rebuilt[el_g + 2 * t + 1].clone(),
+                        )
+                    })
                     .collect(),
                 per_linear: rebuilt[n_ab..el_g].to_vec(),
                 sigma: vec![(leaf_digest, rebuilt[sig_g].clone())],

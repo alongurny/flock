@@ -40,7 +40,10 @@ fn main() {
         let tv = t.elapsed();
         let mut bad = keys.clone();
         bad[0][0] ^= 1;
-        assert!(circuit.verify(&bad, &proof).is_err(), "a wrong key must be rejected");
+        assert!(
+            circuit.verify(&bad, &proof).is_err(),
+            "a wrong key must be rejected"
+        );
         println!(
             "witness {tw:?} witness+prove {tp:?} verify {tv:?}: {:.0} blocks/s, {:.2} MB/s",
             (n * k) as f64 / tp.as_secs_f64(),

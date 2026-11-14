@@ -18,9 +18,7 @@
 
 use std::{fs, path::Path};
 
-use flock_core::{
-    circuit::bus::SharedChallenges, pcs::Commitment, proof::R1csProofCircuitMerged,
-};
+use flock_core::{circuit::bus::SharedChallenges, pcs::Commitment, proof::R1csProofCircuitMerged};
 use flock_prover::lean_rows::{
     LeanCircuit, Rows, same_commitment, shared_balance, shared_challenges,
 };
@@ -54,9 +52,9 @@ fn circuit(k: usize, batches: &str, dir: &str) -> LeanCircuit {
 }
 
 fn read<T: serde::de::DeserializeOwned>(p: impl AsRef<Path>) -> T {
-    bincode::deserialize(&fs::read(p.as_ref()).unwrap_or_else(|e| {
-        panic!("{}: {e}", p.as_ref().display())
-    }))
+    bincode::deserialize(
+        &fs::read(p.as_ref()).unwrap_or_else(|e| panic!("{}: {e}", p.as_ref().display())),
+    )
     .unwrap()
 }
 
@@ -88,13 +86,21 @@ fn main() {
                     t.elapsed().as_secs_f64() * 1e3
                 );
             }
-            fs::write(format!("{out}/{k}.commit"), bincode::serialize(&st).unwrap()).unwrap();
+            fs::write(
+                format!("{out}/{k}.commit"),
+                bincode::serialize(&st).unwrap(),
+            )
+            .unwrap();
         }
         "challenges" => {
             let (count, out) = (n(1), &a[2]);
             let st = statement(count, out);
             let ch = shared_challenges(&st);
-            fs::write(format!("{out}/challenges"), bincode::serialize(&ch).unwrap()).unwrap();
+            fs::write(
+                format!("{out}/challenges"),
+                bincode::serialize(&ch).unwrap(),
+            )
+            .unwrap();
             println!("{} pieces, challenges drawn", st.len());
         }
         "prove" => {
@@ -132,7 +138,11 @@ fn main() {
             let (count, out) = (n(1), &a[2]);
             let st = statement(count, out);
             let ch: SharedChallenges = read(format!("{out}/challenges"));
-            assert_eq!(ch, shared_challenges(&st), "challenges drawn from every commitment");
+            assert_eq!(
+                ch,
+                shared_challenges(&st),
+                "challenges drawn from every commitment"
+            );
             let mut proofs = Vec::new();
             let mut bytes = 0;
             for k in 0..count {

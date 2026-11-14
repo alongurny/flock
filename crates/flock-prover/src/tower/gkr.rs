@@ -68,7 +68,12 @@ pub(super) struct BusRec {
 
 impl BusRec {
     /// β's and the γs' native values: absorbed words or squeezes.
-    pub(super) fn challenges(&self, vals_rec: &[F128], chals: &[F128], width: usize) -> (F128, Vec<F128>) {
+    pub(super) fn challenges(
+        &self,
+        vals_rec: &[F128],
+        chals: &[F128],
+        width: usize,
+    ) -> (F128, Vec<F128>) {
         match self.shared_v {
             Some(v) => (vals_rec[v], vals_rec[v + 1..v + 1 + width].to_vec()),
             None => (
@@ -339,7 +344,10 @@ pub(super) fn emit_bus(
         })
         .collect();
     let words = bus.words();
-    assert!(gather_w.len() >= words.len(), "one gather wire per bus word");
+    assert!(
+        gather_w.len() >= words.len(),
+        "one gather wire per bus word"
+    );
     let (gather_w, opened_w) = gather_w.split_at(words.len());
     let mult = br.mult.as_ref().map(|m| {
         emit_bus_mult(
@@ -472,7 +480,9 @@ fn emit_bus_mult(
     for &(v, _, fin) in &m.rounds {
         let rk = sq(fin);
         r_w.push(rk);
-        let d: Vec<Wire> = (0..4).map(|l| sb.gate(macs, &[node_w[l], rk, ow])[0]).collect();
+        let d: Vec<Wire> = (0..4)
+            .map(|l| sb.gate(macs, &[node_w[l], rk, ow])[0])
+            .collect();
         let p01 = sb.gate(macs, &[zw, d[0], d[1]])[0];
         let p23 = sb.gate(macs, &[zw, d[2], d[3]])[0];
         let num = [
@@ -524,7 +534,11 @@ fn emit_bus_mult(
     assert_eq!(tag_cols, ms.columns, "the multiplicity columns' order");
     let bit_slots = bus.mult_bits();
     let word_slots = bus.mult_words();
-    assert_eq!(opened_w.len(), bit_slots.len() + word_slots.len(), "bits then words");
+    assert_eq!(
+        opened_w.len(),
+        bit_slots.len() + word_slots.len(),
+        "bits then words"
+    );
     let (bits_w, words_w) = opened_w.split_at(bit_slots.len());
     let mut total = zw;
     for (g, &(p, i)) in groups.iter().enumerate() {
@@ -626,7 +640,10 @@ pub(super) fn pin_bus_sides(
         for (g, (p, bit)) in bus.groups(dir).into_iter().enumerate() {
             let port = &bus.ports[p];
             if let Some(i) = bit {
-                let at = mult_groups.iter().position(|&x| x == (p, i)).expect("a multiplicity group");
+                let at = mult_groups
+                    .iter()
+                    .position(|&x| x == (p, i))
+                    .expect("a multiplicity group");
                 acc += eq_port[g] * sums[at];
                 continue;
             }
@@ -680,10 +697,17 @@ fn pin_bus_mult(
     let mu: Vec<F128> = (0..n).map(|g| chals[m.lam_ch + n + g]).collect();
     let bit_slots = bus.mult_bits();
     let word_slots = bus.mult_words();
-    assert_eq!(opened.len(), bit_slots.len() + word_slots.len(), "bits then words");
+    assert_eq!(
+        opened.len(),
+        bit_slots.len() + word_slots.len(),
+        "bits then words"
+    );
     let (bits, words) = opened.split_at(bit_slots.len());
     let sums: Vec<F128> = m.sums.clone();
-    let mut claim = sums.iter().zip(&lambda).fold(F128::ZERO, |a, (&s, &l)| a + l * s);
+    let mut claim = sums
+        .iter()
+        .zip(&lambda)
+        .fold(F128::ZERO, |a, (&s, &l)| a + l * s);
     for (k, s) in m.round_values.iter().enumerate() {
         let rk = chals[m.rounds[k].1];
         claim = interpolate([s[0], claim + s[0], s[1], s[2]], rk);
@@ -716,7 +740,11 @@ fn pin_bus_mult(
         }
         total += mb * (lambda[g] * (F128::ONE + frob(f, i)) + mu[g] * (F128::ONE + mb));
     }
-    assert_eq!(eq_at(rho_row, &m.r) * total, claim, "the multiplicity sumcheck closes");
+    assert_eq!(
+        eq_at(rho_row, &m.r) * total,
+        claim,
+        "the multiplicity sumcheck closes"
+    );
     sums
 }
 
@@ -836,7 +864,10 @@ pub(super) fn circuit_structure_claim_wires(
             out.push((sigma_w[i].to_vec(), col, vw));
         }
     } else {
-        assert!(bus_mult.is_none(), "multiplicity wires without their structure");
+        assert!(
+            bus_mult.is_none(),
+            "multiplicity wires without their structure"
+        );
     }
     // The public columns' values at the wiring's row point: plane 7.
     if let Some(structure) = &sigma.public_columns {

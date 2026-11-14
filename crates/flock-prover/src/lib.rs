@@ -19,8 +19,8 @@ pub use flock_core::{
 };
 
 pub mod cas;
-pub mod cas_ir;
 pub mod cas_chunks;
+pub mod cas_ir;
 pub mod cas_typed;
 pub mod lean_rows;
 pub mod leanxmss;

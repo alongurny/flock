@@ -49,25 +49,35 @@ pub(super) fn lean_leaf_word(public: &[F128], cap: &[[u8; 32]]) -> [u8; 32] {
     acc
 }
 
-/// The commitment tree's root over leaf words in order: pairs hash as
-/// BLAKE3 parents, level by level (a power-of-two count).
-pub(super) fn lean_tree_root(words: &[[u8; 32]]) -> [u8; 32] {
-    assert!(words.len().is_power_of_two(), "a full binary cone");
-    let mut level = words.to_vec();
-    while level.len() > 1 {
-        level = level
-            .chunks(2)
-            .map(|p| hash_pair(&p[0], &p[1], HashKind::Blake3))
-            .collect();
+/// The commitment root in the tower's shape: leaf pairs hash into the
+/// first-level digests `f_j`, the base node pairs the last two, and each
+/// spine node prepends the next-earlier one,
+/// `H(f_0, H(f_1, … H(f_{k-2}, f_{k-1})))`.
+pub(super) fn lean_cone_root(words: &[[u8; 32]]) -> [u8; 32] {
+    assert!(
+        words.len() >= 4 && words.len() % 2 == 0,
+        "leaf pairs, at least two"
+    );
+    let pair = |l: &[u8; 32], r: &[u8; 32]| hash_pair(l, r, HashKind::Blake3);
+    let fls: Vec<[u8; 32]> = words.chunks(2).map(|p| pair(&p[0], &p[1])).collect();
+    let k = fls.len();
+    let mut acc = pair(&fls[k - 2], &fls[k - 1]);
+    for f in fls[..k - 2].iter().rev() {
+        acc = pair(f, &acc);
     }
-    level[0]
+    acc
 }
 
 /// The challenges' seed every node carries: β and the γs, paired into
 /// digests and chained as BLAKE3 parents.
 pub(super) fn challenge_seed(ch: &SharedChallenges) -> [u8; 32] {
-    let words: Vec<F128> = std::iter::once(ch.beta).chain(ch.gamma.iter().copied()).collect();
-    assert!(words.len() % 2 == 0 && words.len() >= 4, "β and the γs pair up");
+    let words: Vec<F128> = std::iter::once(ch.beta)
+        .chain(ch.gamma.iter().copied())
+        .collect();
+    assert!(
+        words.len() % 2 == 0 && words.len() >= 4,
+        "β and the γs pair up"
+    );
     let d = |k: usize| f128_digest([words[k], words[k + 1]]);
     let mut acc = hash_pair(&d(0), &d(2), HashKind::Blake3);
     for k in (4..words.len()).step_by(2) {
@@ -143,7 +153,15 @@ fn lean_child_region_emits_alone() {
     let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
     let mut consts: Vec<(F128, Wire)> = Vec::new();
     let b3_slot = cs.q.b3;
-    let region = emit_child_region(&mut sb, &mut cs, b3_slot, &ct, &mut vals, &mut hints, &mut consts);
+    let region = emit_child_region(
+        &mut sb,
+        &mut cs,
+        b3_slot,
+        &ct,
+        &mut vals,
+        &mut hints,
+        &mut consts,
+    );
     let shape2 = sb.finish().expect("the Lean child circuit builds");
     let hint_refs: Vec<&(dyn Any + Sync)> = hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
     let built2 = shape2.run(&vals, &hint_refs);
@@ -171,12 +189,24 @@ fn lean_child_region_rejects_moved_counts() {
         let nu2 = (ct.b3_rows.next_power_of_two().trailing_zeros() as usize).max(16);
         let mut sb = ShapeBuilder::new(nu2);
         let mut cs = ChildSlots::new(&mut sb, nu2, ct.spread_w);
-        let (mut vals, mut hints, mut consts): (Vec<F128>, Vec<[u32; SLOT_WORDS]>, Vec<(F128, Wire)>) =
-            (Vec::new(), Vec::new(), Vec::new());
+        let (mut vals, mut hints, mut consts): (
+            Vec<F128>,
+            Vec<[u32; SLOT_WORDS]>,
+            Vec<(F128, Wire)>,
+        ) = (Vec::new(), Vec::new(), Vec::new());
         let b3_slot = cs.q.b3;
-        let _ = emit_child_region(&mut sb, &mut cs, b3_slot, ct, &mut vals, &mut hints, &mut consts);
+        let _ = emit_child_region(
+            &mut sb,
+            &mut cs,
+            b3_slot,
+            ct,
+            &mut vals,
+            &mut hints,
+            &mut consts,
+        );
         let shape2 = sb.finish().expect("the Lean child circuit builds");
-        let hint_refs: Vec<&(dyn Any + Sync)> = hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
+        let hint_refs: Vec<&(dyn Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         catch_unwind(AssertUnwindSafe(|| shape2.run(&vals, &hint_refs))).is_ok()
     };
     assert!(runs(&ct), "the honest region runs");
@@ -184,7 +214,11 @@ fn lean_child_region_rejects_moved_counts() {
     ct.sigma_native.bus.as_mut().unwrap().values[0] += F128::ONE;
     assert!(!runs(&ct), "a moved bus column at ρ_row");
     ct.sigma_native.bus = honest;
-    let m = ct.sigma_native.bus_mult.clone().expect("Lean counts its lookups");
+    let m = ct
+        .sigma_native
+        .bus_mult
+        .clone()
+        .expect("Lean counts its lookups");
     eprintln!(
         "{} count bits, {} tag columns at the σ_i",
         m.sigma.len(),
@@ -192,7 +226,15 @@ fn lean_child_region_rejects_moved_counts() {
     );
     assert!(!m.values.is_empty(), "Lean's counted ports carry row tags");
     let bus = inner.built.shape.circuit.bus().expect("a bus");
-    let mp = inner.proof.wiring().bus.as_ref().unwrap().mult.as_ref().unwrap();
+    let mp = inner
+        .proof
+        .wiring()
+        .bus
+        .as_ref()
+        .unwrap()
+        .mult
+        .as_ref()
+        .unwrap();
     let cols = bus.table_columns();
     let bit_slots = bus.mult_bits();
     let read: Vec<usize> = (0..m.columns.len())
@@ -262,9 +304,18 @@ fn lean_shared_pieces_emit() {
         let mut hints: Vec<[u32; SLOT_WORDS]> = Vec::new();
         let mut consts: Vec<(F128, Wire)> = Vec::new();
         let b3_slot = cs.q.b3;
-        let region = emit_child_region(&mut sb, &mut cs, b3_slot, &ct, &mut vals, &mut hints, &mut consts);
+        let region = emit_child_region(
+            &mut sb,
+            &mut cs,
+            b3_slot,
+            &ct,
+            &mut vals,
+            &mut hints,
+            &mut consts,
+        );
         let shape2 = sb.finish().expect("the Lean child circuit builds");
-        let hint_refs: Vec<&(dyn Any + Sync)> = hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
+        let hint_refs: Vec<&(dyn Any + Sync)> =
+            hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         let built2 = shape2.run(&vals, &hint_refs);
         let consumed = check_child_region(&built2.public, &ct, &region);
         assert_eq!(region.pub_base + consumed, built2.public.len());
@@ -285,7 +336,8 @@ fn lean_first_level_node() {
     let small = include_str!("../../tests/data/lean_small.rows");
     let rows = Rows::merge((0..4000).map(|_| Rows::parse(small).unwrap()).collect());
     let c = LeanCircuit::build(&rows).unwrap();
-    let mut per_table: Vec<Vec<usize>> = vec![Vec::new(); c.chunks().iter().map(|x| x.0 + 1).max().unwrap()];
+    let mut per_table: Vec<Vec<usize>> =
+        vec![Vec::new(); c.chunks().iter().map(|x| x.0 + 1).max().unwrap()];
     for (s, ch, _) in c.chunks() {
         per_table[s].push(ch);
     }
@@ -309,7 +361,11 @@ fn lean_first_level_node() {
     let registry = &inners[0].built.shape.registry;
     let family = FlFamily {
         domain: LEAN_DOMAIN,
-        mats: registry.boolean_types().iter().map(|ty| (&ty.a_0, &ty.b_0)).collect(),
+        mats: registry
+            .boolean_types()
+            .iter()
+            .map(|ty| (&ty.a_0, &ty.b_0))
+            .collect(),
         circs: leaves[0].lincheck_circuits(),
         lane_words: None,
         shared: None,
@@ -351,7 +407,8 @@ fn lean_internal_node() {
     let small = include_str!("../../tests/data/lean_small.rows");
     let rows = Rows::merge((0..4000).map(|_| Rows::parse(small).unwrap()).collect());
     let c = LeanCircuit::build(&rows).unwrap();
-    let mut per_table: Vec<Vec<usize>> = vec![Vec::new(); c.chunks().iter().map(|x| x.0 + 1).max().unwrap()];
+    let mut per_table: Vec<Vec<usize>> =
+        vec![Vec::new(); c.chunks().iter().map(|x| x.0 + 1).max().unwrap()];
     for (s, ch, _) in c.chunks() {
         per_table[s].push(ch);
     }
@@ -371,7 +428,7 @@ fn lean_internal_node() {
         .iter()
         .map(|p| lean_leaf_word(&p.public(), &p.commit().cap))
         .collect();
-    let root = lean_tree_root(&words);
+    let root = lean_cone_root(&words);
     let ch = crate::lean_rows::shared_challenges_from_root(&root);
     let seed = challenge_seed(&ch);
     let inners: Vec<MixedInner> = leaves
@@ -382,7 +439,11 @@ fn lean_internal_node() {
     let registry = &inners[0].built.shape.registry;
     let family = FlFamily {
         domain: LEAN_DOMAIN,
-        mats: registry.boolean_types().iter().map(|ty| (&ty.a_0, &ty.b_0)).collect(),
+        mats: registry
+            .boolean_types()
+            .iter()
+            .map(|ty| (&ty.a_0, &ty.b_0))
+            .collect(),
         circs: leaves[0].lincheck_circuits(),
         lane_words: None,
         shared: None,
@@ -444,20 +505,45 @@ fn lean_internal_node() {
     // and the open products balance.
     let app = out.app_base.expect("the node carries the app block");
     let p = &out.lo.public;
-    assert_eq!(f128_digest([p[app], p[app + 1]]), root, "the commitment root");
-    assert_eq!(f128_digest([p[app + 2], p[app + 3]]), seed, "the challenges' seed");
-    assert_eq!(p[app + 4], p[app + 5], "the shared bus balances over the cone");
+    assert_eq!(
+        f128_digest([p[app], p[app + 1]]),
+        root,
+        "the commitment root"
+    );
+    assert_eq!(
+        f128_digest([p[app + 2], p[app + 3]]),
+        seed,
+        "the challenges' seed"
+    );
+    assert_eq!(
+        p[app + 4],
+        p[app + 5],
+        "the shared bus balances over the cone"
+    );
     assert_ne!(p[app + 4], F128::ZERO, "a nonzero product");
     // THE ROOT-SIDE DISCHARGE: the lane against the Lean leaf's tables, the
     // main fold against the first-level and node circuits. With the root
     // proof's own verify, this is the cone's whole verification.
     let lane_acc = out.lane_acc.as_ref().expect("the lane accumulator");
-    assert_eq!(lane_acc.per_element.len(), el_mats.len(), "the lane folds the element class");
+    assert_eq!(
+        lane_acc.per_element.len(),
+        el_mats.len(),
+        "the lane folds the element class"
+    );
     let t_d = std::time::Instant::now();
     let leaf_circuit = &inners[0].built.shape.circuit;
-    assert!(lane_acc.discharge(&family.mats), "the lane's boolean class discharges");
-    assert!(lane_acc.discharge_element(&el_mats), "the lane's element class discharges");
-    assert!(lane_acc.discharge_sigma(&[leaf_circuit]), "the lane's sigma discharges");
+    assert!(
+        lane_acc.discharge(&family.mats),
+        "the lane's boolean class discharges"
+    );
+    assert!(
+        lane_acc.discharge_element(&el_mats),
+        "the lane's element class discharges"
+    );
+    assert!(
+        lane_acc.discharge_sigma(&[leaf_circuit]),
+        "the lane's sigma discharges"
+    );
     assert!(
         lane_acc.discharge_jagged(&[(leaf_circuit.digest(), &jp)]),
         "the lane's jagged entry discharges"
@@ -466,27 +552,50 @@ fn lean_internal_node() {
     {
         let fl_lo = &fls[0].lo;
         let t = std::time::Instant::now();
-        let _ = out.acc.discharge_sigma(&[&fl_lo.shape.circuit, &out.lo.shape.circuit]);
+        let _ = out
+            .acc
+            .discharge_sigma(&[&fl_lo.shape.circuit, &out.lo.shape.circuit]);
         let sig = t.elapsed().as_secs_f64() * 1e3;
         let t = std::time::Instant::now();
         let fj = crate::tower::node::node_jagged_params(fl_lo);
         let rj = crate::tower::node::node_jagged_params(&out.lo);
-        let _ = out.acc.discharge_jagged(&[(fl_lo.shape.circuit.digest(), &fj), (out.lo.shape.circuit.digest(), &rj)]);
+        let _ = out.acc.discharge_jagged(&[
+            (fl_lo.shape.circuit.digest(), &fj),
+            (out.lo.shape.circuit.digest(), &rj),
+        ]);
         let jag = t.elapsed().as_secs_f64() * 1e3;
         let t = std::time::Instant::now();
         let _ = lane_acc.discharge_sigma(&[leaf_circuit]);
         let lsig = t.elapsed().as_secs_f64() * 1e3;
         {
             let t = std::time::Instant::now();
-            let _ = out.acc.discharge(&crate::tower::query::leaf_boolean_mats(fl_lo));
+            let _ = out
+                .acc
+                .discharge(&crate::tower::query::leaf_boolean_mats(fl_lo));
             let b = t.elapsed().as_secs_f64() * 1e3;
-            let em: Vec<_> = fl_lo.shape.registry.element_types().iter().map(|t| { let e = t.element_type().unwrap(); (e.a_0(), e.b_0()) }).collect();
+            let em: Vec<_> = fl_lo
+                .shape
+                .registry
+                .element_types()
+                .iter()
+                .map(|t| {
+                    let e = t.element_type().unwrap();
+                    (e.a_0(), e.b_0())
+                })
+                .collect();
             let t = std::time::Instant::now();
             let _ = out.acc.discharge_element(&em);
             let e = t.elapsed().as_secs_f64() * 1e3;
-            eprintln!("main boolean {b:.1} ms ({} types), main element {e:.1} ms ({} types)", out.acc.per_type.len(), em.len());
+            eprintln!(
+                "main boolean {b:.1} ms ({} types), main element {e:.1} ms ({} types)",
+                out.acc.per_type.len(),
+                em.len()
+            );
         }
-        eprintln!("main sigma {sig:.1} ms, main jagged {jag:.1} ms, lane sigma {lsig:.1} ms; sigma entries {}", out.acc.sigma.len());
+        eprintln!(
+            "main sigma {sig:.1} ms, main jagged {jag:.1} ms, lane sigma {lsig:.1} ms; sigma entries {}",
+            out.acc.sigma.len()
+        );
     }
     let t_m = std::time::Instant::now();
     crate::tower::driver::discharge_outer(&fls[0].lo, &out.lo, None, &out.acc, &[], false)
@@ -499,7 +608,11 @@ fn lean_internal_node() {
         lane_ms + main_ms
     );
     let lane_acc = out.lane_acc.as_ref().expect("the lane accumulator");
-    assert_eq!(lane_acc.per_element.len(), el_mats.len(), "the lane folds the element class");
+    assert_eq!(
+        lane_acc.per_element.len(),
+        el_mats.len(),
+        "the lane folds the element class"
+    );
     let bytes = match &out.lo.proof {
         MixedProof::Rs(p) => bincode::serialize(p).unwrap().len(),
         MixedProof::Ag(p) => bincode::serialize(p).unwrap().len(),
