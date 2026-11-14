@@ -601,6 +601,9 @@ impl Spec {
             x[3],
             T::C(pr),
         ]);
+        if ablate("RANK") {
+            return [x[0], x[1], x[2], x[3]];
+        }
         self.ge(r, E::Own(Part::R), pr, E::Prem(j, Part::R), 1);
         [x[0], x[1], x[2], x[3]]
     }
@@ -714,8 +717,12 @@ fn term_spec(kind: u64) -> Spec {
                 let T::C(id) = x[p] else { unreachable!() };
                 let ch = TR::Child(Box::new(TR::Own), p);
                 let (lc, rc) = s.term(id, ch.clone(), T::Id, [None; 3], None);
-                s.ge(r, own(Part::R), rc, E::Tm(ch.clone(), Part::R), 1);
-                s.ge(l, own(Part::L), lc, E::Tm(ch, Part::L), sh);
+                if !ablate("RANK") {
+                    s.ge(r, own(Part::R), rc, E::Tm(ch.clone(), Part::R), 1);
+                }
+                if !ablate("LBR") {
+                    s.ge(l, own(Part::L), lc, E::Tm(ch, Part::L), sh);
+                }
             }
             s.send([k(TAG_TERM), T::Id, k(kind), x[0], x[1], x[2], tc(l), tc(r)]);
         }
@@ -1480,4 +1487,10 @@ F 10 App infer 0 5 0 0 : 7 8 6 9 5
         let c = LeanCircuit::build_with(&rows, false).unwrap();
         assert!(c.prove_and_verify(false).is_err());
     }
+}
+
+/// Measurement switches (unsound): `LEAN_ROWS_ABLATE=RANK,LBR` drops those
+/// checks to see what they cost.
+fn ablate(what: &str) -> bool {
+    std::env::var("LEAN_ROWS_ABLATE").is_ok_and(|v| v.split(',').any(|w| w == what))
 }
