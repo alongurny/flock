@@ -1352,6 +1352,42 @@ impl LeanCircuit {
             .collect()
     }
 
+    /// Every bus tuple of chunk `ch` of table `s`, natively, as a leaf puts
+    /// it on the bus: `f(table, send, tuple, count)` per row and port (a
+    /// receive counts once per real row, a send its count bits). For
+    /// balance checks without proving.
+    pub fn for_each_tuple(&self, s: usize, ch: usize, mut f: impl FnMut(usize, bool, &[F128], u64)) {
+        let nu = self.nu;
+        let sp = &self.specs[s];
+        let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
+        let t = &self.tables[s];
+        let rows = &t[(ch << nu).min(t.len())..((ch + 1) << nu).min(t.len())];
+        let word = ((self.chunk_base[s] + ch) as u64) << 32;
+        let mut tup = Vec::with_capacity(W);
+        for (j, z0) in rows.iter().enumerate() {
+            let mut z = z0.clone();
+            Gate::complete(&cols, &mut z);
+            for p in &sp.ports {
+                tup.clear();
+                for term in &p.t {
+                    tup.push(match *term {
+                        T::C(c) => z[c],
+                        T::K(v) => v,
+                        T::Id => F128::new(word | j as u64, 0),
+                    });
+                }
+                let n = if p.mult.is_empty() {
+                    1
+                } else {
+                    p.mult.iter().enumerate().fold(0u64, |a, (i, &c)| {
+                        a | (u64::from(z[c] == F128::ONE) << i)
+                    })
+                };
+                f(s, p.send, &tup, n);
+            }
+        }
+    }
+
     /// Each table spec, as text, to compare two sides' leaf circuits.
     pub fn spec_texts(&self) -> Vec<String> {
         self.specs.iter().map(|s| format!("{s:?}")).collect()

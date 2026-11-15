@@ -149,6 +149,18 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// Return freed heap pages to the OS (glibc keeps a large transient's
+/// fragments otherwise).
+fn trim() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: glibc's malloc_trim only returns free heap pages to the OS.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
 fn rss() -> String {
     unsafe extern "C" {
         fn malloc_trim(pad: usize) -> i32;
@@ -179,6 +191,34 @@ fn main() {
     let (n, out) = (num(1), a[2].clone());
     let t0 = Instant::now();
     match a[0].as_str() {
+        "asks" => {
+            // Each batch's requests to the shared side, at this nu: the
+            // shared side's counts read them, and a row's id depends on nu.
+            let g: Rows = read(format!("{out}/cone.bin"));
+            for k in 0..n {
+                let b: Rows = read(format!("{out}/b{k}.bin"));
+                let (_, asks) =
+                    LeanCircuit::build_side(&g, &b, Side::Batch, batch_base(k), &HashMap::new())
+                        .unwrap_or_else(|e| panic!("batch {k}: {e}"));
+                let v: Vec<(Tuple, u64)> = asks.into_iter().collect();
+                fs::write(format!("{out}/{k}.asks.new"), bincode::serialize(&v).unwrap()).unwrap();
+                eprintln!("batch {k}: {} asks ({:.0} s)", v.len(), t0.elapsed().as_secs_f64());
+            }
+        }
+        "cmpasks" => {
+            for k in 0..n {
+                let old: HashMap<Tuple, u64> =
+                    read::<Vec<(Tuple, u64)>>(format!("{out}/{k}.asks")).into_iter().collect();
+                let new: HashMap<Tuple, u64> =
+                    read::<Vec<(Tuple, u64)>>(format!("{out}/{k}.asks.new")).into_iter().collect();
+                let diff = new.iter().filter(|(t, c)| old.get(*t) != Some(*c)).count()
+                    + old.keys().filter(|t| !new.contains_key(*t)).count();
+                if diff > 0 {
+                    eprintln!("batch {k}: {diff} differ of {}", new.len());
+                }
+            }
+            eprintln!("compared {n}");
+        }
         "census" => {
             let mut text = String::new();
             let mut nu = None;
@@ -291,6 +331,58 @@ fn main() {
                 drop(p);
                 return;
             }
+            if std::env::var_os("LEAN_BALANCE").is_some() {
+                // The cone's bus natively, leaf by leaf as the tower deals
+                // it: the net count of every tuple, which must be zero.
+                let mut net: HashMap<[u8; 16], (i64, usize, bool)> = HashMap::new();
+                let mut side_c: Option<(usize, LeanCircuit)> = None;
+                for &(side, l) in &index {
+                    if l == usize::MAX {
+                        continue;
+                    }
+                    if side_c.as_ref().is_none_or(|(s, _)| *s != side) {
+                        side_c = None;
+                        side_c = Some((side, build(side, n, &out)));
+                        eprintln!("side {side} ({:.0} s, {} tuples)", t0.elapsed().as_secs_f64(), net.len());
+                    }
+                    let c = &side_c.as_ref().unwrap().1;
+                    let leaves = side_leaves(&profile, &census[side]);
+                    let mut pt = per_table(c, n_tables);
+                    pt.resize(n_tables, Vec::new());
+                    let slots = profile.deal(&pt, leaves).swap_remove(l);
+                    for (k, x) in slots.iter().enumerate() {
+                        if let Some(ch) = *x {
+                            c.for_each_tuple(profile.slots[k], ch, |s, send, t, m| {
+                                if m == 0 {
+                                    return;
+                                }
+                                let mut h = blake3::Hasher::new();
+                                for v in t {
+                                    h.update(&v.lo.to_le_bytes());
+                                    h.update(&v.hi.to_le_bytes());
+                                }
+                                let key: [u8; 16] = h.finalize().as_bytes()[..16].try_into().unwrap();
+                                let e = net.entry(key).or_insert((0, s, send));
+                                e.0 += if send { m as i64 } else { -(m as i64) };
+                            });
+                        }
+                    }
+                }
+                let bad: Vec<_> = net.values().filter(|e| e.0 != 0).collect();
+                println!("{} tuples, {} unbalanced", net.len(), bad.len());
+                let mut by: HashMap<(usize, bool), (usize, i64)> = HashMap::new();
+                for e in &bad {
+                    let b = by.entry((e.1, e.2)).or_default();
+                    b.0 += 1;
+                    b.1 += e.0;
+                }
+                let mut by: Vec<_> = by.into_iter().collect();
+                by.sort();
+                for ((s, send), (k, sum)) in by {
+                    println!("  first seen in table {s} ({}): {k} tuples, net {sum}", if send { "send" } else { "recv" });
+                }
+                return;
+            }
             if a[0] == "sizes" {
                 let (side, l) = index[index.len() / 2];
                 let c = build(side, n, &out);
@@ -367,21 +459,31 @@ fn main() {
 
             // ---- SECOND PASS: the tower, from the last leaf back ----
             drop(side_c);
+            let mut pending: Option<(usize, flock_prover::lean_rows::Piece)> = None;
             let t1 = Instant::now();
             let r = prove_lean_tower_streaming(
                 TowerConfig::Chain128,
                 &words,
                 |i| {
-                    // A side's circuit is large: build it, take leaf i, and
-                    // drop it before the leaf proves. (Keeping leaf i - 1's
-                    // piece for the next call ran out of memory at 15 GB.)
+                    // A side's circuit is large (7.6 GB at the peak to build
+                    // the shared side): build it with nothing proven held
+                    // (the pool cleared), take leaf i and, when of the same
+                    // side, leaf i - 1 (asked next: its piece is 0.8 GB),
+                    // drop it and hand its pages back before a leaf proves.
+                    if let Some((j, p)) = pending.take() {
+                        if j == i {
+                            return p;
+                        }
+                    }
                     let (side, l) = index[i];
-                    // The prover's pooled buffers would sit under the side
-                    // build (5.3 GB at the peak for the largest side).
                     flock_core::scratch::clear();
                     let c = build(side, n, &out);
                     let p = piece_of(&c, l, &census[side]);
+                    if i % 2 == 1 && index[i - 1].0 == side {
+                        pending = Some((i - 1, piece_of(&c, index[i - 1].1, &census[side])));
+                    }
                     drop(c);
+                    trim();
                     p
                 },
                 env,
