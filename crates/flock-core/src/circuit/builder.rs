@@ -923,6 +923,16 @@ pub struct CircuitShape {
 }
 
 impl CircuitShape {
+    /// Drop the gate program (the steps and the input roots): what only the
+    /// online phase reads. The circuit, registry and counts stay, which is
+    /// all a verifier of this shape's proofs needs; [`Self::run`] panics
+    /// afterwards. A recursion tower holding a proven child keeps hundreds
+    /// of MB less this way.
+    pub fn drop_program(&mut self) {
+        self.steps = Vec::new();
+        self.inputs = Vec::new();
+    }
+
     /// Approximate heap bytes per field, for memory diagnostics.
     pub fn heap_report(&self) -> Vec<(&'static str, usize)> {
         let mut r = self.circuit.heap_report();

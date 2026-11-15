@@ -237,7 +237,11 @@ fn main() {
             if a[0] == "probe" {
                 // Four leaves from the middle of the cone: the envelope's fit
                 // and the per-proof costs, before a full run.
-                let at = index.len() / 2 & !1;
+                let at = std::env::var("LEAN_PROBE_AT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(index.len() / 2)
+                    & !1;
                 index = index[at..at + 4].to_vec();
             }
             println!(
@@ -274,6 +278,17 @@ fn main() {
                     }
                 }
                 println!("{} vs {} tables", cx.len(), cy.len());
+                return;
+            }
+            if let Ok(i) = std::env::var("LEAN_SIDE_OF") {
+                let (side, l) = index[i.parse::<usize>().unwrap()];
+                println!("leaf {i} is ({side}, {l}); side counts {:?}", census[side]);
+                let c = build(side, n, &out);
+                println!("side built ({})", rss());
+                let p = piece_of(&c, l, &census[side]);
+                drop(c);
+                println!("piece built ({})", rss());
+                drop(p);
                 return;
             }
             if a[0] == "sizes" {
@@ -315,24 +330,33 @@ fn main() {
                 return;
             }
 
-            // ---- FIRST PASS: every leaf's word ----
-            let mut words = Vec::with_capacity(index.len());
+            // ---- FIRST PASS: every leaf's word, kept on disk: a run that
+            // fails later restarts at the tower (the tower checks every word
+            // against its leaf, so a stale file fails loudly) ----
+            let words_file = format!("{out}/words-{}-{slots}-{}.bin", a[0], index.len());
+            let mut words: Vec<[u8; 32]> = fs::read(&words_file)
+                .map(|b| b.chunks_exact(32).map(|c| c.try_into().unwrap()).collect())
+                .unwrap_or_default();
             let mut side_c: Option<(usize, LeanCircuit)> = None;
-            for &(side, l) in &index {
-                if side_c.as_ref().is_none_or(|(s, _)| *s != side) {
-                    side_c = None;
-                    side_c = Some((side, build(side, n, &out)));
+            if words.len() != index.len() {
+                words.clear();
+                for &(side, l) in &index {
+                    if side_c.as_ref().is_none_or(|(s, _)| *s != side) {
+                        side_c = None;
+                        side_c = Some((side, build(side, n, &out)));
+                    }
+                    let c = &side_c.as_ref().unwrap().1;
+                    assert_eq!(c.nu, nu, "the census's nu");
+                    let p = piece_of(c, l, &census[side]);
+                    if std::env::var_os("LEAN_DIGESTS").is_some() {
+                        println!(
+                            "leaf ({side}, {l}): circuit blake3:{:02x?}",
+                            &p.digest()[..6]
+                        );
+                    }
+                    words.push(leaf_word(&p));
                 }
-                let c = &side_c.as_ref().unwrap().1;
-                assert_eq!(c.nu, nu, "the census's nu");
-                let p = piece_of(c, l, &census[side]);
-                if std::env::var_os("LEAN_DIGESTS").is_some() {
-                    println!(
-                        "leaf ({side}, {l}): circuit blake3:{:02x?}",
-                        &p.digest()[..6]
-                    );
-                }
-                words.push(leaf_word(&p));
+                fs::write(&words_file, words.concat()).unwrap();
             }
             println!(
                 "first pass: {} leaves committed ({:.0} s, {})",
@@ -343,26 +367,21 @@ fn main() {
 
             // ---- SECOND PASS: the tower, from the last leaf back ----
             drop(side_c);
-            let mut pending: Option<(usize, flock_prover::lean_rows::Piece)> = None;
             let t1 = Instant::now();
             let r = prove_lean_tower_streaming(
                 TowerConfig::Chain128,
                 &words,
                 |i| {
-                    // A side's circuit is large: build it, take leaf i and,
-                    // when it is of the same side, leaf i - 1 (asked next),
-                    // and drop it before the leaves prove.
-                    if let Some((j, p)) = pending.take() {
-                        if j == i {
-                            return p;
-                        }
-                    }
+                    // A side's circuit is large: build it, take leaf i, and
+                    // drop it before the leaf proves. (Keeping leaf i - 1's
+                    // piece for the next call ran out of memory at 15 GB.)
                     let (side, l) = index[i];
+                    // The prover's pooled buffers would sit under the side
+                    // build (5.3 GB at the peak for the largest side).
+                    flock_core::scratch::clear();
                     let c = build(side, n, &out);
                     let p = piece_of(&c, l, &census[side]);
-                    if i >= 2 && index[i - 1].0 == side {
-                        pending = Some((i - 1, piece_of(&c, index[i - 1].1, &census[side])));
-                    }
+                    drop(c);
                     p
                 },
                 env,

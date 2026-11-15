@@ -121,8 +121,10 @@ pub(super) fn build_lean_leaf(
     drop(union);
     let _: Option<F128> = None;
     // The proof is made: keep the statement, drop the slot witnesses.
+    let mut shape = built.shape;
+    shape.drop_program();
     let built = flock_core::circuit::builder::BuiltCircuit {
-        shape: built.shape,
+        shape,
         witness: built.witness.public_only(),
     };
     MixedInner {

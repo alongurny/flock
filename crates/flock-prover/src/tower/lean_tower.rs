@@ -102,7 +102,7 @@ pub fn prove_lean_tower_streaming(
     let pool_gb: usize = std::env::var("LEAN_POOL_GB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(1);
     flock_core::scratch::set_byte_budget(Some(pool_gb << 30));
 
     // ---- THE STATEMENT: the commitment root, and its challenges ----
@@ -186,6 +186,8 @@ pub fn prove_lean_tower_streaming(
             &FlApp::LeanBus { seed },
         );
         drop((l0, l1));
+        let mut f = f;
+        f.lo.shape.drop_program();
         release_pool();
         progress(&format!(
             "first-level node {j}: prove {:.0} ms",
@@ -256,6 +258,8 @@ pub fn prove_lean_tower_streaming(
                 }),
             );
             release_pool();
+            let mut nd = nd;
+            nd.lo.shape.drop_program();
             node_prove_ms += nd.online.prove_ms;
             progress(&format!(
                 "spine node {i}: prove {:.0} ms",
