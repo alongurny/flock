@@ -178,6 +178,9 @@ const F_INST: u64 = 4;
 const F_LINST: u64 = 5;
 const F_LINSTL: u64 = 6;
 const F_LEQ: u64 = 7;
+/// `LLe(l, m)`: l is at most m for every assignment of the parameters.
+/// These rows are not in the derivation: [`certify`] adds them.
+const F_LLE: u64 = 8;
 
 // ---------------------------------------------------------------- the data
 
@@ -563,6 +566,7 @@ impl Rows {
                 _ => {}
             }
         }
+        certify(&mut terms, &mut facts);
         // Constants name declarations by their canonical number: by row.
         for t in &mut terms {
             if t.kind == K_LEAF && t.x[0].f == int(SUB_CONST) {
@@ -695,6 +699,162 @@ impl Rows {
 
 fn facts_rank(f: &[FactRec], p: usize) -> i64 {
     f[p].rank
+}
+
+/// Adds the level comparisons the universe rules need, which the
+/// derivation leaves to its checker: a pi's universe is Lean's
+/// simplification of `imax u v`, and two levels are equivalent by a
+/// decision procedure. For each, rows `LLe(l, m)` built from a few sound
+/// rules are added as premises, and the row is renamed to the rule that
+/// uses them. A row for which they do not suffice keeps its name (and is
+/// assumed).
+fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
+    struct Cx<'a> {
+        terms: &'a [TermRec],
+        base: usize,
+        new: Vec<FactRec>,
+        memo: HashMap<(usize, usize), Option<usize>>,
+    }
+    impl Cx<'_> {
+        fn add(&mut self, rule: &str, l: usize, m: usize, premises: Vec<usize>) -> Option<usize> {
+            self.new.push(FactRec {
+                rule: rule.into(),
+                tag: F_LLE,
+                raw: [l as u64, m as u64, 0, 0],
+                is_term: [true, true, false, false],
+                premises,
+                rank: 0,
+                owner: 0,
+            });
+            Some(self.base + self.new.len() - 1)
+        }
+        fn le(&mut self, l: usize, m: usize) -> Option<usize> {
+            if let Some(&r) = self.memo.get(&(l, m)) {
+                return r;
+            }
+            let r = self.le_new(l, m);
+            self.memo.insert((l, m), r);
+            r
+        }
+        fn le_new(&mut self, l: usize, m: usize) -> Option<usize> {
+            let (tl, tm) = (&self.terms[l], &self.terms[m]);
+            let (lk, mk) = (tl.kind, tm.kind);
+            let (lc, mc) = (tl.child, tm.child);
+            if l == m {
+                return self.add("LLeRefl", l, m, vec![]);
+            }
+            if lk == K_LLEAF && tl.x[0].f == F128::ZERO {
+                return self.add("LLeZero", l, m, vec![]);
+            }
+            // A maximum on the left: both parts.
+            if matches!(lk, K_LMAX | K_LIMAX) {
+                if let (Some(a), Some(b)) = (self.le(lc[0].unwrap(), m), self.le(lc[1].unwrap(), m)) {
+                    return self.add(if lk == K_LMAX { "LLeMaxL" } else { "LLeIMaxL" }, l, m, vec![a, b]);
+                }
+            }
+            match mk {
+                K_LSUCC => {
+                    if lk == K_LSUCC {
+                        if let Some(p) = self.le(lc[0].unwrap(), mc[0].unwrap()) {
+                            return self.add("LLeSuccSucc", l, m, vec![p]);
+                        }
+                    }
+                    let p = self.le(l, mc[0].unwrap())?;
+                    self.add("LLeSucc", l, m, vec![p])
+                }
+                K_LMAX => {
+                    if let Some(p) = self.le(l, mc[0].unwrap()) {
+                        return self.add("LLeMaxR0", l, m, vec![p]);
+                    }
+                    let p = self.le(l, mc[1].unwrap())?;
+                    self.add("LLeMaxR1", l, m, vec![p])
+                }
+                K_LIMAX => {
+                    let p = self.le(l, mc[1].unwrap())?;
+                    self.add("LLeIMaxR", l, m, vec![p])
+                }
+                _ => None,
+            }
+        }
+    }
+    // Zero and one, as rows.
+    let mut find = |terms: &mut Vec<TermRec>, kind: u64, child: Option<usize>| -> usize {
+        let hit = terms.iter().position(|t| t.kind == kind && t.child[0] == child && t.x[0].f == F128::ZERO);
+        hit.unwrap_or_else(|| {
+            terms.push(TermRec {
+                kind,
+                x: [V::default(); 3],
+                child: [child, None, None],
+                lbr: 0,
+                rank: child.is_some() as i64,
+                fv: 0,
+                lp: false,
+            });
+            terms.len() - 1
+        })
+    };
+    if !facts.iter().any(|f| matches!(f.rule.as_str(), "Pi" | "LEqNorm")) {
+        return;
+    }
+    let zero = find(terms, K_LLEAF, None);
+    let one = find(terms, K_LSUCC, Some(zero));
+    let base = facts.len();
+    let mut cx = Cx {
+        terms,
+        base,
+        new: Vec::new(),
+        memo: HashMap::new(),
+    };
+    let sort = |terms: &[TermRec], t: u64| -> Option<usize> {
+        let t = &terms[t as usize];
+        (t.kind == K_LEAF && t.x[0].f.lo == SUB_SORT).then(|| t.child[1].unwrap())
+    };
+    for i in 0..base {
+        let f = &facts[i];
+        if f.rule == "LEqNorm" && f.tag == F_LEQ {
+            let (l, m) = (f.raw[0] as usize, f.raw[1] as usize);
+            if let (Some(a), Some(b)) = (cx.le(l, m), cx.le(m, l)) {
+                facts[i].rule = "LEqLe".into();
+                facts[i].premises = vec![a, b];
+            }
+            continue;
+        }
+        if f.rule != "Pi" || f.premises.len() != 5 {
+            continue;
+        }
+        let (su, sv) = (facts[f.premises[1]].raw[2], facts[f.premises[4]].raw[2]);
+        let (Some(u), Some(v), Some(w)) = (sort(cx.terms, su), sort(cx.terms, sv), sort(cx.terms, f.raw[2])) else {
+            continue;
+        };
+        // imax u v is: zero when v is; v when u ≤ v; max u v when 1 ≤ v,
+        // which is u when also v ≤ u.
+        let tw = &cx.terms[w];
+        let is = |kind: u64| tw.kind == kind && tw.child[0] == Some(u) && tw.child[1] == Some(v);
+        let (is_max, is_imax) = (is(K_LMAX), is(K_LIMAX));
+        let v_zero = cx.terms[v].kind == K_LLEAF && cx.terms[v].x[0].f == F128::ZERO;
+        let (rule, more) = if w == v && v_zero {
+            ("PiZero", vec![])
+        } else if is_imax {
+            ("PiIMax", vec![])
+        } else if let Some(p) = (w == v).then(|| cx.le(u, v)).flatten() {
+            ("PiV", vec![p])
+        } else if let Some(p) = is_max.then(|| cx.le(one, v)).flatten() {
+            ("PiMax", vec![p])
+        } else if let Some((p, q)) = (w == u).then(|| cx.le(v, u).zip(cx.le(one, v))).flatten() {
+            ("PiU", vec![p, q])
+        } else {
+            continue;
+        };
+        facts[i].rule = rule.into();
+        facts[i].premises.extend(more);
+    }
+    let new = std::mem::take(&mut cx.new);
+    facts.extend(new);
+    // Ranks again: the added rows first (their premises are added rows
+    // before them), then the derivation's in order.
+    for i in (base..facts.len()).chain(0..base) {
+        facts[i].rank = facts[i].premises.iter().map(|&p| facts[p].rank + 1).max().unwrap_or(0);
+    }
 }
 
 // ------------------------------------------------------------ the tables
@@ -1754,6 +1914,131 @@ fn fact_spec(rule: &str) -> Spec {
             s.prem(5, F_INFER, [c(g), c(b2), c(t), Some(Z)], r);
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
+        "LLeRefl" | "LLeZero" | "LLeSucc" | "LLeSuccSucc" | "LLeMaxR0" | "LLeMaxR1" | "LLeIMaxR" | "LLeMaxL"
+        | "LLeIMaxL" => {
+            // l ≤ m for every assignment of the parameters.
+            let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
+            let le = |s: &mut Spec, j: usize, a: usize, b: usize| {
+                s.prem(j, F_LLE, [c(a), c(b), Some(Z), Some(Z)], r);
+            };
+            let part = |s: &mut Spec, x: usize, i: usize| s.val(E::Tm(ch(f(x), i), Part::Id));
+            match rule {
+                "LLeRefl" => {}
+                "LLeZero" => {
+                    s.level(l, f(0), Some(k(K_LLEAF)), Some(Z), Some(Z));
+                }
+                // l ≤ m' gives l ≤ succ m'; l' ≤ m' gives succ l' ≤ succ m'.
+                "LLeSucc" | "LLeSuccSucc" => {
+                    let m1 = part(&mut s, 1, 0);
+                    s.level(m, f(1), Some(k(K_LSUCC)), c(m1), Some(Z));
+                    let l1 = if rule == "LLeSucc" {
+                        l
+                    } else {
+                        let l1 = part(&mut s, 0, 0);
+                        s.level(l, f(0), Some(k(K_LSUCC)), c(l1), Some(Z));
+                        l1
+                    };
+                    le(&mut s, 0, l1, m1);
+                }
+                // At most one side of a maximum; at most the second of an
+                // impredicative one (imax a b ≥ b).
+                "LLeMaxR0" | "LLeMaxR1" | "LLeIMaxR" => {
+                    let (a, b) = (part(&mut s, 1, 0), part(&mut s, 1, 1));
+                    let kind = if rule == "LLeIMaxR" { K_LIMAX } else { K_LMAX };
+                    s.level(m, f(1), Some(k(kind)), c(a), c(b));
+                    le(&mut s, 0, l, if rule == "LLeMaxR0" { a } else { b });
+                }
+                // Both sides at most m (imax a b ≤ max a b).
+                _ => {
+                    let (a, b) = (part(&mut s, 0, 0), part(&mut s, 0, 1));
+                    let kind = if rule == "LLeIMaxL" { K_LIMAX } else { K_LMAX };
+                    s.level(l, f(0), Some(k(kind)), c(a), c(b));
+                    le(&mut s, 0, a, m);
+                    le(&mut s, 1, b, m);
+                }
+            }
+            send(&mut s, F_LLE, [tc(l), tc(m), Z, Z]);
+        }
+        "LEqLe" => {
+            let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
+            s.prem(0, F_LLE, [c(l), c(m), Some(Z), Some(Z)], r);
+            s.prem(1, F_LLE, [c(m), c(l), Some(Z), Some(Z)], r);
+            send(&mut s, F_LEQ, [tc(l), tc(m), Z, Z]);
+        }
+        "PiZero" | "PiIMax" | "PiV" | "PiMax" | "PiU" => {
+            // pi A B : sort w, from A : sort u and, with a fresh variable
+            // for the binder, B : sort v. w is imax u v, in the form the
+            // rule's name says.
+            let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (a, b) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+            );
+            s.term(e, f(1), k(K_PI), [c(a), c(b), Some(Z)], None);
+            let (gp_, ga, ng) = (
+                s.val(E::Tm(f(0), Part::X(0))),
+                s.val(E::Tm(f(0), Part::X(1))),
+                s.val(E::Tm(f(0), Part::X(2))),
+            );
+            s.recv([k(TAG_CTX), tc(g), tc(gp_), tc(ga), tc(ng)]);
+            let var = s.val(E::Prem(2, Part::X(2)));
+            s.term(var, TR::PFld(2, 2), k(K_FVAR), [c(ng), Some(Z), Some(Z)], None);
+            let ext = s.val(E::Prem(3, Part::X(0)));
+            let ng1 = s.out(Col::Lin(G, ng));
+            s.recv([k(TAG_CTX), tc(ext), tc(g), tc(a), tc(ng1)]);
+            // The body does not mention the variable already.
+            s.term(b, ch(f(1), 1), T::Id, [None; 3], None);
+            let fc = s.last_f;
+            s.ge(ng, E::Tm(f(0), Part::X(2)), fc, E::Tm(ch(f(1), 1), Part::F), 0);
+            let sa = s.val(E::Prem(0, Part::X(2)));
+            let su = s.val(E::Prem(1, Part::X(2)));
+            let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
+            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(u), Some(Z)], None);
+            let bo = s.val(E::Prem(2, Part::X(3)));
+            let sb = s.val(E::Prem(3, Part::X(2)));
+            let sv = s.val(E::Prem(4, Part::X(2)));
+            let v = s.val(E::Tm(TR::PFld(4, 2), Part::X(1)));
+            s.term(sv, TR::PFld(4, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(v), Some(Z)], None);
+            s.prem(0, F_INFER, [c(g), c(a), c(sa), Some(Z)], r);
+            s.prem(1, F_EQ, [c(g), c(sa), c(su), Some(Z)], r);
+            s.prem(2, F_INST, [c(b), Some(one), c(var), c(bo)], r);
+            s.prem(3, F_INFER, [c(ext), c(bo), c(sb), Some(Z)], r);
+            s.prem(4, F_EQ, [c(ext), c(sb), c(sv), Some(Z)], r);
+            // 1 ≤ v, as premise j: its left side is succ zero.
+            let positive = |s: &mut Spec, j: usize| {
+                let one_ = s.val(E::Prem(j, Part::X(0)));
+                let zero = s.val(E::Tm(ch(TR::PFld(j, 0), 0), Part::Id));
+                s.level(one_, TR::PFld(j, 0), Some(k(K_LSUCC)), c(zero), Some(Z));
+                s.level(zero, ch(TR::PFld(j, 0), 0), Some(k(K_LLEAF)), Some(Z), Some(Z));
+                s.prem(j, F_LLE, [c(one_), c(v), Some(Z), Some(Z)], r);
+            };
+            let w = match rule {
+                "PiZero" => {
+                    s.level(v, ch(TR::PFld(4, 2), 1), Some(k(K_LLEAF)), Some(Z), Some(Z));
+                    v
+                }
+                "PiV" => {
+                    s.prem(5, F_LLE, [c(u), c(v), Some(Z), Some(Z)], r);
+                    v
+                }
+                "PiU" => {
+                    s.prem(5, F_LLE, [c(v), c(u), Some(Z), Some(Z)], r);
+                    positive(&mut s, 6);
+                    u
+                }
+                _ => {
+                    let w = s.val(E::Tm(f(2), Part::X(1)));
+                    let kind = if rule == "PiMax" { K_LMAX } else { K_LIMAX };
+                    s.level(w, ch(f(2), 1), Some(k(kind)), c(u), c(v));
+                    if rule == "PiMax" {
+                        positive(&mut s, 5);
+                    }
+                    w
+                }
+            };
+            s.term(t, f(2), k(K_LEAF), [Some(k(SUB_SORT)), c(w), Some(Z)], None);
+            send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
+        }
         "Sort" => {
             // sort l : sort (succ l).
             let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
@@ -1932,6 +2217,21 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "CongPi" => "CongPi",
         "Let" => "Let",
         "Sort" => "Sort",
+        "LLeRefl" => "LLeRefl",
+        "LLeZero" => "LLeZero",
+        "LLeSucc" => "LLeSucc",
+        "LLeSuccSucc" => "LLeSuccSucc",
+        "LLeMaxR0" => "LLeMaxR0",
+        "LLeMaxR1" => "LLeMaxR1",
+        "LLeIMaxR" => "LLeIMaxR",
+        "LLeMaxL" => "LLeMaxL",
+        "LLeIMaxL" => "LLeIMaxL",
+        "LEqLe" => "LEqLe",
+        "PiZero" => "PiZero",
+        "PiIMax" => "PiIMax",
+        "PiV" => "PiV",
+        "PiMax" => "PiMax",
+        "PiU" => "PiU",
         "LInstNone" => "LInstNone",
         "CongSort" => "CongSort",
         "LInstSort" => "LInstSort",
@@ -1962,7 +2262,7 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 49] = [
+const FACT_TABLES: [&str; 64] = [
     "Const0",
     "ConstL",
     "Refl",
@@ -2011,6 +2311,21 @@ const FACT_TABLES: [&str; 49] = [
     "LInstConst1",
     "LInstConst2",
     "LInstConst3",
+    "LLeRefl",
+    "LLeZero",
+    "LLeSucc",
+    "LLeSuccSucc",
+    "LLeMaxR0",
+    "LLeMaxR1",
+    "LLeIMaxR",
+    "LLeMaxL",
+    "LLeIMaxL",
+    "LEqLe",
+    "PiZero",
+    "PiIMax",
+    "PiV",
+    "PiMax",
+    "PiU",
     "Assumed",
 ];
 
