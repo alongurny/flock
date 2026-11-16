@@ -355,7 +355,7 @@ fn lean_first_level_node() {
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
             leaf(&c, &profile, &slots, i).unwrap()
         })
         .collect();
@@ -427,7 +427,7 @@ fn lean_internal_node() {
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
             leaf(&c, &profile, &slots, i).unwrap()
         })
         .collect();

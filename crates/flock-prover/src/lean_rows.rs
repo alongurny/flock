@@ -2162,7 +2162,28 @@ pub struct Profile {
 }
 
 /// One slot's content: a chunk `c` of table `s` of a built side.
-pub type LeafSlot<'a> = Option<(&'a LeanCircuit, usize)>;
+pub type LeafSlot<'a> = Option<SlotRows<'a>>;
+
+/// The rows of one chunk and its chunk number, from whichever side holds
+/// it (or from a copy kept elsewhere).
+#[derive(Clone, Copy)]
+pub struct SlotRows<'a> {
+    pub rows: &'a [Vec<F128>],
+    pub chunk: u64,
+    pub nu: usize,
+}
+
+impl LeanCircuit {
+    /// Chunk `ch` of table `s`, for a leaf slot.
+    pub fn slot(&self, s: usize, ch: usize) -> SlotRows<'_> {
+        let t = &self.tables[s];
+        SlotRows {
+            rows: &t[ch << self.nu..((ch + 1) << self.nu).min(t.len())],
+            chunk: (self.chunk_base[s] + ch) as u64,
+            nu: self.nu,
+        }
+    }
+}
 
 impl Profile {
     /// A profile for `leaves` leaves over chunk counts per table: table `s`
@@ -2230,15 +2251,11 @@ pub fn leaf(
     for (k, &s) in profile.slots.iter().enumerate() {
         let sp = &proto.specs[s];
         let (rows, chunk_no): (&[Vec<F128>], u64) = match slots[k] {
-            Some((c, ch)) => {
+            Some(c) => {
                 if c.nu != nu {
                     return Err(format!("a side at nu {} in a profile at nu {nu}", c.nu));
                 }
-                let t = &c.tables[s];
-                (
-                    &t[ch << nu..((ch + 1) << nu).min(t.len())],
-                    (c.chunk_base[s] + ch) as u64,
-                )
+                (c.rows, c.chunk)
             }
             None => (&[], pad_chunk(index, profile.slots.len(), k)),
         };
@@ -2247,11 +2264,25 @@ pub fn leaf(
         let mut cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
         let word_col = cols.len();
         cols.push(Col::In);
+        // One live bit for the whole row: its receives count that bit, and
+        // a counted send carries its tag times the bit, so a row that
+        // switches its premises off sends a tuple of tag 0, which nothing
+        // receives.
         let mut live_col = vec![None; sp.ports.len()];
-        for (pi, p) in sp.ports.iter().enumerate() {
-            if p.mult.is_empty() {
-                live_col[pi] = Some(cols.len());
-                cols.push(Col::In);
+        let mut tag_col = vec![None; sp.ports.len()];
+        if sp.ports.iter().any(|p| p.mult.is_empty()) {
+            let live = cols.len();
+            cols.push(Col::In);
+            for (pi, p) in sp.ports.iter().enumerate() {
+                if p.mult.is_empty() {
+                    live_col[pi] = Some(live);
+                } else if let T::K(tag) = p.t[0] {
+                    assert!(p.send, "a receive without a live bit");
+                    tag_col[pi] = Some(cols.len());
+                    cols.push(Col::Lin(tag, live));
+                } else {
+                    panic!("a counted send without a constant tag");
+                }
             }
         }
         let io = io_index(&cols);
@@ -2259,7 +2290,9 @@ pub fn leaf(
         for (pi, p) in sp.ports.iter().enumerate() {
             let terms =
                 p.t.iter()
-                    .map(|t| match *t {
+                    .enumerate()
+                    .map(|(ti, t)| match *t {
+                        T::K(_) if ti == 0 && tag_col[pi].is_some() => BusTerm::word(io[tag_col[pi].unwrap()]),
                         T::C(c) => BusTerm::word(io[c]),
                         T::K(v) => BusTerm {
                             word: None,
@@ -2316,7 +2349,7 @@ pub fn leaf(
             terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
             sb.bus_port_counted(slot, BusDirection::Send, terms, vec![io[live]]);
         }
-        let n_live = live_col.iter().flatten().count();
+        let n_live = live_col.iter().any(Option::is_some) as usize;
         let zero_row = vec![F128::ZERO; sp.cols.len()];
         for j in 0..1usize << nu {
             let (z, live) = match rows.get(j) {
@@ -2395,13 +2428,12 @@ pub fn leaf_statement(
     slots: &[LeafSlot<'_>],
     index: usize,
 ) -> (Vec<u64>, Vec<[F128; 2]>) {
-    let nu = profile.nu;
     let mut words = Vec::new();
     let mut keys = Vec::new();
     for (k, &s) in profile.slots.iter().enumerate() {
         match slots[k] {
-            Some((c, ch)) => {
-                words.push(((c.chunk_base[s] + ch) as u64) << 32);
+            Some(c) => {
+                words.push(c.chunk << 32);
                 let sp = &proto.specs[s];
                 if sp.name == "decl_checked" {
                     let pubs: Vec<usize> = sp
@@ -2411,8 +2443,7 @@ pub fn leaf_statement(
                         .filter(|(_, c)| matches!(c.1, Some(Src::Pub(_))))
                         .map(|(y, _)| y)
                         .collect();
-                    let t = &c.tables[s];
-                    for z in &t[ch << nu..((ch + 1) << nu).min(t.len())] {
+                    for z in c.rows {
                         keys.push([z[pubs[0]], z[pubs[1]]]);
                     }
                 }
@@ -2905,7 +2936,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+                let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
                 leaf(&c, &profile, &slots, i).unwrap()
             })
             .collect();
@@ -2927,7 +2958,7 @@ mod tests {
         }
         let (mut words, mut keys) = (Vec::new(), Vec::new());
         for (i, d) in dealt.iter().enumerate() {
-            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
             let (w, k) = leaf_statement(&c, &profile, &slots, i);
             words.extend(w);
             keys.extend(k);
@@ -2971,7 +3002,7 @@ mod tests {
         let leaves: Vec<Piece> = dealt
             .iter()
             .map(|d| {
-                let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+                let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
                 leaf(&c, &profile, &slots, 0).unwrap()
             })
             .collect();
@@ -2985,7 +3016,7 @@ mod tests {
             .collect();
         let (mut words, mut keys) = (Vec::new(), Vec::new());
         for d in &dealt {
-            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
             let (w, k) = leaf_statement(&c, &profile, &slots, 0);
             words.extend(w);
             keys.extend(k);

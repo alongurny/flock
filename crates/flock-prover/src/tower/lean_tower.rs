@@ -477,7 +477,7 @@ fn lean_tower_spine() {
     let deal = profile.deal(&per_table, 8);
     let mut st = LeanStatement::default();
     for (i, d) in deal.iter().enumerate() {
-        let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+        let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
         let (w, k) = leaf_statement(&c, &profile, &slots, i);
         st.chunk_words.extend(w);
         st.keys.extend(k);
@@ -486,7 +486,7 @@ fn lean_tower_spine() {
         super::test_config(),
         8,
         |i| {
-            let slots: Vec<LeafSlot<'_>> = deal[i].iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = deal[i].iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
             leaf(&c, &profile, &slots, i).unwrap()
         },
         &st,
@@ -503,7 +503,7 @@ fn lean_tower_spine() {
     // own: together they balance, and not with a claim changed or the
     // challenges of another root.
     let mut piece = |i: usize| {
-        let slots: Vec<LeafSlot<'_>> = deal[i].iter().map(|x| x.map(|ch| (&c, ch))).collect();
+        let slots: Vec<LeafSlot<'_>> = deal[i].iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
         leaf(&c, &profile, &slots, i).unwrap()
     };
     let words: Vec<[u8; 32]> = (0..8).map(|i| leaf_word(&piece(i))).collect();

@@ -20,7 +20,7 @@ use std::{collections::HashMap, fs, path::Path, time::Instant};
 use flock_field::F128;
 
 use flock_prover::{
-    lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, Tuple, leaf, leaf_statement},
+    lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, SlotRows, Tuple, leaf, leaf_statement},
     tower::{
         LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root, lean_segments_root,
         prove_lean_segment, prove_lean_tower_streaming, segments_balanced,
@@ -56,6 +56,129 @@ fn build(side: usize, n: usize, out: &str) -> LeanCircuit {
         let (c, _) = LeanCircuit::build_side(&g, &b, Side::Batch, batch_base(k), &HashMap::new())
             .unwrap_or_else(|e| panic!("batch {k}: {e}"));
         c
+    }
+}
+
+/// Where a shared chunk's rows are kept (`lean_tower shared` writes them).
+fn chunk_file(out: &str, s: usize, ch: usize) -> String {
+    format!("{out}/shared/{s}-{ch}.bin")
+}
+
+/// A chunk's number and rows: three u64 (chunk, rows, columns), then the
+/// cells as two u64 each, row by row.
+fn write_chunk(path: &str, chunk: u64, rows: &[Vec<F128>]) {
+    let cols = rows.first().map_or(0, Vec::len);
+    let mut b: Vec<u8> = Vec::with_capacity(24 + rows.len() * cols * 16);
+    for v in [chunk, rows.len() as u64, cols as u64] {
+        b.extend(v.to_le_bytes());
+    }
+    for r in rows {
+        for x in r {
+            b.extend(x.lo.to_le_bytes());
+            b.extend(x.hi.to_le_bytes());
+        }
+    }
+    fs::write(path, b).unwrap_or_else(|e| panic!("{path}: {e}"));
+}
+
+fn read_chunk(path: &str) -> (u64, Vec<Vec<F128>>) {
+    let b = fs::read(path).unwrap_or_else(|e| panic!("{path}: {e} (run `lean_tower shared` first)"));
+    let u = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+    let (chunk, n, cols) = (u(0), u(1) as usize, u(2) as usize);
+    let rows = (0..n)
+        .map(|r| (0..cols).map(|c| F128::new(u(3 + 2 * (r * cols + c)), u(4 + 2 * (r * cols + c)))).collect())
+        .collect();
+    (chunk, rows)
+}
+
+/// What the leaves are made from: the shared side's chunks from disk, and
+/// the batches' chunks, copied out of a batch built when a leaf needs it
+/// (with those of the leaves around it, so a batch is built once per
+/// stretch of leaves, and never held while a leaf proves).
+struct Sources {
+    out: String,
+    g: Rows,
+    proto: LeanCircuit,
+    chunks: HashMap<(usize, usize, usize), (u64, Vec<Vec<F128>>)>,
+    around: usize,
+}
+
+type Plan = [Vec<Option<(usize, usize)>>];
+
+impl Sources {
+    fn new(out: &str) -> Sources {
+        let g: Rows = read(format!("{out}/cone.bin"));
+        let (proto, _) = LeanCircuit::build_side(&g, &Rows::default(), Side::Batch, batch_base(0), &HashMap::new())
+            .unwrap_or_else(|e| panic!("an empty batch: {e}"));
+        let around = std::env::var("LEAN_AROUND").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        Sources { out: out.into(), g, proto, chunks: HashMap::new(), around }
+    }
+
+    fn keys(profile: &Profile, slots: &[Option<(usize, usize)>]) -> impl Iterator<Item = (usize, usize, usize)> {
+        slots.iter().zip(&profile.slots).filter_map(|(x, &s)| x.map(|(side, ch)| (side, s, ch)))
+    }
+
+    /// Makes leaf i's chunks present; keeps only those of the leaves within
+    /// `around` of it.
+    fn load(&mut self, profile: &Profile, plan: &Plan, i: usize) {
+        let (lo, hi) = (i.saturating_sub(self.around), (i + self.around + 1).min(plan.len()));
+        let near: std::collections::HashSet<(usize, usize, usize)> = (lo..hi)
+            .flat_map(|j| Self::keys(profile, &plan[j]))
+            .filter(|k| k.0 > 0)
+            .chain(Self::keys(profile, &plan[i]).filter(|k| k.0 == 0))
+            .collect();
+        self.chunks.retain(|k, _| near.contains(k));
+        let mut sides: Vec<usize> =
+            Self::keys(profile, &plan[i]).filter(|k| !self.chunks.contains_key(k)).map(|k| k.0).collect();
+        sides.sort_unstable();
+        sides.dedup();
+        for side in sides {
+            if side == 0 {
+                for k in Self::keys(profile, &plan[i]).filter(|k| k.0 == 0) {
+                    let c = read_chunk(&chunk_file(&self.out, k.1, k.2));
+                    self.chunks.insert(k, c);
+                }
+                continue;
+            }
+            let k = side - 1;
+            let b: Rows = read(format!("{}/b{k}.bin", self.out));
+            let (c, _) = LeanCircuit::build_side(&self.g, &b, Side::Batch, batch_base(k), &HashMap::new())
+                .unwrap_or_else(|e| panic!("batch {k}: {e}"));
+            assert_eq!(c.nu, profile.nu, "the census's nu");
+            for key in near.iter().filter(|x| x.0 == side) {
+                if !self.chunks.contains_key(key) {
+                    let x = c.slot(key.1, key.2);
+                    self.chunks.insert(*key, (x.chunk, x.rows.to_vec()));
+                }
+            }
+        }
+    }
+
+    /// Drops the shared chunks (read again from disk when asked).
+    fn rest(&mut self) {
+        self.chunks.retain(|k, _| k.0 > 0);
+    }
+
+    fn slots<'a>(&'a self, profile: &Profile, slots: &[Option<(usize, usize)>]) -> Vec<LeafSlot<'a>> {
+        let nu = profile.nu;
+        slots
+            .iter()
+            .zip(&profile.slots)
+            .map(|(x, &s)| {
+                x.map(|(side, ch)| {
+                    let (chunk, rows) = &self.chunks[&(side, s, ch)];
+                    SlotRows { rows, chunk: *chunk, nu }
+                })
+            })
+            .collect()
+    }
+
+    fn piece(&self, profile: &Profile, slots: &[Option<(usize, usize)>], i: usize) -> flock_prover::lean_rows::Piece {
+        leaf(&self.proto, profile, &self.slots(profile, slots), i).unwrap()
+    }
+
+    fn statement(&self, profile: &Profile, slots: &[Option<(usize, usize)>], i: usize) -> (Vec<u64>, Vec<[F128; 2]>) {
+        leaf_statement(&self.proto, profile, &self.slots(profile, slots), i)
     }
 }
 
@@ -270,6 +393,20 @@ fn main() {
             let bits: Vec<String> = bits.iter().map(usize::to_string).collect();
             fs::write(bits_path(&out), bits.join("\t") + "\n").unwrap();
         }
+        "shared" => {
+            // The shared side's chunks, kept on disk: every leaf holds a
+            // few, and building the side takes minutes and gigabytes.
+            flock_prover::lean_rows::set_mult_bits(Some(read_bits(&out)));
+            let c = build(0, n, &out);
+            fs::create_dir_all(format!("{out}/shared")).unwrap();
+            let mut k = 0;
+            for (s, ch, _) in c.chunks() {
+                let x = c.slot(s, ch);
+                write_chunk(&chunk_file(&out, s, ch), x.chunk, x.rows);
+                k += 1;
+            }
+            eprintln!("{k} chunks written ({:.0} s, {})", t0.elapsed().as_secs_f64(), rss());
+        }
         "run" | "probe" | "sizes" => {
             let slots = num(3);
             let env = LeanEnvelope {
@@ -284,17 +421,57 @@ fn main() {
                 r.resize(n_tables, 0);
             }
             let profile = profile(nu, &census, slots);
-            // Leaves in order, side by side: (side, leaf in side); an empty
-            // leaf pads an odd count.
-            let mut index: Vec<(usize, usize)> = Vec::new();
-            for (side, counts) in census.iter().enumerate() {
-                for l in 0..side_leaves(&profile, counts) {
-                    index.push((side, l));
+            // Every table's chunks over the whole cone, side by side: leaf
+            // l takes the next k_s of table s, so a leaf holds terms of
+            // the shared side beside the judgements of a few batches.
+            // The batches come in order and a leaf takes chunks from at
+            // most `window` of them at once (a batch is built to read its
+            // chunks), so a table whose chunks run out leaves its slots
+            // empty until the oldest batch is used up. The shared side's
+            // chunks fill their own slots at an even rate.
+            let window = std::env::var("LEAN_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
+            let k_of: Vec<usize> =
+                (0..n_tables).map(|s| profile.slots.iter().filter(|&&x| x == s).count()).collect();
+            let mut queues: Vec<std::collections::VecDeque<(usize, usize)>> =
+                vec![std::collections::VecDeque::new(); n_tables];
+            for (s, &c) in census[0].iter().enumerate() {
+                queues[s].extend((0..c).map(|ch| (0, ch)));
+            }
+            let mut next = 1;
+            let mut plan: Vec<Vec<Option<(usize, usize)>>> = Vec::new();
+            loop {
+                // Bring batches in while some table is short and the window allows.
+                loop {
+                    let oldest = queues.iter().flatten().map(|x| x.0).filter(|&x| x > 0).min().unwrap_or(next);
+                    let short = (0..n_tables).any(|s| census[1..].iter().any(|c| c[s] > 0) && queues[s].len() < k_of[s]);
+                    if next > n || !short || next - oldest >= window {
+                        break;
+                    }
+                    for (s, &c) in census[next].iter().enumerate() {
+                        queues[s].extend((0..c).map(|ch| (next, ch)));
+                    }
+                    next += 1;
                 }
+                if queues.iter().all(|q| q.is_empty()) {
+                    break;
+                }
+                let mut seen = vec![0usize; n_tables];
+                let leaf: Vec<Option<(usize, usize)>> = profile
+                    .slots
+                    .iter()
+                    .map(|&s| {
+                        seen[s] += 1;
+                        queues[s].pop_front()
+                    })
+                    .collect();
+                plan.push(leaf);
             }
-            if index.len() % 2 == 1 {
-                index.push((n, usize::MAX));
+            if plan.len() % 2 == 1 {
+                plan.push(vec![None; profile.slots.len()]);
             }
+            let n_leaves = plan.len();
+            // The cone's index of each leaf (padding words depend on it).
+            let mut index: Vec<usize> = (0..n_leaves).collect();
             if a[0] == "probe" {
                 // Four leaves from the middle of the cone: the envelope's fit
                 // and the per-proof costs, before a full run.
@@ -304,99 +481,47 @@ fn main() {
                     .unwrap_or(index.len() / 2)
                     & !1;
                 index = index[at..at + 4].to_vec();
+                plan = plan[at..at + 4].to_vec();
             }
+            let full: usize = plan.iter().flatten().flatten().count();
             println!(
-                "profile: nu {nu}, {} slots; {} leaves over {} sides",
+                "profile: nu {nu}, {} slots; {} leaves over {} sides; {} of {} slots hold a chunk",
                 profile.slots.len(),
                 index.len(),
-                n + 1
+                n + 1,
+                full,
+                index.len() * profile.slots.len()
             );
-            let slots_of = |c: &LeanCircuit, l: usize, counts: &[usize]| -> Vec<Option<usize>> {
-                let leaves = side_leaves(&profile, counts);
-                let mut pt = per_table(c, n_tables);
-                pt.resize(n_tables, Vec::new());
-                if l == usize::MAX {
-                    vec![None; profile.slots.len()]
-                } else {
-                    profile.deal(&pt, leaves).swap_remove(l)
+            if std::env::var_os("LEAN_PLAN").is_some() {
+                for (i, p) in plan.iter().enumerate() {
+                    let mut sides: Vec<usize> = p.iter().flatten().map(|x| x.0).collect();
+                    sides.sort_unstable();
+                    sides.dedup();
+                    println!("leaf {i}: {} chunks from sides {sides:?}", p.iter().flatten().count());
                 }
-            };
-            // Leaf `i` of the cone (its padding slots' chunk words depend on i).
-            let piece_of = |c: &LeanCircuit, l: usize, counts: &[usize], i: usize| {
-                let slots = slots_of(c, l, counts);
-                let s: Vec<LeafSlot<'_>> = slots.iter().map(|x| x.map(|ch| (c, ch))).collect();
-                leaf(c, &profile, &s, i).unwrap()
-            };
-            let stmt_of = |c: &LeanCircuit, l: usize, counts: &[usize], i: usize| {
-                let slots = slots_of(c, l, counts);
-                let s: Vec<LeafSlot<'_>> = slots.iter().map(|x| x.map(|ch| (c, ch))).collect();
-                leaf_statement(c, &profile, &s, i)
-            };
-            if std::env::var_os("LEAN_SPECS").is_some() {
-                let (x, y) = (index[0].0, index[index.len() - 1].0);
-                let (cx, cy) = (
-                    build(x, n, &out).spec_texts(),
-                    build(y, n, &out).spec_texts(),
-                );
-                for (i, (p, q)) in cx.iter().zip(&cy).enumerate() {
-                    if p != q {
-                        println!(
-                            "table {i} differs between sides {x} and {y}:\n  {}\n  {}",
-                            &p[..p.len().min(600)],
-                            &q[..q.len().min(600)]
-                        );
-                    }
-                }
-                println!("{} vs {} tables", cx.len(), cy.len());
-                return;
-            }
-            if let Ok(i) = std::env::var("LEAN_SIDE_OF") {
-                let i: usize = i.parse().unwrap();
-                let (side, l) = index[i];
-                println!("leaf {i} is ({side}, {l}); side counts {:?}", census[side]);
-                let c = build(side, n, &out);
-                println!("side built ({})", rss());
-                let p = piece_of(&c, l, &census[side], i);
-                drop(c);
-                println!("piece built ({})", rss());
-                drop(p);
                 return;
             }
             if std::env::var_os("LEAN_BALANCE").is_some() {
-                // The cone's bus natively, leaf by leaf as the tower deals
-                // it: the net count of every tuple, which must be zero.
+                // The cone's bus natively, side by side: the net count of
+                // every tuple, which must be zero.
                 let mut net: HashMap<[u8; 16], (i64, usize, bool)> = HashMap::new();
-                let mut side_c: Option<(usize, LeanCircuit)> = None;
-                for &(side, l) in &index {
-                    if l == usize::MAX {
-                        continue;
-                    }
-                    if side_c.as_ref().is_none_or(|(s, _)| *s != side) {
-                        side_c = None;
-                        side_c = Some((side, build(side, n, &out)));
-                        eprintln!("side {side} ({:.0} s, {} tuples)", t0.elapsed().as_secs_f64(), net.len());
-                    }
-                    let c = &side_c.as_ref().unwrap().1;
-                    let leaves = side_leaves(&profile, &census[side]);
-                    let mut pt = per_table(c, n_tables);
-                    pt.resize(n_tables, Vec::new());
-                    let slots = profile.deal(&pt, leaves).swap_remove(l);
-                    for (k, x) in slots.iter().enumerate() {
-                        if let Some(ch) = *x {
-                            c.for_each_tuple(profile.slots[k], ch, |s, send, t, m| {
-                                if m == 0 {
-                                    return;
-                                }
-                                let mut h = blake3::Hasher::new();
-                                for v in t {
-                                    h.update(&v.lo.to_le_bytes());
-                                    h.update(&v.hi.to_le_bytes());
-                                }
-                                let key: [u8; 16] = h.finalize().as_bytes()[..16].try_into().unwrap();
-                                let e = net.entry(key).or_insert((0, s, send));
-                                e.0 += if send { m as i64 } else { -(m as i64) };
-                            });
-                        }
+                for side in 0..=n {
+                    let c = build(side, n, &out);
+                    eprintln!("side {side} ({:.0} s, {} tuples)", t0.elapsed().as_secs_f64(), net.len());
+                    for (s0, ch, _) in c.chunks() {
+                        c.for_each_tuple(s0, ch, |s, send, t, m| {
+                            if m == 0 {
+                                return;
+                            }
+                            let mut h = blake3::Hasher::new();
+                            for v in t {
+                                h.update(&v.lo.to_le_bytes());
+                                h.update(&v.hi.to_le_bytes());
+                            }
+                            let key: [u8; 16] = h.finalize().as_bytes()[..16].try_into().unwrap();
+                            let e = net.entry(key).or_insert((0, s, send));
+                            e.0 += if send { m as i64 } else { -(m as i64) };
+                        });
                     }
                 }
                 let bad: Vec<_> = net.values().filter(|e| e.0 != 0).collect();
@@ -414,12 +539,12 @@ fn main() {
                 }
                 return;
             }
+            let mut src = Sources::new(&out);
             if a[0] == "sizes" {
-                let (side, l) = index[index.len() / 2];
-                let c = build(side, n, &out);
-                println!("side built ({})", rss());
-                let p = piece_of(&c, l, &census[side], index.len() / 2);
-                drop(c);
+                let at = index.len() / 2;
+                src.load(&profile, &plan, at);
+                println!("sources loaded ({})", rss());
+                let p = src.piece(&profile, &plan[at], index[at]);
                 println!("piece built ({})", rss());
                 let sh = p.shape();
                 let cl = sh.clone();
@@ -474,28 +599,22 @@ fn main() {
                     }
                 })
                 .unwrap_or_default();
-            let mut side_c: Option<(usize, LeanCircuit)> = None;
             if words.len() != index.len() || statement.chunk_words.is_empty() {
                 words.clear();
                 statement = LeanStatement::default();
-                for (i, &(side, l)) in index.iter().enumerate() {
-                    if side_c.as_ref().is_none_or(|(s, _)| *s != side) {
-                        side_c = None;
-                        side_c = Some((side, build(side, n, &out)));
-                    }
-                    let c = &side_c.as_ref().unwrap().1;
-                    assert_eq!(c.nu, nu, "the census's nu");
-                    let p = piece_of(c, l, &census[side], i);
-                    let (w, k) = stmt_of(c, l, &census[side], i);
+                for (i, p) in plan.iter().enumerate() {
+                    src.load(&profile, &plan, i);
+                    let piece = src.piece(&profile, p, index[i]);
+                    let (w, k) = src.statement(&profile, p, index[i]);
                     statement.chunk_words.extend(w);
                     statement.keys.extend(k);
                     if std::env::var_os("LEAN_DIGESTS").is_some() {
-                        println!(
-                            "leaf ({side}, {l}): circuit blake3:{:02x?}",
-                            &p.digest()[..6]
-                        );
+                        println!("leaf {i}: circuit blake3:{:02x?}", &piece.digest()[..6]);
                     }
-                    words.push(leaf_word(&p));
+                    words.push(leaf_word(&piece));
+                    if i % 8 == 0 {
+                        eprintln!("leaf {i} committed ({:.0} s, {})", t0.elapsed().as_secs_f64(), rss());
+                    }
                 }
                 fs::write(&words_file, words.concat()).unwrap();
                 let k: Vec<[(u64, u64); 2]> = statement
@@ -519,30 +638,17 @@ fn main() {
             );
 
             // ---- SECOND PASS: the tower, from the last leaf back ----
-            drop(side_c);
-            let mut pending: Option<(usize, flock_prover::lean_rows::Piece)> = None;
             let t1 = Instant::now();
             let mut make_piece = |i: usize| {
-                    // A side's circuit is large (7.6 GB at the peak to build
-                    // the shared side): build it with nothing proven held
-                    // (the pool cleared), take leaf i and, when of the same
-                    // side, leaf i - 1 (asked next: its piece is 0.8 GB),
-                    // drop it and hand its pages back before a leaf proves.
-                    if let Some((j, p)) = pending.take() {
-                        if j == i {
-                            return p;
-                        }
-                    }
-                    let (side, l) = index[i];
-                    flock_core::scratch::clear();
-                    let c = build(side, n, &out);
-                    let p = piece_of(&c, l, &census[side], i);
-                    if i % 2 == 1 && index[i - 1].0 == side {
-                        pending = Some((i - 1, piece_of(&c, index[i - 1].1, &census[side], i - 1)));
-                    }
-                    drop(c);
-                    trim();
-                    p
+                // A leaf's sources are read with nothing proven held (the
+                // pool cleared) and their spare pages handed back before
+                // the leaf proves.
+                flock_core::scratch::clear();
+                src.load(&profile, &plan, i);
+                let p = src.piece(&profile, &plan[i], index[i]);
+                src.rest();
+                trim();
+                p
             };
             // ---- IN SEGMENTS (LEAN_SEGMENTS=S): each segment a proof of
             // its own, kept on disk, so a run that is cut off resumes at

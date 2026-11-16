@@ -312,6 +312,10 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
         // words, so the sigma and jagged entries together outgrow 96.
         env.publics += LEAN_PASS_WORDS - env.pass_words;
         env.pass_words = LEAN_PASS_WORDS;
+        // A leaf of many slots has more public words (a chunk word per
+        // slot, the range tables' values): LEAN_BODY_EXTRA widens the
+        // public body every outer pads to.
+        env.publics += std::env::var("LEAN_BODY_EXTRA").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     }
     env
 }
@@ -646,7 +650,7 @@ pub(super) fn pad_envelope_counts(
     // is.
     let body =
         env.publics - env.acc_chain_words - ENV_ACC_MAIN_WORDS - env.pass_words - ENV_APP_WORDS;
-    debug_assert_eq!(body, ENV_BODY_WORDS);
+    debug_assert!(body >= ENV_BODY_WORDS);
     let live_pub = sb.public_len();
     report.push(format!("publics {live_pub}/{body}"));
     if live_pub > body {
