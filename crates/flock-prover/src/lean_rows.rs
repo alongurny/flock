@@ -3476,7 +3476,14 @@ pub fn leaf(
 /// A padding slot's chunk number: above every real one, and distinct for
 /// every (leaf, slot) of a cone.
 pub fn pad_chunk(index: usize, slots: usize, k: usize) -> u64 {
-    PAD_CHUNK + (index * slots + k) as u64
+    // The same for leaves of different profiles: not by this leaf's slots.
+    assert!(slots <= 4096 && k < slots);
+    PAD_CHUNK + (index * 4096 + k) as u64
+}
+
+/// The index of the rare rules' table among a side's tables.
+pub fn rare_table() -> usize {
+    2 + TERM_TABLES.len() + 3 + FACT_TABLES.iter().filter(|r| **r != "Assumed" && !RARE.contains(r)).count()
 }
 
 /// What a leaf contributes to the statement: its slots' chunk words, and

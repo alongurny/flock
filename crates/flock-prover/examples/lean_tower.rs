@@ -120,10 +120,11 @@ impl Sources {
 
     /// Makes leaf i's chunks present; keeps only those of the leaves within
     /// `around` of it.
-    fn load(&mut self, profile: &Profile, plan: &Plan, i: usize) {
+    fn load(&mut self, profiles: &[Profile], plan: &Plan, i: usize) {
+        let profile = &profiles[i];
         let (lo, hi) = (i.saturating_sub(self.around), (i + self.around + 1).min(plan.len()));
         let near: std::collections::HashSet<(usize, usize, usize)> = (lo..hi)
-            .flat_map(|j| Self::keys(profile, &plan[j]))
+            .flat_map(|j| Self::keys(&profiles[j], &plan[j]))
             .filter(|k| k.0 > 0)
             .chain(Self::keys(profile, &plan[i]).filter(|k| k.0 == 0))
             .collect();
@@ -420,6 +421,18 @@ fn main() {
             for r in &mut census {
                 r.resize(n_tables, 0);
             }
+            // Leaves of the rare rules' table alone (LEAN_RARE_SLOTS=k slots
+            // each), in a segment of their own: the leaf's verifier grows
+            // with the leaf's ports, and that table has as many as all the
+            // others together.
+            let rare_k: usize = std::env::var("LEAN_RARE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let rare = flock_prover::lean_rows::rare_table();
+            let rare_census: Vec<usize> = census.iter().map(|r| r[rare]).collect();
+            if rare_k > 0 {
+                for r in &mut census {
+                    r[rare] = 0;
+                }
+            }
             let profile = profile(nu, &census, slots);
             // Every table's chunks over the whole cone, side by side: leaf
             // l takes the next k_s of table s, so a leaf holds terms of
@@ -469,6 +482,25 @@ fn main() {
             if plan.len() % 2 == 1 {
                 plan.push(vec![None; profile.slots.len()]);
             }
+            let n_common = plan.len();
+            let mut profiles: Vec<Profile> = vec![profile.clone(); n_common];
+            if rare_k > 0 {
+                let rare_profile = Profile { nu, slots: vec![rare; rare_k] };
+                let all: Vec<(usize, usize)> = rare_census
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(side, &c)| (0..c).map(move |ch| (side, ch)))
+                    .collect();
+                for part in all.chunks(rare_k) {
+                    let mut leaf: Vec<Option<(usize, usize)>> = part.iter().copied().map(Some).collect();
+                    leaf.resize(rare_k, None);
+                    plan.push(leaf);
+                }
+                while (plan.len() - n_common) % 2 == 1 || plan.len() - n_common < 4 {
+                    plan.push(vec![None; rare_k]);
+                }
+                profiles.resize(plan.len(), rare_profile);
+            }
             let n_leaves = plan.len();
             // The cone's index of each leaf (padding words depend on it).
             let mut index: Vec<usize> = (0..n_leaves).collect();
@@ -482,6 +514,7 @@ fn main() {
                     & !1;
                 index = index[at..at + 4].to_vec();
                 plan = plan[at..at + 4].to_vec();
+                profiles = profiles[at..at + 4].to_vec();
             }
             let full: usize = plan.iter().flatten().flatten().count();
             println!(
@@ -490,7 +523,7 @@ fn main() {
                 index.len(),
                 n + 1,
                 full,
-                index.len() * profile.slots.len()
+                profiles.iter().map(|p| p.slots.len()).sum::<usize>()
             );
             if std::env::var_os("LEAN_PLAN").is_some() {
                 for (i, p) in plan.iter().enumerate() {
@@ -542,9 +575,9 @@ fn main() {
             let mut src = Sources::new(&out);
             if a[0] == "sizes" {
                 let at = index.len() / 2;
-                src.load(&profile, &plan, at);
+                src.load(&profiles, &plan, at);
                 println!("sources loaded ({})", rss());
-                let p = src.piece(&profile, &plan[at], index[at]);
+                let p = src.piece(&profiles[at], &plan[at], index[at]);
                 println!("piece built ({})", rss());
                 let sh = p.shape();
                 let cl = sh.clone();
@@ -603,9 +636,9 @@ fn main() {
                 words.clear();
                 statement = LeanStatement::default();
                 for (i, p) in plan.iter().enumerate() {
-                    src.load(&profile, &plan, i);
-                    let piece = src.piece(&profile, p, index[i]);
-                    let (w, k) = src.statement(&profile, p, index[i]);
+                    src.load(&profiles, &plan, i);
+                    let piece = src.piece(&profiles[i], p, index[i]);
+                    let (w, k) = src.statement(&profiles[i], p, index[i]);
                     statement.chunk_words.extend(w);
                     statement.keys.extend(k);
                     if std::env::var_os("LEAN_DIGESTS").is_some() {
@@ -644,8 +677,8 @@ fn main() {
                 // pool cleared) and their spare pages handed back before
                 // the leaf proves.
                 flock_core::scratch::clear();
-                src.load(&profile, &plan, i);
-                let p = src.piece(&profile, &plan[i], index[i]);
+                src.load(&profiles, &plan, i);
+                let p = src.piece(&profiles[i], &plan[i], index[i]);
                 src.rest();
                 trim();
                 p
@@ -656,9 +689,16 @@ fn main() {
             // segment i. The segments' claims are then joined. ----
             if let Some(s_n) = std::env::var("LEAN_SEGMENTS").ok().and_then(|v| v.parse::<usize>().ok()) {
                 type Kept = ([u8; 32], [u8; 32], [u8; 32], (u64, u64), (u64, u64), usize, f64, f64, f64);
-                let k = words.len() / 2;
-                let bounds: Vec<(usize, usize)> =
+                // The common leaves in s_n segments, then the rare rules'
+                // leaves (another leaf circuit) in one of their own.
+                let n_common = if a[0] == "run" { n_common } else { words.len() };
+                let k = n_common / 2;
+                let mut bounds: Vec<(usize, usize)> =
                     (0..s_n).map(|s| (2 * (s * k / s_n), 2 * ((s + 1) * k / s_n))).collect();
+                if n_common < words.len() {
+                    bounds.push((n_common, words.len()));
+                }
+                let s_n = bounds.len();
                 assert!(bounds.iter().all(|(a, b)| b - a >= 4), "at least four leaves a segment");
                 let roots: Vec<[u8; 32]> = bounds.iter().map(|(a, b)| lean_segment_root(&words[*a..*b])).collect();
                 let all = lean_segments_root(&roots);
