@@ -353,9 +353,10 @@ fn lean_first_level_node() {
     let leaves: Vec<_> = profile
         .deal(&per_table, 2)
         .iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(i, d)| {
             let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
-            leaf(&c, &profile, &slots).unwrap()
+            leaf(&c, &profile, &slots, i).unwrap()
         })
         .collect();
     let statement: Vec<_> = leaves.iter().map(|p| (p.digest(), p.commit())).collect();
@@ -424,9 +425,10 @@ fn lean_internal_node() {
     let leaves: Vec<_> = profile
         .deal(&per_table, 4)
         .iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(i, d)| {
             let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
-            leaf(&c, &profile, &slots).unwrap()
+            leaf(&c, &profile, &slots, i).unwrap()
         })
         .collect();
     // The cone's statement: the commitment tree over the leaves' words,

@@ -42,7 +42,7 @@ use {
 
 #[cfg(not(target_arch = "aarch64"))]
 pub use crate::tower::lean_tower::{
-    LeanEnvelope, LeanTowerReport, leaf_word, prove_lean_tower, prove_lean_tower_streaming,
+    LeanEnvelope, LeanStatement, LeanTowerReport, leaf_word, prove_lean_tower, prove_lean_tower_streaming,
 };
 pub use crate::tower::{
     chain::{ChainOnlineMs, ChainProof, build_chain_proof},

@@ -99,6 +99,12 @@ const TAG_DECL: u64 = 3;
 const TAG_RANGE: u64 = 4;
 // TAG_RANGE + 1 is the second limb's table.
 const TAG_CHECKED: u64 = 6;
+/// A leaf slot's chunk word, sent once ([`leaf`]).
+const TAG_CHUNK: u64 = 7;
+/// A checked declaration's key, sent once to the statement.
+const TAG_STMT: u64 = 8;
+/// Padding slots' chunk numbers start here, above every side's.
+const PAD_CHUNK: u64 = 1 << 31;
 // Term kinds.
 const K_BVAR: u64 = 1;
 const K_LEAF: u64 = 2;
@@ -2061,6 +2067,7 @@ pub fn leaf(
     proto: &LeanCircuit,
     profile: &Profile,
     slots: &[LeafSlot<'_>],
+    index: usize,
 ) -> Result<Piece, String> {
     let nu = profile.nu;
     if slots.len() != profile.slots.len() {
@@ -2069,6 +2076,7 @@ pub fn leaf(
     let mut sb = ShapeBuilder::new(nu);
     let mut values = Vec::new();
     let mut out_slots = Vec::new();
+    let mut word_ws: Vec<Wire> = Vec::new();
     let gate = crate::leanxmss::gadgets::swap_gate(nu).map_err(|e| format!("{e:?}"))?;
     let bslot = sb.slot(gate.clone());
     let w: Vec<Wire> = (0..3)
@@ -2095,7 +2103,7 @@ pub fn leaf(
                     (c.chunk_base[s] + ch) as u64,
                 )
             }
-            None => (&[], 0),
+            None => (&[], pad_chunk(index, profile.slots.len(), k)),
         };
         // The spec's columns, then the chunk word, then a live bit per port
         // without counts.
@@ -2145,6 +2153,32 @@ pub fn leaf(
         }
         values.push(int(chunk_no << 32));
         let word_w = sb.public_input();
+        word_ws.push(word_w);
+        // A checked declaration names its key in the statement: it sends
+        // (STMT, key) exactly when it receives its CHECKED fact (the same
+        // live bit), and the verifier receives the keys the statement claims.
+        if sp.name == "decl_checked" {
+            let pubs: Vec<usize> = sp
+                .cols
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c.1, Some(Src::Pub(_))))
+                .map(|(y, _)| y)
+                .collect();
+            let recv = sp.ports.iter().position(|p| !p.send).expect("the CHECKED receive");
+            let live = live_col[recv].expect("a receive has a live bit");
+            let mut terms = vec![
+                BusTerm {
+                    word: None,
+                    constant: int(TAG_STMT),
+                    row: None,
+                },
+                BusTerm::word(io[pubs[0]]),
+                BusTerm::word(io[pubs[1]]),
+            ];
+            terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
+            sb.bus_port_counted(slot, BusDirection::Send, terms, vec![io[live]]);
+        }
         let n_live = live_col.iter().flatten().count();
         let zero_row = vec![F128::ZERO; sp.cols.len()];
         for j in 0..1usize << nu {
@@ -2180,6 +2214,26 @@ pub fn leaf(
             cols.len(),
         ));
     }
+    // Every slot's chunk word goes on the bus once, from a table whose rows
+    // are wired to those words; the verifier receives the list of words
+    // the statement gives, all distinct. With as many words as slots in
+    // the whole cone, balance leaves no two slots one word, so no two rows
+    // one id.
+    let tslot = sb.slot(Gate::new(vec![Col::In]));
+    let mut terms = vec![
+        BusTerm {
+            word: None,
+            constant: int(TAG_CHUNK),
+            row: None,
+        },
+        BusTerm::word(0),
+    ];
+    terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
+    sb.bus_port_counted(tslot, BusDirection::Send, terms, Vec::new());
+    for &w in &word_ws {
+        sb.gate(tslot, &[w]);
+    }
+    out_slots.push((tslot, "chunk_words".to_string(), word_ws.len(), 1, 1));
     let shape = sb.finish().map_err(|e| format!("{e:?}"))?;
     Ok(Piece {
         nu,
@@ -2188,6 +2242,82 @@ pub fn leaf(
         slots: out_slots,
         tower: Some((bslot, gate)),
     })
+}
+
+/// A padding slot's chunk number: above every real one, and distinct for
+/// every (leaf, slot) of a cone.
+pub fn pad_chunk(index: usize, slots: usize, k: usize) -> u64 {
+    PAD_CHUNK + (index * slots + k) as u64
+}
+
+/// What a leaf contributes to the statement: its slots' chunk words, and
+/// the keys of the declarations its checked-declaration rows check.
+pub fn leaf_statement(
+    proto: &LeanCircuit,
+    profile: &Profile,
+    slots: &[LeafSlot<'_>],
+    index: usize,
+) -> (Vec<u64>, Vec<[F128; 2]>) {
+    let nu = profile.nu;
+    let mut words = Vec::new();
+    let mut keys = Vec::new();
+    for (k, &s) in profile.slots.iter().enumerate() {
+        match slots[k] {
+            Some((c, ch)) => {
+                words.push(((c.chunk_base[s] + ch) as u64) << 32);
+                let sp = &proto.specs[s];
+                if sp.name == "decl_checked" {
+                    let pubs: Vec<usize> = sp
+                        .cols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| matches!(c.1, Some(Src::Pub(_))))
+                        .map(|(y, _)| y)
+                        .collect();
+                    let t = &c.tables[s];
+                    for z in &t[ch << nu..((ch + 1) << nu).min(t.len())] {
+                        keys.push([z[pubs[0]], z[pubs[1]]]);
+                    }
+                }
+            }
+            None => words.push(pad_chunk(index, profile.slots.len(), k) << 32),
+        }
+    }
+    (words, keys)
+}
+
+/// The verifier's side of the statement on the bus: one receive per chunk
+/// word and per claimed key. Refuses a word list with a repeat or a word
+/// that is not `c·2^32` for `c < 2^32` (a row's id is the word plus its
+/// row, so ids could collide).
+pub fn statement_product(
+    ch: &SharedChallenges,
+    words: &[u64],
+    keys: &[[F128; 2]],
+) -> Result<F128, String> {
+    let mut sorted = words.to_vec();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        return Err("a chunk word repeats".into());
+    }
+    if sorted.iter().any(|w| w & 0xffff_ffff != 0) {
+        return Err("a chunk word with low bits".into());
+    }
+    let f = |t: &[F128]| {
+        let mut acc = ch.beta;
+        for (x, &g) in t.iter().zip(&ch.gamma) {
+            acc += g * *x;
+        }
+        acc
+    };
+    let mut p = F128::ONE;
+    for &w in words {
+        p *= f(&[int(TAG_CHUNK), int(w)]);
+    }
+    for k in keys {
+        p *= f(&[int(TAG_STMT), k[0], k[1]]);
+    }
+    Ok(p)
 }
 
 /// The bus challenges every piece shares: drawn after every piece's
@@ -2495,6 +2625,20 @@ pub fn shared_balance<'a>(proofs: impl IntoIterator<Item = &'a R1csProofCircuitM
     bus::shared_balance(proofs.into_iter().filter_map(|p| p.wiring.bus.as_ref()))
 }
 
+/// [`shared_balance`] with the statement's receives ([`statement_product`]):
+/// the sends of every piece equal its receives times the statement's.
+pub fn shared_balance_with<'a>(
+    proofs: impl IntoIterator<Item = &'a R1csProofCircuitMerged>,
+    statement: F128,
+) -> bool {
+    let (mut l, mut r) = (F128::ONE, F128::ONE);
+    for b in proofs.into_iter().filter_map(|p| p.wiring.bus.as_ref()) {
+        l *= b.gkr.top_lhs;
+        r *= b.gkr.top_rhs;
+    }
+    l == r * statement
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2622,9 +2766,10 @@ mod tests {
         let dealt = profile.deal(&per_table, 2);
         let leaves: Vec<Piece> = dealt
             .iter()
-            .map(|d| {
+            .enumerate()
+            .map(|(i, d)| {
                 let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
-                leaf(&c, &profile, &slots).unwrap()
+                leaf(&c, &profile, &slots, i).unwrap()
             })
             .collect();
         assert_eq!(
@@ -2643,12 +2788,82 @@ mod tests {
                 .expect("the leaf verifies");
             proofs.push(pp.proof);
         }
-        assert!(shared_balance(&proofs), "the leaves balance together");
+        let (mut words, mut keys) = (Vec::new(), Vec::new());
+        for (i, d) in dealt.iter().enumerate() {
+            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            let (w, k) = leaf_statement(&c, &profile, &slots, i);
+            words.extend(w);
+            keys.extend(k);
+        }
+        let st = statement_product(&ch, &words, &keys).unwrap();
+        assert!(!shared_balance(&proofs), "the statement is part of the balance");
+        assert!(shared_balance_with(&proofs, st), "the leaves balance with the statement");
+        if let Some(k) = keys.first().copied() {
+            let mut more = keys.clone();
+            more.push(k);
+            let st2 = statement_product(&ch, &words, &more).unwrap();
+            assert!(!shared_balance_with(&proofs, st2), "a key claimed twice unbalances the bus");
+        }
+        let mut other = words.clone();
+        other[0] = (PAD_CHUNK + (1 << 30)) << 32;
+        let st3 = statement_product(&ch, &other, &keys).unwrap();
+        assert!(!shared_balance_with(&proofs, st3), "another chunk word unbalances the bus");
         proofs.pop();
         assert!(
-            !shared_balance(&proofs),
+            !shared_balance_with(&proofs, st),
             "a leaf left out unbalances the bus"
         );
+    }
+
+    /// Two copies of one leaf: every row's id twice, each id naming two
+    /// rows. The statement's word list then repeats (refused) or, made
+    /// distinct, lists words no slot sends (unbalanced).
+    #[test]
+    fn repeated_chunk_words_are_refused() {
+        let rows = Rows::merge((0..4000).map(|_| Rows::parse(SMALL).unwrap()).collect());
+        let c = LeanCircuit::build(&rows).unwrap();
+        let mut per_table: Vec<Vec<usize>> =
+            vec![Vec::new(); c.chunks().iter().map(|x| x.0 + 1).max().unwrap()];
+        for (s, ch, _) in c.chunks() {
+            per_table[s].push(ch);
+        }
+        let n: Vec<usize> = per_table.iter().map(|t| t.len()).collect();
+        let profile = Profile::even(c.nu, &n, 2);
+        let dealt = profile.deal(&per_table, 2);
+        let dealt = vec![dealt[0].clone(), dealt[0].clone()];
+        let leaves: Vec<Piece> = dealt
+            .iter()
+            .map(|d| {
+                let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+                leaf(&c, &profile, &slots, 0).unwrap()
+            })
+            .collect();
+        let statement: Vec<([u8; 32], Commitment)> =
+            leaves.iter().map(|p| (p.digest(), p.commit())).collect();
+        let ch = shared_challenges(&statement);
+        let proofs: Vec<_> = leaves
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p.prove(Some(&ch), &(i as u64).to_le_bytes(), false).proof)
+            .collect();
+        let (mut words, mut keys) = (Vec::new(), Vec::new());
+        for d in &dealt {
+            let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+            let (w, k) = leaf_statement(&c, &profile, &slots, 0);
+            words.extend(w);
+            keys.extend(k);
+        }
+        assert!(statement_product(&ch, &words, &keys).is_err());
+        let mut fresh = words.clone();
+        fresh.sort_unstable();
+        fresh.dedup();
+        let mut next = (PAD_CHUNK + (1 << 30)) << 32;
+        while fresh.len() < words.len() {
+            fresh.push(next);
+            next += 1 << 32;
+        }
+        let st = statement_product(&ch, &fresh, &keys).unwrap();
+        assert!(!shared_balance_with(&proofs, st));
     }
 
     #[test]

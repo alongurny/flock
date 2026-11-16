@@ -17,9 +17,11 @@
 
 use std::{collections::HashMap, fs, path::Path, time::Instant};
 
+use flock_field::F128;
+
 use flock_prover::{
-    lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, Tuple, leaf},
-    tower::{LeanEnvelope, TowerConfig, leaf_word, prove_lean_tower_streaming},
+    lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, Tuple, leaf, leaf_statement},
+    tower::{LeanEnvelope, LeanStatement, TowerConfig, leaf_word, prove_lean_tower_streaming},
 };
 
 fn read<T: serde::de::DeserializeOwned>(p: impl AsRef<Path>) -> T {
@@ -306,17 +308,26 @@ fn main() {
                 index.len(),
                 n + 1
             );
-            let piece_of = |c: &LeanCircuit, l: usize, counts: &[usize]| {
+            let slots_of = |c: &LeanCircuit, l: usize, counts: &[usize]| -> Vec<Option<usize>> {
                 let leaves = side_leaves(&profile, counts);
                 let mut pt = per_table(c, n_tables);
                 pt.resize(n_tables, Vec::new());
-                let slots: Vec<Option<usize>> = if l == usize::MAX {
+                if l == usize::MAX {
                     vec![None; profile.slots.len()]
                 } else {
                     profile.deal(&pt, leaves).swap_remove(l)
-                };
+                }
+            };
+            // Leaf `i` of the cone (its padding slots' chunk words depend on i).
+            let piece_of = |c: &LeanCircuit, l: usize, counts: &[usize], i: usize| {
+                let slots = slots_of(c, l, counts);
                 let s: Vec<LeafSlot<'_>> = slots.iter().map(|x| x.map(|ch| (c, ch))).collect();
-                leaf(c, &profile, &s).unwrap()
+                leaf(c, &profile, &s, i).unwrap()
+            };
+            let stmt_of = |c: &LeanCircuit, l: usize, counts: &[usize], i: usize| {
+                let slots = slots_of(c, l, counts);
+                let s: Vec<LeafSlot<'_>> = slots.iter().map(|x| x.map(|ch| (c, ch))).collect();
+                leaf_statement(c, &profile, &s, i)
             };
             if std::env::var_os("LEAN_SPECS").is_some() {
                 let (x, y) = (index[0].0, index[index.len() - 1].0);
@@ -337,11 +348,12 @@ fn main() {
                 return;
             }
             if let Ok(i) = std::env::var("LEAN_SIDE_OF") {
-                let (side, l) = index[i.parse::<usize>().unwrap()];
+                let i: usize = i.parse().unwrap();
+                let (side, l) = index[i];
                 println!("leaf {i} is ({side}, {l}); side counts {:?}", census[side]);
                 let c = build(side, n, &out);
                 println!("side built ({})", rss());
-                let p = piece_of(&c, l, &census[side]);
+                let p = piece_of(&c, l, &census[side], i);
                 drop(c);
                 println!("piece built ({})", rss());
                 drop(p);
@@ -403,7 +415,7 @@ fn main() {
                 let (side, l) = index[index.len() / 2];
                 let c = build(side, n, &out);
                 println!("side built ({})", rss());
-                let p = piece_of(&c, l, &census[side]);
+                let p = piece_of(&c, l, &census[side], index.len() / 2);
                 drop(c);
                 println!("piece built ({})", rss());
                 let sh = p.shape();
@@ -445,17 +457,35 @@ fn main() {
             let mut words: Vec<[u8; 32]> = fs::read(&words_file)
                 .map(|b| b.chunks_exact(32).map(|c| c.try_into().unwrap()).collect())
                 .unwrap_or_default();
+            let stmt_file = format!("{out}/statement-{}-{slots}-{}.bin", a[0], index.len());
+            let mut statement: LeanStatement = fs::read(&stmt_file)
+                .ok()
+                .map(|b| {
+                    let (w, k): (Vec<u64>, Vec<[(u64, u64); 2]>) = bincode::deserialize(&b).unwrap();
+                    LeanStatement {
+                        chunk_words: w,
+                        keys: k
+                            .into_iter()
+                            .map(|[x, y]| [F128::new(x.0, x.1), F128::new(y.0, y.1)])
+                            .collect(),
+                    }
+                })
+                .unwrap_or_default();
             let mut side_c: Option<(usize, LeanCircuit)> = None;
-            if words.len() != index.len() {
+            if words.len() != index.len() || statement.chunk_words.is_empty() {
                 words.clear();
-                for &(side, l) in &index {
+                statement = LeanStatement::default();
+                for (i, &(side, l)) in index.iter().enumerate() {
                     if side_c.as_ref().is_none_or(|(s, _)| *s != side) {
                         side_c = None;
                         side_c = Some((side, build(side, n, &out)));
                     }
                     let c = &side_c.as_ref().unwrap().1;
                     assert_eq!(c.nu, nu, "the census's nu");
-                    let p = piece_of(c, l, &census[side]);
+                    let p = piece_of(c, l, &census[side], i);
+                    let (w, k) = stmt_of(c, l, &census[side], i);
+                    statement.chunk_words.extend(w);
+                    statement.keys.extend(k);
                     if std::env::var_os("LEAN_DIGESTS").is_some() {
                         println!(
                             "leaf ({side}, {l}): circuit blake3:{:02x?}",
@@ -465,7 +495,19 @@ fn main() {
                     words.push(leaf_word(&p));
                 }
                 fs::write(&words_file, words.concat()).unwrap();
+                let k: Vec<[(u64, u64); 2]> = statement
+                    .keys
+                    .iter()
+                    .map(|[x, y]| [(x.lo, x.hi), (y.lo, y.hi)])
+                    .collect();
+                fs::write(&stmt_file, bincode::serialize(&(&statement.chunk_words, k)).unwrap())
+                    .unwrap();
             }
+            println!(
+                "statement: {} chunk words, {} checked keys",
+                statement.chunk_words.len(),
+                statement.keys.len()
+            );
             println!(
                 "first pass: {} leaves committed ({:.0} s, {})",
                 words.len(),
@@ -494,14 +536,15 @@ fn main() {
                     let (side, l) = index[i];
                     flock_core::scratch::clear();
                     let c = build(side, n, &out);
-                    let p = piece_of(&c, l, &census[side]);
+                    let p = piece_of(&c, l, &census[side], i);
                     if i % 2 == 1 && index[i - 1].0 == side {
-                        pending = Some((i - 1, piece_of(&c, index[i - 1].1, &census[side])));
+                        pending = Some((i - 1, piece_of(&c, index[i - 1].1, &census[side], i - 1)));
                     }
                     drop(c);
                     trim();
                     p
                 },
+                &statement,
                 env,
                 |line| println!("{line} ({:.0} s, {})", t1.elapsed().as_secs_f64(), rss()),
             );

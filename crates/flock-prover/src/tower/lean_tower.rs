@@ -71,10 +71,21 @@ pub fn prove_lean_tower(
     cfg: TowerConfig,
     n: usize,
     mut piece: impl FnMut(usize) -> Piece,
+    statement: &LeanStatement,
     env: LeanEnvelope,
 ) -> LeanTowerReport {
     let words: Vec<[u8; 32]> = (0..n).map(|i| leaf_word(&piece(i))).collect();
-    prove_lean_tower_streaming(cfg, &words, piece, env, |line| eprintln!("{line}"))
+    prove_lean_tower_streaming(cfg, &words, piece, statement, env, |line| eprintln!("{line}"))
+}
+
+/// What the root's statement names besides the commitment root: every
+/// leaf slot's chunk word, all distinct (so no two rows share an id), and
+/// the keys of the declarations checked. The verifier receives each on
+/// the shared bus ([`crate::lean_rows::statement_product`]).
+#[derive(Clone, Debug, Default)]
+pub struct LeanStatement {
+    pub chunk_words: Vec<u64>,
+    pub keys: Vec<[F128; 2]>,
 }
 
 /// A leaf's word in the commitment tree: its publics digest chained with
@@ -91,6 +102,7 @@ pub fn prove_lean_tower_streaming(
     cfg: TowerConfig,
     words: &[[u8; 32]],
     mut piece: impl FnMut(usize) -> Piece,
+    statement: &LeanStatement,
     env: LeanEnvelope,
     mut progress: impl FnMut(&str),
 ) -> LeanTowerReport {
@@ -298,7 +310,19 @@ pub fn prove_lean_tower_streaming(
         seed,
         "the challenges' seed"
     );
-    let balanced = p[a + 4] == p[a + 5];
+    // The statement's receives: the chunk words (distinct, or refused)
+    // and the checked keys.
+    let balanced = match crate::lean_rows::statement_product(
+        &ch,
+        &statement.chunk_words,
+        &statement.keys,
+    ) {
+        Ok(st) => p[a + 4] == p[a + 5] * st,
+        Err(e) => {
+            progress(&format!("the statement is refused: {e}"));
+            false
+        }
+    };
     assert_ne!(p[a + 4], F128::ZERO, "a nonzero product");
     let lane_acc = root.lane_acc.as_ref().expect("the lane accumulator");
     let leaf_circuit = &shape0.circuit;
@@ -345,7 +369,7 @@ pub fn prove_lean_tower_streaming(
 #[ignore] // Heavier — run alone with `-- --ignored`.
 #[cfg(not(target_arch = "aarch64"))]
 fn lean_tower_spine() {
-    use crate::lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, leaf};
+    use crate::lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, leaf, leaf_statement};
     let small = include_str!("../../tests/data/lean_small.rows");
     let rows = Rows::merge((0..9000).map(|_| Rows::parse(small).unwrap()).collect());
     let c = LeanCircuit::build(&rows).unwrap();
@@ -357,13 +381,21 @@ fn lean_tower_spine() {
     let n: Vec<usize> = per_table.iter().map(|t| t.len()).collect();
     let profile = Profile::even(c.nu, &n, 8);
     let deal = profile.deal(&per_table, 8);
+    let mut st = LeanStatement::default();
+    for (i, d) in deal.iter().enumerate() {
+        let slots: Vec<LeafSlot<'_>> = d.iter().map(|x| x.map(|ch| (&c, ch))).collect();
+        let (w, k) = leaf_statement(&c, &profile, &slots, i);
+        st.chunk_words.extend(w);
+        st.keys.extend(k);
+    }
     let r = prove_lean_tower(
         super::test_config(),
         8,
         |i| {
             let slots: Vec<LeafSlot<'_>> = deal[i].iter().map(|x| x.map(|ch| (&c, ch))).collect();
-            leaf(&c, &profile, &slots).unwrap()
+            leaf(&c, &profile, &slots, i).unwrap()
         },
+        &st,
         LeanEnvelope {
             nu: 15,
             lanes: 40,
