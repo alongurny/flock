@@ -18,8 +18,10 @@
 //! checked like Lean's `instantiate`. Bound variable indices and the `k` of
 //! a substitution are `g^k`; `k + 1` is multiplication by `g`.
 //!
-//! Rules with constraints here: Refl, Symm, Trans, CongApp, App, Beta,
-//! Delta, InstClosed, InstHit, InstApp, InstBind. Any other judgement row
+//! Rules with constraints here: Refl, Symm, Trans, CongApp, CongProj, App,
+//! Const, FVar, Beta, Delta, Zeta, InstClosed, InstHit, InstApp, InstBind,
+//! InstLet, InstProj, and level substitution through a node (LInstApp,
+//! LInstBind, LInstLet, LInstProj). Any other judgement row
 //! goes to an *assumed* table that sends its fact unchecked, and the cited
 //! declarations are sent unchecked (in cas they are bound to the store).
 //! Levels, level lists and contexts are opaque ids. This is a cost
@@ -1218,6 +1220,116 @@ fn fact_spec(rule: &str) -> Spec {
             s.prem(1, F_INST, [c(p[1]), c(k1), c(a), c(q[1])], r);
             send(&mut s, F_INST, [tc(e), tc(kk), tc(a), tc(res)]);
         }
+        // Level substitution through a node: the same node over the parts
+        // substituted (the parts' own rows do the work on levels).
+        "LInstApp" | "LInstLam" | "LInstPi" | "LInstLet" | "InstLet" => {
+            let inst = rule == "InstLet";
+            let (e, mid, a, res) = if inst {
+                let (e, kk, a, res) = (
+                    fld(&mut s, 0),
+                    fld(&mut s, 1),
+                    fld(&mut s, 2),
+                    fld(&mut s, 3),
+                );
+                (e, kk, Some(a), res)
+            } else {
+                let (e, ls, res) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+                (e, ls, None, res)
+            };
+            let rf = if inst { 3 } else { 2 };
+            let (kind, n) = match rule {
+                "LInstApp" => (K_APP, 2),
+                "LInstLam" => (K_LAM, 2),
+                "LInstPi" => (K_PI, 2),
+                _ => (K_LET, 3),
+            };
+            let p: Vec<usize> = (0..n)
+                .map(|i| s.val(E::Tm(ch(f(0), i), Part::Id)))
+                .collect();
+            let q: Vec<usize> = (0..n)
+                .map(|i| s.val(E::Tm(ch(f(rf), i), Part::Id)))
+                .collect();
+            let third = |v: &[usize]| if n == 3 { c(v[2]) } else { Some(Z) };
+            s.term(e, f(0), k(kind), [c(p[0]), c(p[1]), third(&p)], None);
+            s.term(res, f(rf), k(kind), [c(q[0]), c(q[1]), third(&q)], None);
+            match a {
+                Some(a) => {
+                    // let A v b: the body is under one more binder.
+                    closed(&mut s, a);
+                    let k1 = s.out(Col::Lin(G, mid));
+                    s.prem(0, F_INST, [c(p[0]), c(mid), c(a), c(q[0])], r);
+                    s.prem(1, F_INST, [c(p[1]), c(mid), c(a), c(q[1])], r);
+                    s.prem(2, F_INST, [c(p[2]), c(k1), c(a), c(q[2])], r);
+                    send(&mut s, F_INST, [tc(e), tc(mid), tc(a), tc(res)]);
+                }
+                None => {
+                    for i in 0..n {
+                        s.prem(i, F_LINST, [c(p[i]), c(mid), c(q[i]), Some(Z)], r);
+                    }
+                    send(&mut s, F_LINST, [tc(e), tc(mid), tc(res), Z]);
+                }
+            }
+        }
+        "LInstProj" | "InstProj" => {
+            let inst = rule == "InstProj";
+            let rf = if inst { 3 } else { 2 };
+            let (e, mid) = (fld(&mut s, 0), fld(&mut s, 1));
+            let a = inst.then(|| fld(&mut s, 2));
+            let res = fld(&mut s, rf);
+            let (st, ix) = (
+                s.val(E::Tm(f(0), Part::X(0))),
+                s.val(E::Tm(f(0), Part::X(1))),
+            );
+            let (x, y) = (
+                s.val(E::Tm(ch(f(0), 2), Part::Id)),
+                s.val(E::Tm(ch(f(rf), 2), Part::Id)),
+            );
+            s.term(e, f(0), k(K_PROJ), [c(st), c(ix), c(x)], None);
+            s.term(res, f(rf), k(K_PROJ), [c(st), c(ix), c(y)], None);
+            match a {
+                Some(a) => {
+                    closed(&mut s, a);
+                    s.prem(0, F_INST, [c(x), c(mid), c(a), c(y)], r);
+                    send(&mut s, F_INST, [tc(e), tc(mid), tc(a), tc(res)]);
+                }
+                None => {
+                    s.prem(0, F_LINST, [c(x), c(mid), c(y), Some(Z)], r);
+                    send(&mut s, F_LINST, [tc(e), tc(mid), tc(res), Z]);
+                }
+            }
+        }
+        "CongProj" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (st, ix) = (
+                s.val(E::Tm(f(1), Part::X(0))),
+                s.val(E::Tm(f(1), Part::X(1))),
+            );
+            let (x, y) = (
+                s.val(E::Tm(ch(f(1), 2), Part::Id)),
+                s.val(E::Tm(ch(f(2), 2), Part::Id)),
+            );
+            s.term(a, f(1), k(K_PROJ), [c(st), c(ix), c(x)], None);
+            s.term(b, f(2), k(K_PROJ), [c(st), c(ix), c(y)], None);
+            s.prem(0, F_EQ, [c(g), c(x), c(y), Some(Z)], r);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
+        "FVar" => {
+            let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let n = s.val(E::Tm(f(1), Part::X(1)));
+            s.term(e, f(1), k(K_LEAF), [Some(k(SUB_FVAR)), c(n), None], None);
+            s.prem(0, F_HAS, [c(g), c(n), c(t), Some(Z)], r);
+            send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
+        }
+        "Zeta" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (v, body) = (
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+                s.val(E::Tm(ch(f(1), 2), Part::Id)),
+            );
+            s.term(a, f(1), k(K_LET), [None, c(v), c(body)], None);
+            s.prem(0, F_INST, [c(body), Some(one), c(v), c(b)], r);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
         r => panic!("no table for {r}"),
     }
     s
@@ -1266,12 +1378,27 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
                 "InstPi"
             }
         }
+        "LInstApp" => "LInstApp",
+        "LInstBind" => {
+            if g.terms[f.raw[0] as usize].kind == K_LAM {
+                "LInstLam"
+            } else {
+                "LInstPi"
+            }
+        }
+        "LInstLet" => "LInstLet",
+        "InstLet" => "InstLet",
+        "LInstProj" => "LInstProj",
+        "InstProj" => "InstProj",
+        "CongProj" => "CongProj",
+        "FVar" => "FVar",
+        "Zeta" => "Zeta",
         _ => return Of::Assumed,
     };
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 16] = [
+const FACT_TABLES: [&str; 26] = [
     "Const0",
     "ConstL",
     "Refl",
@@ -1287,6 +1414,16 @@ const FACT_TABLES: [&str; 16] = [
     "InstPi",
     "Delta0",
     "DeltaL",
+    "LInstApp",
+    "LInstLam",
+    "LInstPi",
+    "LInstLet",
+    "InstLet",
+    "LInstProj",
+    "InstProj",
+    "CongProj",
+    "FVar",
+    "Zeta",
     "Assumed",
 ];
 
