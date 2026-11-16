@@ -20,8 +20,12 @@
 //!
 //! Rules with constraints here: Refl, Symm, Trans, CongApp, CongProj, App,
 //! Const, FVar, Beta, Delta, Zeta, InstClosed, InstHit, InstApp, InstBind,
-//! InstLet, InstProj, and level substitution through a node (LInstApp,
-//! LInstBind, LInstLet, LInstProj). Any other judgement row
+//! InstLet, InstProj, level substitution through a node (LInstApp,
+//! LInstBind, LInstLet, LInstProj), and the rules of contexts: HasLast,
+//! HasUp, Lam, Let, CongLam, CongPi. A context is a row beside the terms
+//! (its parent, the type added, `g^length`), so its id is a row tag too;
+//! a term carries `F = g^fv`, a bound on its free variables, which a
+//! context entry and a binder's closed body are held to. Any other judgement row
 //! goes to an *assumed* table that sends its fact unchecked, and the cited
 //! declarations are sent unchecked (in cas they are bound to the store).
 //! Levels, level lists and contexts are opaque ids. This is a cost
@@ -105,6 +109,8 @@ const TAG_CHECKED: u64 = 6;
 const TAG_CHUNK: u64 = 7;
 /// A checked declaration's key, sent once to the statement.
 const TAG_STMT: u64 = 8;
+/// A context: its id, its parent, the type added, and `g^length`.
+const TAG_CTX: u64 = 9;
 /// Padding slots' chunk numbers start here, above every side's.
 const PAD_CHUNK: u64 = 1 << 31;
 // Term kinds.
@@ -115,6 +121,11 @@ const K_LAM: u64 = 4;
 const K_PI: u64 = 5;
 const K_LET: u64 = 6;
 const K_PROJ: u64 = 7;
+/// Contexts are rows beside the terms: the empty one, and a parent with a type.
+const K_CTX0: u64 = 8;
+const K_CTX: u64 = 9;
+/// A free variable, `g^n` its level.
+const K_FVAR: u64 = 10;
 // Leaf kinds.
 const SUB_SORT: u64 = 1;
 const SUB_CONST: u64 = 2;
@@ -155,6 +166,8 @@ struct TermRec {
     child: [Option<usize>; 3],
     lbr: i64,
     rank: i64,
+    /// One more than the largest free variable level (0 without any).
+    fv: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,6 +193,8 @@ struct GoalRec {
     ty: (usize, usize),
     /// `Infer([], value, t)` and `Eq([], t, ty)`.
     value: Option<(usize, usize)>,
+    /// The empty context's row.
+    ctx: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -216,7 +231,6 @@ pub struct Rows {
 struct Local {
     levels: Vec<(u8, u64, u64)>,
     lists: Vec<Option<(u64, u64)>>,
-    ctxs: Vec<Option<(u64, u64)>>,
     /// The canonical number of each declaration row.
     decl_no: Vec<u64>,
 }
@@ -228,6 +242,8 @@ impl Rows {
         let mut decls = Vec::new();
         let mut facts = Vec::new();
         let mut local = Local::default();
+        // Each context's row among the terms (contexts follow the terms).
+        let mut ctx_at: Vec<usize> = Vec::new();
         let mut goal_line: Option<((u64, u64), Vec<i64>)> = None;
         for line in text.lines() {
             let w: Vec<&str> = line.split_whitespace().collect();
@@ -251,9 +267,27 @@ impl Rows {
                 Some("S") => local
                     .lists
                     .push((w[2] == "cons").then(|| (n(3).unwrap(), n(4).unwrap()))),
-                Some("C") => local
-                    .ctxs
-                    .push((w[2] == "push").then(|| (n(3).unwrap(), n(4).unwrap()))),
+                Some("C") => {
+                    let (x, child) = if w[2] == "push" {
+                        let q = *ctx_at.get(n(3)? as usize).ok_or(format!("a parent after its context: {line}"))?;
+                        let a = n(4)? as usize;
+                        if a >= terms.len() || terms[a].kind >= K_CTX0 && terms[a].kind != K_FVAR {
+                            return Err(format!("a context's type is not a term: {line}"));
+                        }
+                        (ve(terms[q].x[2].e + 1), [Some(q), Some(a), None])
+                    } else {
+                        (ve(0), [None; 3])
+                    };
+                    ctx_at.push(terms.len());
+                    terms.push(TermRec {
+                        kind: if child[0].is_some() { K_CTX } else { K_CTX0 },
+                        x: [V::default(), V::default(), x],
+                        child,
+                        lbr: 0,
+                        rank: 0,
+                        fv: 0,
+                    });
+                }
                 Some("G") => {
                     goal_line = Some((
                         (n(1)?, n(2)?),
@@ -264,7 +298,7 @@ impl Rows {
                     ))
                 }
                 Some("T") => {
-                    if n(1)? as usize != terms.len() {
+                    if n(1)? as usize != terms.len() || !ctx_at.is_empty() {
                         return Err(format!("terms out of order: {line}"));
                     }
                     let ch = |i: usize| -> Result<usize, String> {
@@ -279,6 +313,11 @@ impl Rows {
                         "bvar" => (
                             K_BVAR,
                             [ve(n(3)? as i64), V::default(), V::default()],
+                            [None; 3],
+                        ),
+                        "leaf" if w[3] == "fvar" => (
+                            K_FVAR,
+                            [ve(n(4)? as i64), V::default(), V::default()],
                             [None; 3],
                         ),
                         "leaf" => {
@@ -332,12 +371,17 @@ impl Rows {
                         .map(|&i| terms[i].rank + 1)
                         .max()
                         .unwrap_or(0);
+                    let fv = match kind {
+                        K_FVAR => x[0].e + 1,
+                        _ => child.iter().flatten().map(|&i| terms[i].fv).max().unwrap_or(0),
+                    };
                     terms.push(TermRec {
                         kind,
                         x,
                         child,
                         lbr,
                         rank,
+                        fv,
                     });
                 }
                 Some("D") => {
@@ -375,13 +419,16 @@ impl Rows {
                         f => return Err(format!("fact {f}")),
                     };
                     let is_term = match tag {
-                        F_HAS => [false, false, true, false],
-                        F_INFER | F_EQ => [false, true, true, false],
+                        F_HAS => [true, false, true, false],
+                        F_INFER | F_EQ => [true, true, true, false],
                         F_INST => [true, false, true, true],
                         F_LINST => [true, false, true, false],
                         _ => [false; 4],
                     };
-                    let raw = [n(4)?, n(5)?, n(6)?, n(7)?];
+                    let mut raw = [n(4)?, n(5)?, n(6)?, n(7)?];
+                    if matches!(tag, F_HAS | F_INFER | F_EQ) {
+                        raw[0] = *ctx_at.get(raw[0] as usize).ok_or(format!("no such context: {line}"))? as u64;
+                    }
                     let premises: Vec<usize> = w[9..]
                         .iter()
                         .map(|p| p.parse::<usize>().map_err(|e| format!("{e}: {line}")))
@@ -433,7 +480,7 @@ impl Rows {
                 ve_,
                 _prop,
                 order,
-                _empty,
+                empty,
             ] = g[..]
             else {
                 return Err(format!("a goal row of {} fields", g.len() + 2));
@@ -472,6 +519,10 @@ impl Rows {
                 } else {
                     None
                 },
+                ctx: *ctx_at
+                    .get(empty as usize)
+                    .filter(|&&c| terms[c].kind == K_CTX0)
+                    .ok_or("the goal's context is not an empty one")?,
             });
         }
         Ok(Rows {
@@ -511,6 +562,7 @@ impl Rows {
                 g.decl += nd;
                 g.ty = (g.ty.0 + nf, g.ty.1 + nf);
                 g.value = g.value.map(|(a, b)| (a + nf, b + nf));
+                g.ctx += nt;
                 m.goals.push(g);
             }
             for mut f in p.facts {
@@ -561,6 +613,8 @@ enum Part {
     R,
     /// A judgement's owner, `g^order`.
     O,
+    /// A term's bound on its free variables, `g^fv`.
+    F,
 }
 
 #[derive(Clone, Debug)]
@@ -625,6 +679,8 @@ struct Spec {
     ports: Vec<Port>,
     /// A judgement table's owner column.
     owner: Option<usize>,
+    /// The free-variable column of the term received last.
+    last_f: usize,
 }
 
 fn pad<const N: usize>(t: [T; N]) -> [T; W] {
@@ -740,6 +796,7 @@ impl Spec {
             cols: Vec::new(),
             ports: Vec::new(),
             owner: None,
+            last_f: 0,
         }
     }
     fn src(&mut self, s: Src) -> usize {
@@ -797,8 +854,9 @@ impl Spec {
             .collect();
         let lc = self.val(E::Tm(tr.clone(), Part::L));
         let l = l.unwrap_or(T::C(lc));
-        let r = self.val(E::Tm(tr, Part::R));
-        self.recv([k(TAG_TERM), T::C(id), kind, x[0], x[1], x[2], l, T::C(r)]);
+        let r = self.val(E::Tm(tr.clone(), Part::R));
+        self.last_f = self.val(E::Tm(tr, Part::F));
+        self.recv([k(TAG_TERM), T::C(id), kind, x[0], x[1], x[2], l, T::C(r), T::C(self.last_f)]);
         (lc, r)
     }
     /// Receives premise `j` of kind `tag` with these fields (free where
@@ -910,7 +968,10 @@ fn spec(of: Of) -> Spec {
                 s.val(own(Part::X(3))),
             );
             let o = s.val(own(Part::R));
-            // A premise in the empty context (id 0), owned by this goal.
+            // The goal's judgements are in a context that is empty.
+            let cx = s.val(own(Part::X(6)));
+            s.recv([k(TAG_CTX), tc(cx), Z, Z, T::K(F128::ONE)]);
+            // A premise in the empty context, owned by this goal.
             let fact = |s: &mut Spec, j: usize, tag: u64, x: [T; 4]| {
                 let id = s.val(E::Prem(j, Part::Id));
                 let r = s.val(E::Prem(j, Part::R));
@@ -928,8 +989,8 @@ fn spec(of: Of) -> Spec {
             };
             let sv = s.val(E::Prem(0, Part::X(2)));
             let su = s.val(E::Prem(1, Part::X(2)));
-            fact(&mut s, 0, F_INFER, [Z, tc(ty), tc(sv), Z]);
-            fact(&mut s, 1, F_EQ, [Z, tc(sv), tc(su), Z]);
+            fact(&mut s, 0, F_INFER, [tc(cx), tc(ty), tc(sv), Z]);
+            fact(&mut s, 1, F_EQ, [tc(cx), tc(sv), tc(su), Z]);
             let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
             s.term(
                 su,
@@ -941,8 +1002,8 @@ fn spec(of: Of) -> Spec {
             let v = if with_value {
                 let v = s.val(own(Part::X(2)));
                 let t = s.val(E::Prem(2, Part::X(2)));
-                fact(&mut s, 2, F_INFER, [Z, tc(v), tc(t), Z]);
-                fact(&mut s, 3, F_EQ, [Z, tc(t), tc(ty), Z]);
+                fact(&mut s, 2, F_INFER, [tc(cx), tc(v), tc(t), Z]);
+                fact(&mut s, 3, F_EQ, [tc(cx), tc(t), tc(ty), Z]);
                 tc(v)
             } else {
                 Z
@@ -986,7 +1047,35 @@ fn term_spec(kind: u64) -> Spec {
             let r = s.val(own(Part::R));
             s.recv([k(TAG_RANGE), tc(a0), T::K(F128::ONE), Z, Z, Z, Z, Z]);
             s.recv([k(TAG_RANGE + 1), tc(a1), T::K(F128::ONE), Z, Z, Z, Z, Z]);
-            s.send([k(TAG_TERM), T::Id, k(K_BVAR), tc(j), Z, Z, tc(l), tc(r)]);
+            s.send([k(TAG_TERM), T::Id, k(K_BVAR), tc(j), Z, Z, tc(l), tc(r), T::K(F128::ONE)]);
+        }
+        K_FVAR => {
+            // Closed, and its bound on free variables is its level plus one.
+            let n = s.val(own(Part::X(0)));
+            let f = s.out(Col::Lin(G, n));
+            let r = s.val(own(Part::R));
+            s.send([k(TAG_TERM), T::Id, k(K_FVAR), tc(n), Z, Z, T::K(F128::ONE), tc(r), tc(f)]);
+        }
+        K_CTX0 => {
+            s.send([k(TAG_CTX), T::Id, Z, Z, T::K(F128::ONE)]);
+        }
+        K_CTX => {
+            // The parent's length plus one; the type added may mention only
+            // the variables the parent has.
+            let (p, a) = (s.val(own(Part::X(0))), s.val(own(Part::X(1))));
+            let par = TR::Child(Box::new(TR::Own), 0);
+            let (pp, pa, np) = (
+                s.val(E::Tm(par.clone(), Part::X(0))),
+                s.val(E::Tm(par.clone(), Part::X(1))),
+                s.val(E::Tm(par.clone(), Part::X(2))),
+            );
+            s.recv([k(TAG_CTX), tc(p), tc(pp), tc(pa), tc(np)]);
+            let ty = TR::Child(Box::new(TR::Own), 1);
+            s.term(a, ty.clone(), T::Id, [None; 3], None);
+            let fa = s.last_f;
+            s.ge(np, E::Tm(par, Part::X(2)), fa, E::Tm(ty, Part::F), 0);
+            let n = s.out(Col::Lin(G, np));
+            s.send([k(TAG_CTX), T::Id, tc(p), tc(a), tc(n)]);
         }
         K_LEAF => {
             let x: Vec<usize> = (0..3).map(|i| s.val(own(Part::X(i)))).collect();
@@ -1000,10 +1089,12 @@ fn term_spec(kind: u64) -> Spec {
                 tc(x[2]),
                 tc(l),
                 tc(r),
+                T::K(F128::ONE),
             ]);
         }
         _ => {
             let (l, r) = (s.val(own(Part::L)), s.val(own(Part::R)));
+            let fv = s.val(own(Part::F));
             // Children by part, and how L bounds each: c·L_child ≤ L.
             let (parts, shift): (Vec<usize>, Vec<i64>) = match kind {
                 K_APP => (vec![0, 1], vec![0, 0]),
@@ -1023,11 +1114,13 @@ fn term_spec(kind: u64) -> Spec {
                 if !ablate("RANK") {
                     s.ge(r, own(Part::R), rc, E::Tm(ch.clone(), Part::R), 1);
                 }
+                let fc = s.last_f;
                 if !ablate("LBR") {
-                    s.ge(l, own(Part::L), lc, E::Tm(ch, Part::L), sh);
+                    s.ge(l, own(Part::L), lc, E::Tm(ch.clone(), Part::L), sh);
                 }
+                s.ge(fv, own(Part::F), fc, E::Tm(ch, Part::F), 0);
             }
-            s.send([k(TAG_TERM), T::Id, k(kind), x[0], x[1], x[2], tc(l), tc(r)]);
+            s.send([k(TAG_TERM), T::Id, k(kind), x[0], x[1], x[2], tc(l), tc(r), tc(fv)]);
         }
     }
     s
@@ -1315,8 +1408,8 @@ fn fact_spec(rule: &str) -> Spec {
         }
         "FVar" => {
             let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
-            let n = s.val(E::Tm(f(1), Part::X(1)));
-            s.term(e, f(1), k(K_LEAF), [Some(k(SUB_FVAR)), c(n), None], None);
+            let n = s.val(E::Tm(f(1), Part::X(0)));
+            s.term(e, f(1), k(K_FVAR), [c(n), Some(Z), Some(Z)], None);
             s.prem(0, F_HAS, [c(g), c(n), c(t), Some(Z)], r);
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
@@ -1329,6 +1422,124 @@ fn fact_spec(rule: &str) -> Spec {
             s.term(a, f(1), k(K_LET), [None, c(v), c(body)], None);
             s.prem(0, F_INST, [c(body), Some(one), c(v), c(b)], r);
             send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
+        "HasLast" => {
+            // The last entry: the context's length is n + 1.
+            let (g, n, a) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let p = s.val(E::Tm(f(0), Part::X(0)));
+            let len = s.out(Col::Lin(G, n));
+            s.recv([k(TAG_CTX), tc(g), tc(p), tc(a), tc(len)]);
+            send(&mut s, F_HAS, [tc(g), tc(n), tc(a), Z]);
+        }
+        "HasUp" => {
+            let (g, n, a) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (p, last, len) = (
+                s.val(E::Tm(f(0), Part::X(0))),
+                s.val(E::Tm(f(0), Part::X(1))),
+                s.val(E::Tm(f(0), Part::X(2))),
+            );
+            s.recv([k(TAG_CTX), tc(g), tc(p), tc(last), tc(len)]);
+            s.prem(0, F_HAS, [c(p), c(n), c(a), Some(Z)], r);
+            send(&mut s, F_HAS, [tc(g), tc(n), tc(a), Z]);
+        }
+        "Lam" => {
+            let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (a, b) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+            );
+            let cod = s.val(E::Tm(ch(f(2), 1), Part::Id));
+            s.term(e, f(1), k(K_LAM), [c(a), c(b), Some(Z)], None);
+            s.term(t, f(2), k(K_PI), [c(a), c(cod), Some(Z)], None);
+            // The context's length n, the variable fvar n, and the context
+            // with the binder's type added.
+            let (gp_, ga, ng) = (
+                s.val(E::Tm(f(0), Part::X(0))),
+                s.val(E::Tm(f(0), Part::X(1))),
+                s.val(E::Tm(f(0), Part::X(2))),
+            );
+            s.recv([k(TAG_CTX), tc(g), tc(gp_), tc(ga), tc(ng)]);
+            let var = s.val(E::Prem(2, Part::X(2)));
+            s.term(var, TR::PFld(2, 2), k(K_FVAR), [c(ng), Some(Z), Some(Z)], None);
+            let ext = s.val(E::Prem(3, Part::X(0)));
+            let ng1 = s.out(Col::Lin(G, ng));
+            s.recv([k(TAG_CTX), tc(ext), tc(g), tc(a), tc(ng1)]);
+            // The codomain does not mention the variable: fv(B) ≤ n.
+            s.term(cod, ch(f(2), 1), T::Id, [None; 3], None);
+            let fc = s.last_f;
+            s.ge(ng, E::Tm(f(0), Part::X(2)), fc, E::Tm(ch(f(2), 1), Part::F), 0);
+            let sa = s.val(E::Prem(0, Part::X(2)));
+            let su = s.val(E::Prem(1, Part::X(2)));
+            let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
+            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(u), Some(Z)], None);
+            let bo = s.val(E::Prem(2, Part::X(3)));
+            let bt = s.val(E::Prem(3, Part::X(2)));
+            s.prem(0, F_INFER, [c(g), c(a), c(sa), Some(Z)], r);
+            s.prem(1, F_EQ, [c(g), c(sa), c(su), Some(Z)], r);
+            s.prem(2, F_INST, [c(b), Some(one), c(var), c(bo)], r);
+            s.prem(3, F_INFER, [c(ext), c(bo), c(bt), Some(Z)], r);
+            s.prem(4, F_INST, [c(cod), Some(one), c(var), c(bt)], r);
+            send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
+        }
+        "CongLam" | "CongPi" => {
+            let kind = if rule == "CongLam" { K_LAM } else { K_PI };
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (a1, b1) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+            );
+            let (a2, b2) = (
+                s.val(E::Tm(ch(f(2), 0), Part::Id)),
+                s.val(E::Tm(ch(f(2), 1), Part::Id)),
+            );
+            s.term(a, f(1), k(kind), [c(a1), c(b1), Some(Z)], None);
+            s.term(b, f(2), k(kind), [c(a2), c(b2), Some(Z)], None);
+            let (gp_, ga, ng) = (
+                s.val(E::Tm(f(0), Part::X(0))),
+                s.val(E::Tm(f(0), Part::X(1))),
+                s.val(E::Tm(f(0), Part::X(2))),
+            );
+            s.recv([k(TAG_CTX), tc(g), tc(gp_), tc(ga), tc(ng)]);
+            let var = s.val(E::Prem(1, Part::X(2)));
+            s.term(var, TR::PFld(1, 2), k(K_FVAR), [c(ng), Some(Z), Some(Z)], None);
+            let ext = s.val(E::Prem(3, Part::X(0)));
+            let ng1 = s.out(Col::Lin(G, ng));
+            s.recv([k(TAG_CTX), tc(ext), tc(g), tc(a1), tc(ng1)]);
+            // Neither body mentions the variable already.
+            for (body, tr) in [(b1, ch(f(1), 1)), (b2, ch(f(2), 1))] {
+                s.term(body, tr.clone(), T::Id, [None; 3], None);
+                let fc = s.last_f;
+                s.ge(ng, E::Tm(f(0), Part::X(2)), fc, E::Tm(tr, Part::F), 0);
+            }
+            let o2 = s.val(E::Prem(1, Part::X(3)));
+            let o1 = s.val(E::Prem(2, Part::X(3)));
+            s.prem(0, F_EQ, [c(g), c(a1), c(a2), Some(Z)], r);
+            s.prem(1, F_INST, [c(b2), Some(one), c(var), c(o2)], r);
+            s.prem(2, F_INST, [c(b1), Some(one), c(var), c(o1)], r);
+            s.prem(3, F_EQ, [c(ext), c(o1), c(o2), Some(Z)], r);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
+        "Let" => {
+            let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (a, v, b) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+                s.val(E::Tm(ch(f(1), 2), Part::Id)),
+            );
+            s.term(e, f(1), k(K_LET), [c(a), c(v), c(b)], None);
+            let sa = s.val(E::Prem(0, Part::X(2)));
+            let su = s.val(E::Prem(1, Part::X(2)));
+            let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
+            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(u), Some(Z)], None);
+            let vt = s.val(E::Prem(2, Part::X(2)));
+            let b2 = s.val(E::Prem(4, Part::X(3)));
+            s.prem(0, F_INFER, [c(g), c(a), c(sa), Some(Z)], r);
+            s.prem(1, F_EQ, [c(g), c(sa), c(su), Some(Z)], r);
+            s.prem(2, F_INFER, [c(g), c(v), c(vt), Some(Z)], r);
+            s.prem(3, F_EQ, [c(g), c(vt), c(a), Some(Z)], r);
+            s.prem(4, F_INST, [c(b), Some(one), c(v), c(b2)], r);
+            s.prem(5, F_INFER, [c(g), c(b2), c(t), Some(Z)], r);
+            send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
         r => panic!("no table for {r}"),
     }
@@ -1393,12 +1604,18 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "CongProj" => "CongProj",
         "FVar" => "FVar",
         "Zeta" => "Zeta",
+        "HasLast" => "HasLast",
+        "HasUp" => "HasUp",
+        "Lam" => "Lam",
+        "CongLam" => "CongLam",
+        "CongPi" => "CongPi",
+        "Let" => "Let",
         _ => return Of::Assumed,
     };
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 26] = [
+const FACT_TABLES: [&str; 32] = [
     "Const0",
     "ConstL",
     "Refl",
@@ -1424,6 +1641,12 @@ const FACT_TABLES: [&str; 26] = [
     "CongProj",
     "FVar",
     "Zeta",
+    "HasLast",
+    "HasUp",
+    "Lam",
+    "CongLam",
+    "CongPi",
+    "Let",
     "Assumed",
 ];
 
@@ -1594,7 +1817,7 @@ impl LeanCircuit {
         let t0 = Instant::now();
         // Tables and which rows go to each.
         let mut ofs: Vec<Of> = vec![Of::Range(0), Of::Range(1)];
-        for kd in [K_BVAR, K_LEAF, K_APP, K_LAM, K_PI, K_LET, K_PROJ] {
+        for kd in [K_BVAR, K_LEAF, K_APP, K_LAM, K_PI, K_LET, K_PROJ, K_CTX0, K_CTX, K_FVAR] {
             ofs.push(Of::Term(kd));
         }
         ofs.extend([Of::DeclChecked, Of::DeclBlock, Of::DeclFree]);
@@ -1641,7 +1864,7 @@ impl LeanCircuit {
                 .facts
                 .iter()
                 .map(|f| f.rank.max(f.owner))
-                .chain(g.terms.iter().map(|t| t.rank + t.lbr))
+                .chain(g.terms.iter().map(|t| (t.rank + t.lbr).max(t.fv + 1).max(t.x[2].e + 1)))
                 .chain(g.decls.iter().map(|d| d.order + 1))
                 .max()
                 .unwrap_or(0);
@@ -1737,7 +1960,7 @@ impl LeanCircuit {
                     f: term_id(f.raw[x] as usize),
                     e: 0,
                 }
-            } else if f.tag == F_INST && x == 1 {
+            } else if (f.tag == F_INST || f.tag == F_HAS) && x == 1 {
                 ve(f.raw[1] as i64)
             } else {
                 vi(f.raw[x])
@@ -1768,6 +1991,7 @@ impl LeanCircuit {
                 },
                 Part::L => ve(t.lbr),
                 Part::R => ve(t.rank),
+                Part::F => ve(t.fv),
                 Part::O => unreachable!(),
             }
         };
@@ -1839,7 +2063,7 @@ impl LeanCircuit {
                 Part::X(x) => field(q, x),
                 Part::R => ve(b.facts[q].rank),
                 Part::O => ve(b.facts[q].owner),
-                Part::L => unreachable!(),
+                Part::L | Part::F => unreachable!(),
             }
         };
         let eval = |e: &E, of: Of, own: usize| -> V {
@@ -1850,6 +2074,7 @@ impl LeanCircuit {
                     Of::Goal(_) => {
                         let d = b.goals[own].decl;
                         match p {
+                            Part::X(6) => term_part(b.goals[own].ctx, Part::Id),
                             Part::X(0) => decl_part(d, Part::Id),
                             _ => decl_part(d, *p),
                         }
@@ -2853,13 +3078,29 @@ mod tests {
     #[test]
     fn a_false_beta_is_refused() {
         let bad = SMALL
-            .replace("F 2 Beta eq 0 5 4 0 : 1", "F 2 Beta eq 0 5 0 0 : 1")
-            .replace("F 3 Trans eq 0 5 4 0 : 2 0", "F 3 Refl eq 0 5 5 0 :")
-            .replace("F 4 Symm eq 0 4 5 0 : 3", "F 4 Refl eq 0 4 4 0 :");
+            .replace("F 2 Beta eq 1 5 4 0 : 1", "F 2 Beta eq 1 5 0 0 : 1")
+            .replace("F 3 Trans eq 1 5 4 0 : 2 0", "F 3 Refl eq 1 5 5 0 :")
+            .replace("F 4 Symm eq 1 4 5 0 : 3", "F 4 Refl eq 1 4 4 0 :");
         let rows = Rows::parse(&bad).unwrap();
         assert!(LeanCircuit::build(&rows).is_err());
         let c = LeanCircuit::build_with(&rows, false).unwrap();
         assert!(c.prove_and_verify(false).is_err());
+    }
+
+    /// A context entry claimed with another type, and one claimed at
+    /// another position: neither is the context's row.
+    #[test]
+    fn a_false_context_entry_is_refused() {
+        for (was, bad) in [
+            ("F 6 HasLast has 1 0 0 0 :", "F 6 HasLast has 1 0 2 0 :"),
+            ("F 6 HasLast has 1 0 0 0 :", "F 6 HasLast has 1 1 0 0 :"),
+        ] {
+            assert!(SMALL.contains(was));
+            let rows = Rows::parse(&SMALL.replace(was, bad).replace("F 7 FVar infer 1 4 0 0 : 6", "F 7 Given infer 1 4 0 0 :")).unwrap();
+            assert!(LeanCircuit::build(&rows).is_err());
+            let c = LeanCircuit::build_with(&rows, false).unwrap();
+            assert!(c.prove_and_verify(false).is_err());
+        }
     }
 
     /// Proves every piece under challenges drawn from all commitments;
@@ -3037,9 +3278,9 @@ mod tests {
     #[test]
     fn a_false_beta_is_refused_in_pieces() {
         let bad = SMALL
-            .replace("F 2 Beta eq 0 5 4 0 : 1", "F 2 Beta eq 0 5 0 0 : 1")
-            .replace("F 3 Trans eq 0 5 4 0 : 2 0", "F 3 Refl eq 0 5 5 0 :")
-            .replace("F 4 Symm eq 0 4 5 0 : 3", "F 4 Refl eq 0 4 4 0 :");
+            .replace("F 2 Beta eq 1 5 4 0 : 1", "F 2 Beta eq 1 5 0 0 : 1")
+            .replace("F 3 Trans eq 1 5 4 0 : 2 0", "F 3 Refl eq 1 5 5 0 :")
+            .replace("F 4 Symm eq 1 4 5 0 : 3", "F 4 Refl eq 1 4 4 0 :");
         let mut parts: Vec<Rows> = (0..3999).map(|_| Rows::parse(SMALL).unwrap()).collect();
         parts.push(Rows::parse(&bad).unwrap());
         let c = LeanCircuit::build_with(&Rows::merge(parts), false).unwrap();
@@ -3066,7 +3307,6 @@ pub struct Cone {
     pub shared: Rows,
     levels: HashMap<(u8, u64, u64), u64>,
     lists: HashMap<Option<(u64, u64)>, u64>,
-    ctxs: HashMap<Option<(u64, u64)>, u64>,
     terms: HashMap<(u64, [(u64, u64); 3]), usize>,
     decls: HashMap<(u64, u64), usize>,
     span: i64,
@@ -3080,14 +3320,10 @@ impl Default for Cone {
 
 impl Cone {
     pub fn new() -> Cone {
-        let mut ctxs = HashMap::new();
-        // The empty context is 0, as goals expect.
-        ctxs.insert(None, 0);
         Cone {
             shared: Rows::default(),
             levels: HashMap::new(),
             lists: HashMap::new(),
-            ctxs,
             terms: HashMap::new(),
             decls: HashMap::new(),
             span: 0,
@@ -3181,7 +3417,7 @@ impl Cone {
                 Some(&i) => i,
                 None => {
                     let i = self.shared.terms.len();
-                    self.span = self.span.max(t.rank + t.lbr);
+                    self.span = self.span.max(t.rank + t.lbr).max(t.fv + 1).max(t.x[2].e + 1);
                     self.shared.terms.push(t);
                     self.terms.insert(key, i);
                     i
@@ -3205,13 +3441,6 @@ impl Cone {
                 }
             }
         }
-        // Contexts.
-        let mut cx: Vec<u64> = Vec::with_capacity(lc.ctxs.len());
-        for &row in &lc.ctxs {
-            let key = row.map(|(q, a)| (cx[q as usize], tm[a as usize] as u64));
-            let n = self.ctxs.len() as u64;
-            cx.push(*self.ctxs.entry(key).or_insert(n));
-        }
         // Judgements and the goal.
         let base = batch.facts.len();
         for mut f in r.facts {
@@ -3220,11 +3449,9 @@ impl Cone {
                     f.raw[x] = tm[f.raw[x] as usize] as u64;
                 }
             }
-            let ctx = |v: u64| cx.get(v as usize).copied().ok_or("a context out of range");
             let lvl = |v: u64| lv.get(v as usize).copied().ok_or("a level out of range");
             let lst = |v: u64| ls.get(v as usize).copied().ok_or("a list out of range");
             match f.tag {
-                F_HAS | F_INFER | F_EQ => f.raw[0] = ctx(f.raw[0])?,
                 F_LINST => f.raw[1] = lst(f.raw[1])?,
                 F_LINSTL => {
                     f.raw[0] = lvl(f.raw[0])?;
@@ -3248,6 +3475,7 @@ impl Cone {
                 decl: decl[g.decl],
                 ty: (g.ty.0 + base, g.ty.1 + base),
                 value: g.value.map(|(a, b)| (a + base, b + base)),
+                ctx: tm[g.ctx],
             });
         }
         Ok(())
