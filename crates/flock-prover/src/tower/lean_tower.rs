@@ -101,11 +101,111 @@ pub fn leaf_word(p: &Piece) -> [u8; 32] {
 pub fn prove_lean_tower_streaming(
     cfg: TowerConfig,
     words: &[[u8; 32]],
-    mut piece: impl FnMut(usize) -> Piece,
+    piece: impl FnMut(usize) -> Piece,
     statement: &LeanStatement,
     env: LeanEnvelope,
     mut progress: impl FnMut(&str),
 ) -> LeanTowerReport {
+    let s = prove_lean_segment(cfg, words, 0, None, piece, env, &mut progress);
+    let balanced = match segments_balanced(&s.root, &[s.claim()], statement) {
+        Ok(b) => b,
+        Err(e) => {
+            progress(&format!("the statement is refused: {e}"));
+            false
+        }
+    };
+    LeanTowerReport { balanced, ..s.report }
+}
+
+/// What one segment's root proof states: the commitment root of its own
+/// leaves' words, the seed of the challenges its bus used, and its two
+/// bus products.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentClaim {
+    pub root: [u8; 32],
+    pub seed: [u8; 32],
+    pub send: F128,
+    pub recv: F128,
+}
+
+/// A proved segment: its measurements (`balanced` is not its to say) and
+/// its claim.
+#[derive(Clone, Debug)]
+pub struct LeanSegmentOut {
+    pub report: LeanTowerReport,
+    pub root: [u8; 32],
+    pub seed: [u8; 32],
+    pub send: F128,
+    pub recv: F128,
+}
+
+impl LeanSegmentOut {
+    pub fn claim(&self) -> SegmentClaim {
+        SegmentClaim { root: self.root, seed: self.seed, send: self.send, recv: self.recv }
+    }
+}
+
+/// The root the challenges of a cone proved in segments are drawn from:
+/// it commits to every segment's commitment root, so to every leaf's word.
+pub fn lean_segments_root(roots: &[[u8; 32]]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("cas-lean cone segments v0");
+    h.update(&(roots.len() as u64).to_le_bytes());
+    for r in roots {
+        h.update(r);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// A segment's own commitment root, from its leaves' words.
+pub fn lean_segment_root(words: &[[u8; 32]]) -> [u8; 32] {
+    lean_cone_root(words)
+}
+
+/// The verifier's last step over a cone's segment proofs (each already
+/// verified): every segment used the challenges of `challenge_root`
+/// (which for more than one segment must be [`lean_segments_root`] of
+/// their roots, in order), and over all segments the shared bus balances
+/// against the statement: Πsend = Πrecv · statement.
+pub fn segments_balanced(
+    challenge_root: &[u8; 32],
+    segments: &[SegmentClaim],
+    statement: &LeanStatement,
+) -> Result<bool, String> {
+    if segments.len() > 1 {
+        let roots: Vec<[u8; 32]> = segments.iter().map(|s| s.root).collect();
+        if lean_segments_root(&roots) != *challenge_root {
+            return Err("the challenge root is not the segments'".into());
+        }
+    } else if segments.iter().any(|s| s.root != *challenge_root) {
+        return Err("the challenge root is not the segment's".into());
+    }
+    let ch = shared_challenges_from_root(challenge_root);
+    let seed = challenge_seed(&ch);
+    if segments.iter().any(|s| s.seed != seed) {
+        return Err("a segment used other challenges".into());
+    }
+    let st = crate::lean_rows::statement_product(&ch, &statement.chunk_words, &statement.keys)?;
+    let send = segments.iter().fold(F128::ONE, |a, s| a * s.send);
+    let recv = segments.iter().fold(F128::ONE, |a, s| a * s.recv);
+    Ok(send != F128::ZERO && send == recv * st)
+}
+
+/// One segment of a cone's tower: leaves `first .. first + words.len()`
+/// (`words` are theirs), under the challenges of `challenge_root` (None:
+/// the segment is the whole cone, and its own root gives them). A cone
+/// too long for one run is proved a segment at a time, each a proof of
+/// its own; [`segments_balanced`] joins them.
+pub fn prove_lean_segment(
+    cfg: TowerConfig,
+    words: &[[u8; 32]],
+    first: usize,
+    challenge_root: Option<[u8; 32]>,
+    mut piece: impl FnMut(usize) -> Piece,
+    env: LeanEnvelope,
+    mut progress: impl FnMut(&str),
+) -> LeanSegmentOut {
+    let mut piece = |i: usize| piece(first + i);
+    let tag = |i: usize| ((first + i) as u64).to_le_bytes();
     let n = words.len();
     assert!(n >= 4 && n % 2 == 0, "leaf pairs, at least two of them");
     set_envelope_override(Some((env.nu, env.lanes, env.m)));
@@ -119,13 +219,13 @@ pub fn prove_lean_tower_streaming(
 
     // ---- THE STATEMENT: the commitment root, and its challenges ----
     let root_digest = lean_cone_root(words);
-    let ch = shared_challenges_from_root(&root_digest);
+    let ch = shared_challenges_from_root(&challenge_root.unwrap_or(root_digest));
     let seed = challenge_seed(&ch);
 
     // ---- LEAF 0, the lane's table owner ----
     let t = Instant::now();
     let piece0 = piece(0);
-    let leaf0 = build_lean_leaf(&piece0, Some(&ch), &0u64.to_le_bytes());
+    let leaf0 = build_lean_leaf(&piece0, Some(&ch), &tag(0));
     assert_eq!(
         lean_leaf_word(&leaf0.built.witness.public, &leaf0.commitment.cap),
         words[0],
@@ -177,7 +277,7 @@ pub fn prove_lean_tower_streaming(
         let t = Instant::now();
         let mut build = |i: usize| {
             let p = piece(i);
-            let l = build_lean_leaf(&p, Some(&ch), &(i as u64).to_le_bytes());
+            let l = build_lean_leaf(&p, Some(&ch), &tag(i));
             assert_eq!(
                 lean_leaf_word(&l.built.witness.public, &l.commitment.cap),
                 words[i],
@@ -186,9 +286,9 @@ pub fn prove_lean_tower_streaming(
             l
         };
         let l1 = build(2 * j + 1);
-        progress(&format!("leaf {}", 2 * j + 1));
+        progress(&format!("leaf {}", first + 2 * j + 1));
         let l0: MixedInner = if j == 0 { build(0) } else { build(2 * j) };
-        progress(&format!("leaf {}", 2 * j));
+        progress(&format!("leaf {}", first + 2 * j));
         *leaf_prove_ms += t.elapsed().as_secs_f64() * 1e3;
         let f = build_first_level_core(
             cfg,
@@ -310,19 +410,7 @@ pub fn prove_lean_tower_streaming(
         seed,
         "the challenges' seed"
     );
-    // The statement's receives: the chunk words (distinct, or refused)
-    // and the checked keys.
-    let balanced = match crate::lean_rows::statement_product(
-        &ch,
-        &statement.chunk_words,
-        &statement.keys,
-    ) {
-        Ok(st) => p[a + 4] == p[a + 5] * st,
-        Err(e) => {
-            progress(&format!("the statement is refused: {e}"));
-            false
-        }
-    };
+    let (send, recv) = (p[a + 4], p[a + 5]);
     assert_ne!(p[a + 4], F128::ZERO, "a nonzero product");
     let lane_acc = root.lane_acc.as_ref().expect("the lane accumulator");
     let leaf_circuit = &shape0.circuit;
@@ -351,15 +439,21 @@ pub fn prove_lean_tower_streaming(
     let discharge_ms = t.elapsed().as_secs_f64() * 1e3;
     set_envelope_override(None);
     flock_core::scratch::set_byte_budget(None);
-    LeanTowerReport {
-        leaves: n,
-        leaf_prove_ms,
-        fl_prove_ms,
-        node_prove_ms,
-        root_verify_ms: root.online.verify_ms,
-        discharge_ms,
-        root_proof_bytes: proof_bytes(&root.lo.proof),
-        balanced,
+    LeanSegmentOut {
+        report: LeanTowerReport {
+            leaves: n,
+            leaf_prove_ms,
+            fl_prove_ms,
+            node_prove_ms,
+            root_verify_ms: root.online.verify_ms,
+            discharge_ms,
+            root_proof_bytes: proof_bytes(&root.lo.proof),
+            balanced: false,
+        },
+        root: root_digest,
+        seed,
+        send,
+        recv,
     }
 }
 
@@ -404,6 +498,41 @@ fn lean_tower_spine() {
     );
     eprintln!("{r:?}");
     assert!(r.balanced, "the shared bus balances over the whole cone");
+
+    // The same cone as two segments of four leaves, each a proof of its
+    // own: together they balance, and not with a claim changed or the
+    // challenges of another root.
+    let mut piece = |i: usize| {
+        let slots: Vec<LeafSlot<'_>> = deal[i].iter().map(|x| x.map(|ch| (&c, ch))).collect();
+        leaf(&c, &profile, &slots, i).unwrap()
+    };
+    let words: Vec<[u8; 32]> = (0..8).map(|i| leaf_word(&piece(i))).collect();
+    let roots = [lean_segment_root(&words[..4]), lean_segment_root(&words[4..])];
+    let all = lean_segments_root(&roots);
+    let env = LeanEnvelope { nu: 15, lanes: 40, m: 30 };
+    let claims: Vec<SegmentClaim> = (0..2)
+        .map(|s| {
+            let o = prove_lean_segment(
+                super::test_config(),
+                &words[4 * s..4 * s + 4],
+                4 * s,
+                Some(all),
+                &mut piece,
+                env,
+                |line| eprintln!("segment {s}: {line}"),
+            );
+            assert_eq!(o.root, roots[s]);
+            o.claim()
+        })
+        .collect();
+    assert_eq!(segments_balanced(&all, &claims, &st), Ok(true));
+    assert_eq!(segments_balanced(&all, &claims[..1], &st).ok(), None, "a segment missing");
+    let mut swapped = claims.clone();
+    swapped.swap(0, 1);
+    assert!(segments_balanced(&all, &swapped, &st).is_err());
+    let mut bad = claims.clone();
+    bad[1].send = bad[1].send + F128::ONE;
+    assert_eq!(segments_balanced(&all, &bad, &st), Ok(false));
 }
 
 /// Release the prover's scratch pool after a node's proof.

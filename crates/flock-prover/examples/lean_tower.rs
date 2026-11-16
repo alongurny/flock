@@ -21,7 +21,10 @@ use flock_field::F128;
 
 use flock_prover::{
     lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, Tuple, leaf, leaf_statement},
-    tower::{LeanEnvelope, LeanStatement, TowerConfig, leaf_word, prove_lean_tower_streaming},
+    tower::{
+        LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root, lean_segments_root,
+        prove_lean_segment, prove_lean_tower_streaming, segments_balanced,
+    },
 };
 
 fn read<T: serde::de::DeserializeOwned>(p: impl AsRef<Path>) -> T {
@@ -519,10 +522,7 @@ fn main() {
             drop(side_c);
             let mut pending: Option<(usize, flock_prover::lean_rows::Piece)> = None;
             let t1 = Instant::now();
-            let r = prove_lean_tower_streaming(
-                TowerConfig::Chain128,
-                &words,
-                |i| {
+            let mut make_piece = |i: usize| {
                     // A side's circuit is large (7.6 GB at the peak to build
                     // the shared side): build it with nothing proven held
                     // (the pool cleared), take leaf i and, when of the same
@@ -543,7 +543,94 @@ fn main() {
                     drop(c);
                     trim();
                     p
-                },
+            };
+            // ---- IN SEGMENTS (LEAN_SEGMENTS=S): each segment a proof of
+            // its own, kept on disk, so a run that is cut off resumes at
+            // the first segment not yet proved; LEAN_SEGMENT=i proves only
+            // segment i. The segments' claims are then joined. ----
+            if let Some(s_n) = std::env::var("LEAN_SEGMENTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                type Kept = ([u8; 32], [u8; 32], [u8; 32], (u64, u64), (u64, u64), usize, f64, f64, f64);
+                let k = words.len() / 2;
+                let bounds: Vec<(usize, usize)> =
+                    (0..s_n).map(|s| (2 * (s * k / s_n), 2 * ((s + 1) * k / s_n))).collect();
+                assert!(bounds.iter().all(|(a, b)| b - a >= 4), "at least four leaves a segment");
+                let roots: Vec<[u8; 32]> = bounds.iter().map(|(a, b)| lean_segment_root(&words[*a..*b])).collect();
+                let all = lean_segments_root(&roots);
+                let only = std::env::var("LEAN_SEGMENT").ok().and_then(|v| v.parse::<usize>().ok());
+                let file = |s: usize| format!("{out}/segment-{slots}-{}-{s_n}-{s}.bin", index.len());
+                let kept = |s: usize| -> Option<Kept> {
+                    let k: Kept = bincode::deserialize(&fs::read(file(s)).ok()?).ok()?;
+                    (k.0 == all && k.1 == roots[s]).then_some(k)
+                };
+                for s in 0..s_n {
+                    if kept(s).is_some() || only.is_some_and(|o| o != s) {
+                        continue;
+                    }
+                    let (a, b) = bounds[s];
+                    let t = Instant::now();
+                    let o = prove_lean_segment(
+                        TowerConfig::Chain128,
+                        &words[a..b],
+                        a,
+                        Some(all),
+                        &mut make_piece,
+                        env,
+                        |line| println!("segment {s}: {line} ({:.0} s, {})", t1.elapsed().as_secs_f64(), rss()),
+                    );
+                    let r = &o.report;
+                    let k: Kept = (
+                        all,
+                        o.root,
+                        o.seed,
+                        (o.send.lo, o.send.hi),
+                        (o.recv.lo, o.recv.hi),
+                        r.root_proof_bytes,
+                        r.root_verify_ms,
+                        r.discharge_ms,
+                        t.elapsed().as_secs_f64(),
+                    );
+                    fs::write(file(s), bincode::serialize(&k).unwrap()).unwrap();
+                    println!(
+                        "segment {s} of {s_n} proved: leaves {a}..{b}; proof {} KiB; verify {:.1} ms + {:.1} ms; {:.0} s",
+                        r.root_proof_bytes / 1024,
+                        r.root_verify_ms,
+                        r.discharge_ms,
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                let done: Vec<Option<Kept>> = (0..s_n).map(kept).collect();
+                let have = done.iter().flatten().count();
+                if have < s_n {
+                    println!("{have} of {s_n} segments proved");
+                    return;
+                }
+                let done: Vec<Kept> = done.into_iter().flatten().collect();
+                let claims: Vec<SegmentClaim> = done
+                    .iter()
+                    .map(|k| SegmentClaim {
+                        root: k.1,
+                        seed: k.2,
+                        send: F128::new(k.3.0, k.3.1),
+                        recv: F128::new(k.4.0, k.4.1),
+                    })
+                    .collect();
+                let balanced = segments_balanced(&all, &claims, &statement);
+                println!("the segments joined: {balanced:?}");
+                assert_eq!(balanced, Ok(true), "the shared bus balances over the whole cone");
+                println!(
+                    "THE CONE in {s_n} proofs: {} leaves; proofs {} KiB together; verify {:.1} ms (proofs) + {:.1} ms (root-side checks); proving {:.0} s",
+                    words.len(),
+                    done.iter().map(|k| k.5).sum::<usize>() / 1024,
+                    done.iter().map(|k| k.6).sum::<f64>(),
+                    done.iter().map(|k| k.7).sum::<f64>(),
+                    done.iter().map(|k| k.8).sum::<f64>()
+                );
+                return;
+            }
+            let r = prove_lean_tower_streaming(
+                TowerConfig::Chain128,
+                &words,
+                &mut make_piece,
                 &statement,
                 env,
                 |line| println!("{line} ({:.0} s, {})", t1.elapsed().as_secs_f64(), rss()),
