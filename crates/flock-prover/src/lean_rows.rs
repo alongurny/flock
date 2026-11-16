@@ -67,7 +67,8 @@ use flock_core::lincheck::LincheckCircuit;
 
 /// Tuple width: tag, id, kind, four fields, rank, and a judgement's owner
 /// (the order of the declaration whose check it belongs to).
-const W: usize = 10;
+/// Odd, so that β and the tuple's γs pair up in the challenge seed.
+const W: usize = 11;
 
 /// A tuple on the bus, as `(lo, hi)` words: how counts are keyed.
 pub type Tuple = [(u64, u64); W];
@@ -119,6 +120,9 @@ const TAG_CTX: u64 = 9;
 const TAG_LVL: u64 = 10;
 /// A level list row: `[id, head, tail, g^length]`.
 const TAG_LIST: u64 = 11;
+/// Inside a table of several rules: the fact a row's rule derives,
+/// `[id, kind, fields, rank, owner]`, from the rule to the row itself.
+const TAG_UFACT: u64 = 12;
 const PAD_CHUNK: u64 = 1 << 31;
 // Term kinds.
 const K_BVAR: u64 = 1;
@@ -941,6 +945,18 @@ struct Port {
     send: bool,
     t: [T; W],
     mult: Vec<usize>,
+    /// Counted by a column the table sets itself (a rule's own live bit
+    /// in a table of several rules), not by the number of requests.
+    preset: bool,
+}
+
+/// One rule of a table of several: its kind of rows, where its inputs
+/// go among the shared input columns, and its live bit.
+#[derive(Clone, Debug)]
+struct Group {
+    of: Of,
+    inputs: Vec<(usize, Src)>,
+    live: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -955,6 +971,8 @@ struct Spec {
     /// A table of terms: its own column that is zero when the row has no
     /// level parameter. A part received then has none either.
     taint: Option<usize>,
+    /// The rules of a table of several rules (empty for a table of one).
+    groups: Vec<Group>,
 }
 
 fn pad<const N: usize>(t: [T; N]) -> [T; W] {
@@ -1072,6 +1090,7 @@ impl Spec {
             owner: None,
             last_f: 0,
             taint: None,
+            groups: Vec::new(),
         }
     }
     fn src(&mut self, s: Src) -> usize {
@@ -1090,6 +1109,7 @@ impl Spec {
             send: false,
             t: pad(t),
             mult: Vec::new(),
+            preset: false,
         });
     }
     fn send<const N: usize>(&mut self, t: [T; N]) {
@@ -1097,6 +1117,7 @@ impl Spec {
             send: true,
             t: pad(t),
             mult: Vec::new(),
+            preset: false,
         });
     }
     /// `X ≥ c·Y` in exponents, `x` and `y` the columns and `ex`, `ey` how
@@ -1226,6 +1247,8 @@ enum Of {
     DeclBlock,
     DeclFree,
     Fact(&'static str),
+    /// The judgements of the rules that are rare, in one table.
+    Rare,
     Assumed,
     /// A declaration's goal, with or without a value.
     Goal(bool),
@@ -1353,7 +1376,81 @@ fn spec(of: Of) -> Spec {
             s
         }
         Of::Fact(rule) => fact_spec(rule),
+        Of::Rare => rare_spec(),
     }
+}
+
+/// The rules too rare for a table each (a table costs every leaf a slot):
+/// their rows share one table.
+const RARE: [&str; 38] = [
+    "InstLet", "LInstLet", "LInstProj", "InstProj", "Zeta", "Let", "CongLam", "LInstSort", "CongSort", "LInstLZero",
+    "LInstLSucc", "LInstLMax", "LInstLIMax", "LInstLParam0", "LInstLParam1", "LInstLParam2", "CongConst1",
+    "CongConst2", "CongConst3", "LInstConst1", "LInstConst2", "LInstConst3", "LLeRefl", "LLeZero", "LLeSucc",
+    "LLeSuccSucc", "LLeMaxR0", "LLeMaxR1", "LLeIMaxR", "LLeMaxL", "LLeIMaxL", "LEqLe", "PiZero", "PiIMax", "PiV",
+    "PiMax", "PiU", "CongProj",
+];
+
+/// One table for the rare rules. A row is of one rule: it has that rule's
+/// live bit set, and the rule's inputs in the input columns all rules
+/// share. Every rule's ports are counted by its live bit, and where a
+/// rule's own table would send its fact, it sends it to the row
+/// (`TAG_UFACT`, once, on its live bit). The row receives that once and
+/// sends the fact to whoever asks. The id in the tuple is the row's, so
+/// the fact a row sends is one a rule live in that very row derived.
+fn rare_spec() -> Spec {
+    let parts: Vec<Spec> = RARE.iter().map(|r| fact_spec(r)).collect();
+    let n_in = parts.iter().map(|sp| sp.cols.iter().filter(|c| matches!(c.0, Col::In)).count()).max().unwrap();
+    let mut u = Spec::new("rare");
+    let own: Vec<T> = [Part::Kind, Part::X(0), Part::X(1), Part::X(2), Part::X(3), Part::R, Part::O]
+        .into_iter()
+        .map(|p| tc(u.val(E::Own(p))))
+        .collect();
+    let fact = |tag: u64| [k(tag), T::Id, own[0], own[1], own[2], own[3], own[4], own[5], own[6]];
+    u.recv(fact(TAG_UFACT));
+    u.send(fact(TAG_FACT));
+    let first = u.cols.len();
+    for _ in 0..n_in {
+        u.cols.push((Col::In, None));
+    }
+    for (sp, rule) in parts.iter().zip(RARE) {
+        let live = u.cols.len();
+        u.cols.push((Col::In, None));
+        let mut at = vec![0; sp.cols.len()];
+        let mut inputs = Vec::new();
+        for (y, (col, src)) in sp.cols.iter().enumerate() {
+            at[y] = match *col {
+                Col::In => {
+                    inputs.push((first + inputs.len(), src.clone().expect("an input has a source")));
+                    first + inputs.len() - 1
+                }
+                Col::Mul(a, b) => u.out(Col::Mul(at[a], at[b])),
+                Col::MulC(c, a, b) => u.out(Col::MulC(c, at[a], at[b])),
+                Col::Lin(c, a) => u.out(Col::Lin(c, at[a])),
+            };
+        }
+        for p in &sp.ports {
+            let mut t = p.t.map(|x| match x {
+                T::C(c) => T::C(at[c]),
+                x => x,
+            });
+            if p.send {
+                assert!(matches!(t[0], T::K(v) if v == int(TAG_FACT)), "a rule sends its fact");
+                t[0] = tc(u.out(Col::Lin(int(TAG_UFACT), live)));
+            }
+            u.ports.push(Port {
+                send: p.send,
+                t,
+                mult: vec![live],
+                preset: true,
+            });
+        }
+        u.groups.push(Group {
+            of: Of::Fact(rule),
+            inputs,
+            live,
+        });
+    }
+    u
 }
 
 fn term_spec(kind: u64) -> Spec {
@@ -2501,15 +2598,24 @@ impl LeanCircuit {
         }
         ofs.extend([Of::DeclChecked, Of::DeclBlock, Of::DeclFree]);
         for r in FACT_TABLES {
-            ofs.push(if r == "Assumed" {
-                Of::Assumed
-            } else {
-                Of::Fact(r)
-            });
+            if r == "Assumed" {
+                ofs.extend([Of::Rare, Of::Assumed]);
+            } else if !RARE.contains(&r) {
+                ofs.push(Of::Fact(r));
+            }
         }
         ofs.extend([Of::Goal(true), Of::Goal(false)]);
-        let at = |of: Of| ofs.iter().position(|&o| o == of).unwrap();
+        let rare_of = |of: Of| match of {
+            Of::Fact(r) => RARE.iter().position(|&x| x == r),
+            _ => None,
+        };
+        let at = |of: Of| {
+            let of = if rare_of(of).is_some() { Of::Rare } else { of };
+            ofs.iter().position(|&o| o == of).unwrap()
+        };
         let mut members: Vec<Vec<usize>> = vec![Vec::new(); ofs.len()];
+        // In the table of rare rules, each row's rule.
+        let mut rule_of: Vec<usize> = Vec::new();
         let mut term_at = vec![(0usize, 0usize); g.terms.len()];
         for (i, t) in g.terms.iter().enumerate() {
             let s = at(Of::Term(table_kind(t)));
@@ -2530,9 +2636,13 @@ impl LeanCircuit {
         }
         let mut fact_at = vec![(0usize, 0usize); b.facts.len()];
         for i in 0..b.facts.len() {
-            let s = at(table_of(g, b, i));
+            let of = table_of(g, b, i);
+            let s = at(of);
             fact_at[i] = (s, members[s].len());
             members[s].push(i);
+            if let Some(r) = rare_of(of) {
+                rule_of.push(r);
+            }
         }
         for (i, goal) in b.goals.iter().enumerate() {
             members[at(Of::Goal(goal.value.is_some()))].push(i);
@@ -2776,15 +2886,9 @@ impl LeanCircuit {
         // Rows, without count bits.
         let mut specs: Vec<Spec> = ofs.iter().map(|&o| spec(o)).collect();
         let mut tables: Vec<Vec<Vec<F128>>> = Vec::new();
-        for (s, of) in ofs.iter().enumerate() {
-            let sp = &specs[s];
-            let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
-            let mut out = Vec::new();
-            for &own in members[s].iter().filter(|_| mine(s)) {
-                let mut z = vec![F128::ZERO; cols.len()];
-                for (y, (_, src)) in sp.cols.iter().enumerate() {
-                    let Some(src) = src else { continue };
-                    z[y] = match src {
+        // An input's value for the row `own` of kind `of`.
+        let value = |src: &Src, of: &Of, own: usize, name: &str| -> Result<F128, String> {
+                    Ok(match src {
                         Src::Val(e) | Src::Pub(e) => eval(e, *of, own).f,
                         Src::Limb(e, l) => {
                             let x = eval(e, *of, own).e;
@@ -2799,7 +2903,7 @@ impl LeanCircuit {
                             let (x, y) = (eval(ex, *of, own), eval(ey, *of, own));
                             let d = x.e - y.e - cc;
                             if d < 0 || d >> (2 * limb) != 0 {
-                                return Err(format!("{}: {} ≥ {} + {cc} fails", sp.name, x.e, y.e));
+                                return Err(format!("{name}: {} ≥ {} + {cc} fails", x.e, y.e));
                             }
                             let a0 = gp(d & lmask);
                             if matches!(src, Src::GeA(..)) {
@@ -2816,7 +2920,26 @@ impl LeanCircuit {
                             }
                         }
                         Src::Bit => F128::ZERO,
-                    };
+                    })
+        };
+        for (s, of) in ofs.iter().enumerate() {
+            let sp = &specs[s];
+            let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
+            let mut out = Vec::new();
+            for (j, &own) in members[s].iter().enumerate().filter(|_| mine(s)) {
+                let mut z = vec![F128::ZERO; cols.len()];
+                // In a table of several rules the row is of its rule's kind.
+                let group = (!sp.groups.is_empty()).then(|| &sp.groups[rule_of[j]]);
+                let of = group.map_or(of, |g| &g.of);
+                for (y, (_, src)) in sp.cols.iter().enumerate() {
+                    let Some(src) = src else { continue };
+                    z[y] = value(src, of, own, &sp.name)?;
+                }
+                if let Some(g) = group {
+                    z[g.live] = F128::ONE;
+                    for (y, src) in &g.inputs {
+                        z[*y] = value(src, of, own, &sp.name)?;
+                    }
                 }
                 Gate::complete(&cols, &mut z);
                 out.push(z);
@@ -2838,6 +2961,9 @@ impl LeanCircuit {
         for (s, sp) in specs.iter().enumerate() {
             for p in sp.ports.iter().filter(|p| !p.send) {
                 for (j, z) in tables[s].iter().enumerate() {
+                    if p.preset && z[p.mult[0]] != F128::ONE {
+                        continue;
+                    }
                     *asked.entry(tuple(&p.t, z, s, j)).or_default() += 1;
                 }
             }
@@ -2850,10 +2976,34 @@ impl LeanCircuit {
                 }
             }
         }
+        // A rule's fact goes to its own row, once.
+        for (s, sp) in specs.iter().enumerate() {
+            for p in sp.ports.iter().filter(|p| p.send && p.preset) {
+                for (j, z) in tables[s].iter().enumerate() {
+                    if z[p.mult[0]] != F128::ONE {
+                        continue;
+                    }
+                    let t = tuple(&p.t, z, s, j);
+                    match asked.get_mut(&t) {
+                        Some(n) if *n > 1 => *n -= 1,
+                        Some(_) => {
+                            asked.remove(&t);
+                        }
+                        None => {
+                            return Err(format!(
+                                "{}: row {j} of rule {} does not derive its fact",
+                                sp.name,
+                                RARE[rule_of[j]]
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         // Count bits for each send port.
         for s in 0..specs.len() {
             let sends: Vec<usize> = (0..specs[s].ports.len())
-                .filter(|&p| specs[s].ports[p].send)
+                .filter(|&p| specs[s].ports[p].send && !specs[s].ports[p].preset)
                 .collect();
             for p in sends {
                 let counts: Vec<u64> = tables[s]
@@ -3183,6 +3333,8 @@ pub fn leaf(
             for (pi, p) in sp.ports.iter().enumerate() {
                 if p.mult.is_empty() {
                     live_col[pi] = Some(live);
+                } else if p.preset {
+                    // Counted by its rule's own live bit.
                 } else if let T::K(tag) = p.t[0] {
                     assert!(p.send, "a receive without a live bit");
                     tag_col[pi] = Some(cols.len());
