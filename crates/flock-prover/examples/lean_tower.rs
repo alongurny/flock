@@ -219,6 +219,22 @@ fn main() {
             }
             eprintln!("compared {n}");
         }
+        "rules" => {
+            let g: Rows = read(format!("{out}/cone.bin"));
+            let mut tot: HashMap<String, (usize, bool)> = HashMap::new();
+            for k in 0..n {
+                let b: Rows = read(format!("{out}/b{k}.bin"));
+                for (r, (c, ok)) in b.rule_census(&g) {
+                    let e = tot.entry(r).or_insert((0, ok));
+                    e.0 += c;
+                }
+            }
+            let mut v: Vec<_> = tot.into_iter().collect();
+            v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for (r, (c, ok)) in v {
+                println!("{r}\t{c}\t{}", if ok { "checked" } else { "assumed" });
+            }
+        }
         "census" => {
             let mut text = String::new();
             let mut nu = None;

@@ -1217,6 +1217,25 @@ fn fact_spec(rule: &str) -> Spec {
     s
 }
 
+impl Rows {
+    /// Judgement rows per rule, and whether the circuit checks that rule
+    /// (`false`: the row's fact goes to the assumed table).
+    pub fn rule_census(&self, g: &Rows) -> HashMap<String, (usize, bool)> {
+        let mut m: HashMap<String, (usize, bool)> = HashMap::new();
+        for i in 0..self.facts.len() {
+            let checked = table_of(g, self, i) != Of::Assumed;
+            let e = m.entry(self.facts[i].rule.clone()).or_insert((0, checked));
+            e.0 += 1;
+        }
+        m
+    }
+
+    /// Counts of cited declarations: (checked, block members, free).
+    pub fn decl_census(&self) -> usize {
+        self.decls.len()
+    }
+}
+
 /// The table a judgement row goes to.
 fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     let f = &rows.facts[i];
