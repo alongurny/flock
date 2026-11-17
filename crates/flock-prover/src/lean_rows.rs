@@ -3884,6 +3884,11 @@ pub fn pad_chunk(index: usize, slots: usize, k: usize) -> u64 {
 }
 
 /// The index of the rare rules' table among a side's tables.
+/// The table of the recursors' rules.
+pub fn rule_table() -> usize {
+    2 + TERM_TABLES.len() + 3
+}
+
 pub fn rare_table() -> usize {
     2 + TERM_TABLES.len() + 4 + FACT_TABLES.iter().filter(|r| **r != "Assumed" && rare_place(r).is_none()).count()
 }
