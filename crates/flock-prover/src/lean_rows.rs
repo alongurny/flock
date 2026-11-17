@@ -123,6 +123,13 @@ const TAG_LIST: u64 = 11;
 /// Inside a table of several rules: the fact a row's rule derives,
 /// `[id, kind, fields, rank, owner]`, from the rule to the row itself.
 const TAG_UFACT: u64 = 12;
+/// What the reduction rules read of a declaration: `[id, what, inductive
+/// type (of a constructor), g^a, g^b]` (see [`InfoRec`]).
+const TAG_INFO: u64 = 13;
+/// A declaration's key: `[id, key words]`.
+const TAG_KEY: u64 = 14;
+/// A recursor's rule: `[recursor, constructor, g^fields, right-hand side]`.
+const TAG_RULE: u64 = 15;
 const PAD_CHUNK: u64 = 1 << 31;
 // Term kinds.
 const K_BVAR: u64 = 1;
@@ -185,6 +192,13 @@ const F_LEQ: u64 = 7;
 /// `LLe(l, m)`: l is at most m for every assignment of the parameters.
 /// These rows are not in the derivation: [`certify`] adds them.
 const F_LLE: u64 = 8;
+/// Facts about application spines, added by [`certify_spines`] for the
+/// rules that read one: `Spine(t, h, n)`, t is h applied to n arguments;
+/// `Pre(t, p, n)`, p is t without its last n arguments; `Ext(u, v, w, n)`,
+/// w is u applied to the last n arguments of v.
+const F_SPINE: u64 = 9;
+const F_PRE: u64 = 10;
+const F_EXT: u64 = 11;
 
 // ---------------------------------------------------------------- the data
 
@@ -231,6 +245,30 @@ struct DeclRec {
     order: i64,
     /// Whether a goal of this proof checks it.
     checked: bool,
+    /// What the reduction rules read of it.
+    #[serde(default)]
+    info: InfoRec,
+}
+
+/// A constructor (what 2): its inductive type's key, parameters `a` and
+/// fields `b`. A recursor (what 3): `a` arguments before the indices and
+/// `b` indices. An inductive type is what 1, a quotient constant what 4.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct InfoRec {
+    what: u64,
+    key: (u64, u64),
+    a: u64,
+    b: u64,
+}
+
+/// A recursor's rule for one constructor: the recursor's declaration row,
+/// the constructor's key, its fields, and the right-hand side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RuleRec {
+    rec: usize,
+    ctor: (u64, u64),
+    fields: u64,
+    rhs: usize,
 }
 
 /// A declaration's goal: its row and the judgements that establish it.
@@ -269,6 +307,9 @@ pub struct Rows {
     goals: Vec<GoalRec>,
     /// Limb width for every table, when fixed for a whole cone.
     limb: Option<usize>,
+    /// The recursor rules (of a cone's shared side).
+    #[serde(default)]
+    rules: Vec<RuleRec>,
     /// The file's own level, list and context rows (local ids), kept only
     /// to put them in a cone's shared numbering.
     #[serde(skip)]
@@ -283,6 +324,13 @@ struct Local {
 
 impl Rows {
     pub fn parse(text: &str) -> Result<Rows, String> {
+        Self::parse_with(text, None)
+    }
+
+    /// Parses a derivation; with the cone's declaration rows (`info`), the
+    /// rules that read a constructor or a recursor get their certificates.
+    pub fn parse_with(text: &str, info: Option<&Rows>) -> Result<Rows, String> {
+        let mut rules: Vec<RuleRec> = Vec::new();
         let mut terms: Vec<TermRec> = Vec::new();
         let mut decl_at: HashMap<u64, usize> = HashMap::new();
         let mut decls = Vec::new();
@@ -443,7 +491,7 @@ impl Rows {
                         ),
                         "proj" => (
                             K_PROJ,
-                            [vi(n(3)?), vi(n(4)?), V::default()],
+                            [vi(n(3)?), ve(n(4)? as i64), V::default()],
                             [None, None, Some(ch(5)?)],
                         ),
                         k => return Err(format!("term kind {k}")),
@@ -499,7 +547,22 @@ impl Rows {
                             0
                         },
                         checked: false,
+                        info: InfoRec::default(),
                     });
+                }
+                Some("I") => {
+                    let d = *decl_at.get(&n(1)?).ok_or(format!("no declaration: {line}"))?;
+                    decls[d].info = match w[2] {
+                        "induct" => InfoRec { what: 1, key: (n(7)?, n(8)?), a: n(3)?, b: n(4)? },
+                        "ctor" => InfoRec { what: 2, key: (n(3)?, n(4)?), a: n(5)?, b: n(6)? },
+                        "rec" => InfoRec { what: 3, key: (0, 0), a: n(3)?, b: n(4)? },
+                        "quot" => InfoRec { what: 4, key: (0, 0), a: n(3)?, b: 0 },
+                        x => return Err(format!("declaration info {x}")),
+                    };
+                }
+                Some("R") => {
+                    let rec = *decl_at.get(&n(1)?).ok_or(format!("no declaration: {line}"))?;
+                    rules.push(RuleRec { rec, ctor: (n(2)?, n(3)?), fields: n(4)?, rhs: n(5)? as usize + off });
                 }
                 Some("F") => {
                     if n(1)? as usize != facts.len() {
@@ -582,6 +645,9 @@ impl Rows {
                 t.x[0] = vi(*decl_at.get(&c).ok_or(format!("no declaration {c}"))? as u64);
             }
         }
+        if let Some(info) = info {
+            certify_spines(&terms, &decls, &mut facts, info);
+        }
         // The goal: the declaration checked, by key among the cited rows or
         // as a row of its own, and every judgement's owner.
         let mut goals = Vec::new();
@@ -614,6 +680,7 @@ impl Rows {
                         key,
                         order,
                         checked: false,
+                        info: InfoRec::default(),
                     });
                     local.decl_no.push(u64::MAX);
                     decls.len() - 1
@@ -648,6 +715,7 @@ impl Rows {
             facts,
             goals,
             limb: None,
+            rules,
             local,
         })
     }
@@ -856,6 +924,160 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
     facts.extend(new);
     // Ranks again: the added rows first (their premises are added rows
     // before them), then the derivation's in order.
+    for i in (base..facts.len()).chain(0..base) {
+        facts[i].rank = facts[i].premises.iter().map(|&p| facts[p].rank + 1).max().unwrap_or(0);
+    }
+}
+
+/// Adds what the rules that read an application spine need: a projection
+/// of a constructor applied, and a recursor at a constructor applied. The
+/// derivation leaves the spines to its checker; here each is spelled out
+/// in `Spine`, `Pre` and `Ext` rows, and the row is renamed to the rule
+/// that takes them as premises (`ProjCtorAt`, `Iota0`, `IotaL`).
+fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>, info: &Rows) {
+    if !facts.iter().any(|f| matches!(f.rule.as_str(), "ProjCtor" | "Iota")) {
+        return;
+    }
+    let by_key: HashMap<(u64, u64), InfoRec> = info.decls.iter().map(|d| (d.key, d.info)).collect();
+    let rule_of: HashMap<((u64, u64), (u64, u64)), u64> =
+        info.rules.iter().map(|r| ((info.decls[r.rec].key, r.ctor), r.fields)).collect();
+    struct Cx<'a> {
+        terms: &'a [TermRec],
+        base: usize,
+        new: Vec<FactRec>,
+        memo: HashMap<(u64, [u64; 4]), usize>,
+    }
+    impl Cx<'_> {
+        fn app(&self, t: usize) -> Option<(usize, usize)> {
+            let t = &self.terms[t];
+            (t.kind == K_APP).then(|| (t.child[0].unwrap(), t.child[1].unwrap()))
+        }
+        fn add(&mut self, rule: &str, tag: u64, raw: [u64; 4], premises: Vec<usize>) -> usize {
+            if let Some(&i) = self.memo.get(&(tag, raw)) {
+                return i;
+            }
+            self.new.push(FactRec {
+                rule: rule.into(),
+                tag,
+                raw,
+                is_term: [true, true, tag == F_EXT, false],
+                premises,
+                rank: 0,
+                owner: 0,
+            });
+            let i = self.base + self.new.len() - 1;
+            self.memo.insert((tag, raw), i);
+            i
+        }
+        /// The head and the number of arguments.
+        fn head(&self, mut t: usize) -> (usize, u64) {
+            let mut n = 0;
+            while let Some((f, _)) = self.app(t) {
+                (t, n) = (f, n + 1);
+            }
+            (t, n)
+        }
+        /// The head and the number of arguments, with the row saying so.
+        fn spine(&mut self, t: usize) -> (usize, u64, usize) {
+            match self.app(t) {
+                None => (t, 0, self.add("SpineNil", F_SPINE, [t as u64, t as u64, 0, 0], vec![])),
+                Some((f, _)) => {
+                    let (h, n, p) = self.spine(f);
+                    (h, n + 1, self.add("SpineApp", F_SPINE, [t as u64, h as u64, n + 1, 0], vec![p]))
+                }
+            }
+        }
+        /// t without its last n arguments, with the row saying so.
+        fn pre(&mut self, t: usize, n: u64) -> Option<(usize, usize)> {
+            if n == 0 {
+                return Some((t, self.add("PreNil", F_PRE, [t as u64, t as u64, 0, 0], vec![])));
+            }
+            let (f, _) = self.app(t)?;
+            let (p, row) = self.pre(f, n - 1)?;
+            Some((p, self.add("PreApp", F_PRE, [t as u64, p as u64, n, 0], vec![row])))
+        }
+        /// The row saying w is u applied to the last n arguments of v.
+        fn ext(&mut self, u: usize, v: usize, w: usize, n: u64) -> Option<usize> {
+            if n == 0 {
+                return (u == w).then(|| self.add("ExtNil", F_EXT, [u as u64, v as u64, w as u64, 0], vec![]));
+            }
+            let ((v1, x), (w1, y)) = (self.app(v)?, self.app(w)?);
+            if x != y {
+                return None;
+            }
+            let row = self.ext(u, v1, w1, n - 1)?;
+            Some(self.add("ExtApp", F_EXT, [u as u64, v as u64, w as u64, n], vec![row]))
+        }
+    }
+    let base = facts.len();
+    let mut cx = Cx { terms, base, new: Vec::new(), memo: HashMap::new() };
+    // The declaration a constant term names, with its information.
+    let konst = |t: usize| -> Option<((u64, u64), InfoRec)> {
+        let t = &terms[t];
+        (t.kind == K_LEAF && t.x[0].f.lo == SUB_CONST).then(|| {
+            let key = decls[t.x[1].f.lo as usize].key;
+            (key, by_key.get(&key).copied().unwrap_or_default())
+        })
+    };
+    for i in 0..base {
+        let f = &facts[i];
+        if f.tag != F_EQ {
+            continue;
+        }
+        let (a, b) = (f.raw[1] as usize, f.raw[2] as usize);
+        if f.rule == "ProjCtor" && terms[a].kind == K_PROJ {
+            let ta = &terms[a];
+            let (s, idx, x) = (ta.x[0].f.lo as usize, ta.x[1].e as u64, ta.child[2].unwrap());
+            let (h, n) = cx.head(x);
+            let Some((_, c)) = konst(h) else { continue };
+            if c.what != 2 || c.key != decls[s].key || n != c.a + c.b || idx >= c.b {
+                continue;
+            }
+            // x without the fields after idx ends in the field.
+            let Some((p, pre)) = cx.pre(x, c.b - 1 - idx) else { continue };
+            let Some((q, field)) = cx.app(p) else { continue };
+            if field != b {
+                continue;
+            }
+            let (_, _, spine) = cx.spine(q);
+            facts[i].rule = "ProjCtorAt".into();
+            facts[i].premises = vec![pre, spine];
+            continue;
+        }
+        if f.rule == "Iota" && f.premises.len() <= 1 {
+            let (h, n) = cx.head(a);
+            let Some((rkey, r)) = konst(h) else { continue };
+            if r.what != 3 || n < r.a + r.b + 1 {
+                continue;
+            }
+            let e = n - r.a - r.b - 1;
+            let Some((a1, p1)) = cx.pre(a, e) else { continue };
+            let Some((a2, major)) = cx.app(a1) else { continue };
+            let Some((a3, p2)) = cx.pre(a2, r.b) else { continue };
+            let (_, _, p3) = cx.spine(a3);
+            let (mh, mn, p4) = cx.spine(major);
+            let Some((ckey, c)) = konst(mh) else { continue };
+            let Some(&fields) = rule_of.get(&(rkey, ckey)) else { continue };
+            if c.what != 2 || mn != c.a + c.b || fields != c.b {
+                continue;
+            }
+            // b is the right-hand side at the arguments before the indices,
+            // the fields, and the arguments after the major premise.
+            let Some((b1, _)) = cx.pre(b, e) else { continue };
+            let Some((b0, _)) = cx.pre(b1, fields) else { continue };
+            let Some((rhs, _)) = cx.pre(b0, r.a) else { continue };
+            let (Some(e1), Some(e2), Some(e3)) =
+                (cx.ext(rhs, a3, b0, r.a), cx.ext(b0, major, b1, fields), cx.ext(b1, a, b, e))
+            else {
+                continue;
+            };
+            let with_levels = !facts[i].premises.is_empty();
+            facts[i].rule = if with_levels { "IotaL" } else { "Iota0" }.into();
+            facts[i].premises.extend([p1, p2, p3, p4, e1, e2, e3]);
+        }
+    }
+    let new = std::mem::take(&mut cx.new);
+    facts.extend(new);
     for i in (base..facts.len()).chain(0..base) {
         facts[i].rank = facts[i].premises.iter().map(|&p| facts[p].rank + 1).max().unwrap_or(0);
     }
@@ -1246,9 +1468,12 @@ enum Of {
     DeclChecked,
     DeclBlock,
     DeclFree,
+    /// The recursors' rules.
+    RecRule,
     Fact(&'static str),
-    /// The judgements of the rules that are rare, in one table.
-    Rare,
+    /// The judgements of the rules that are rare, in one table; the
+    /// second such table holds the rules about application spines.
+    Rare(usize),
     Assumed,
     /// A declaration's goal, with or without a value.
     Goal(bool),
@@ -1260,7 +1485,7 @@ impl Of {
     fn shared(self) -> bool {
         matches!(
             self,
-            Of::Term(_) | Of::DeclChecked | Of::DeclBlock | Of::DeclFree
+            Of::Term(_) | Of::DeclChecked | Of::DeclBlock | Of::DeclFree | Of::RecRule
         )
     }
 }
@@ -1291,8 +1516,12 @@ fn spec(of: Of) -> Spec {
             let x: Vec<usize> = (0..4).map(|i| s.val(E::Own(Part::X(i)))).collect();
             let o = s.val(E::Own(Part::R));
             // The key, public: which declarations the proof checks or assumes.
-            s.src(Src::Pub(E::Own(Part::X(4))));
-            s.src(Src::Pub(E::Own(Part::X(5))));
+let k0 = s.src(Src::Pub(E::Own(Part::X(4))));
+            let k1 = s.src(Src::Pub(E::Own(Part::X(5))));
+            // What the reduction rules read, and the key, to whoever asks.
+            let info: Vec<usize> = (6..10).map(|i| s.val(E::Own(Part::X(i)))).collect();
+            s.send([k(TAG_INFO), T::Id, tc(info[0]), tc(info[3]), tc(info[1]), tc(info[2])]);
+            s.send([k(TAG_KEY), T::Id, tc(k0), tc(k1)]);
             let (unfold, value) = match of {
                 Of::DeclBlock => (Z, Z),
                 _ => (tc(x[0]), tc(x[2])),
@@ -1301,6 +1530,16 @@ fn spec(of: Of) -> Spec {
                 s.recv([k(TAG_CHECKED), T::Id, tc(x[1]), tc(x[3]), tc(x[2]), tc(o)]);
             }
             s.send([k(TAG_DECL), T::Id, unfold, tc(x[1]), value, tc(x[3]), tc(o)]);
+            s
+        }
+        Of::RecRule => {
+            // A recursor's rule for a constructor, both named by key (public).
+            let mut s = Spec::new("rec_rule");
+            let x: Vec<usize> = (0..4).map(|i| s.val(E::Own(Part::X(i)))).collect();
+            let keys: Vec<usize> = (4..8).map(|i| s.src(Src::Pub(E::Own(Part::X(i))))).collect();
+            s.recv([k(TAG_KEY), tc(x[0]), tc(keys[0]), tc(keys[1])]);
+            s.recv([k(TAG_KEY), tc(x[1]), tc(keys[2]), tc(keys[3])]);
+            s.send([k(TAG_RULE), tc(x[0]), tc(x[1]), tc(x[2]), tc(x[3])]);
             s
         }
         Of::Goal(with_value) => {
@@ -1376,7 +1615,7 @@ fn spec(of: Of) -> Spec {
             s
         }
         Of::Fact(rule) => fact_spec(rule),
-        Of::Rare => rare_spec(),
+        Of::Rare(which) => rare_spec(which),
     }
 }
 
@@ -1397,10 +1636,25 @@ const RARE: [&str; 38] = [
 /// (`TAG_UFACT`, once, on its live bit). The row receives that once and
 /// sends the fact to whoever asks. The id in the tuple is the row's, so
 /// the fact a row sends is one a rule live in that very row derived.
-fn rare_spec() -> Spec {
-    let parts: Vec<Spec> = RARE.iter().map(|r| fact_spec(r)).collect();
+/// The rules that read an application spine, and the rows that spell a
+/// spine out: one table, in leaves of their own like the rare rules'.
+const SPINES: [&str; 8] =
+    ["SpineNil", "SpineApp", "PreNil", "PreApp", "ExtNil", "ExtApp", "ProjCtorAt", "IotaL"];
+
+fn rares(which: usize) -> &'static [&'static str] {
+    if which == 0 { &RARE } else { &SPINES }
+}
+
+/// The table of several rules a rule is in, and its place there.
+fn rare_place(rule: &str) -> Option<(usize, usize)> {
+    (0..2).find_map(|w| rares(w).iter().position(|&x| x == rule).map(|i| (w, i)))
+}
+
+fn rare_spec(which: usize) -> Spec {
+    let rules = rares(which);
+    let parts: Vec<Spec> = rules.iter().map(|r| fact_spec(r)).collect();
     let n_in = parts.iter().map(|sp| sp.cols.iter().filter(|c| matches!(c.0, Col::In)).count()).max().unwrap();
-    let mut u = Spec::new("rare");
+    let mut u = Spec::new(if which == 0 { "rare" } else { "spines" });
     let own: Vec<T> = [Part::Kind, Part::X(0), Part::X(1), Part::X(2), Part::X(3), Part::R, Part::O]
         .into_iter()
         .map(|p| tc(u.val(E::Own(p))))
@@ -1412,7 +1666,7 @@ fn rare_spec() -> Spec {
     for _ in 0..n_in {
         u.cols.push((Col::In, None));
     }
-    for (sp, rule) in parts.iter().zip(RARE) {
+    for (sp, &rule) in parts.iter().zip(rules) {
         let live = u.cols.len();
         u.cols.push((Col::In, None));
         let mut at = vec![0; sp.cols.len()];
@@ -2056,6 +2310,111 @@ fn fact_spec(rule: &str) -> Spec {
             }
             send(&mut s, F_LLE, [tc(l), tc(m), Z, Z]);
         }
+        // Application spines. A count is an exponent, one more a step.
+        "SpineNil" | "PreNil" => {
+            let t = fld(&mut s, 0);
+            send(&mut s, if rule == "SpineNil" { F_SPINE } else { F_PRE }, [tc(t), tc(t), one, Z]);
+        }
+        "SpineApp" | "PreApp" => {
+            let tag = if rule == "SpineApp" { F_SPINE } else { F_PRE };
+            let (t, h) = (fld(&mut s, 0), fld(&mut s, 1));
+            let fun = s.val(E::Tm(ch(f(0), 0), Part::Id));
+            s.term(t, f(0), k(K_APP), [c(fun), None, Some(Z)], None);
+            let m = s.val(E::Prem(0, Part::X(2)));
+            s.prem(0, tag, [c(fun), c(h), c(m), Some(Z)], r);
+            let n = s.out(Col::Lin(G, m));
+            send(&mut s, tag, [tc(t), tc(h), tc(n), Z]);
+        }
+        "ExtNil" => {
+            let (u, v) = (fld(&mut s, 0), fld(&mut s, 1));
+            send(&mut s, F_EXT, [tc(u), tc(v), tc(u), one]);
+        }
+        "ExtApp" => {
+            let (u, v, w) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (v1, x, w1) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+                s.val(E::Tm(ch(f(2), 0), Part::Id)),
+            );
+            s.term(v, f(1), k(K_APP), [c(v1), c(x), Some(Z)], None);
+            s.term(w, f(2), k(K_APP), [c(w1), c(x), Some(Z)], None);
+            let m = s.val(E::Prem(0, Part::X(3)));
+            s.prem(0, F_EXT, [c(u), c(v1), c(w1), c(m)], r);
+            let n = s.out(Col::Lin(G, m));
+            send(&mut s, F_EXT, [tc(u), tc(v), tc(w), tc(n)]);
+        }
+        // proj S i (c ps fs) = f_i: the term without the fields after i
+        // ends in the field, and what is before it is the constructor c of
+        // S at params + i arguments.
+        "ProjCtorAt" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (st, ix) = (s.val(E::Tm(f(1), Part::X(0))), s.val(E::Tm(f(1), Part::X(1))));
+            let x = s.val(E::Tm(ch(f(1), 2), Part::Id));
+            s.term(a, f(1), k(K_PROJ), [c(st), c(ix), c(x)], None);
+            let (p, gj) = (s.val(E::Prem(0, Part::X(1))), s.val(E::Prem(0, Part::X(2))));
+            s.prem(0, F_PRE, [c(x), c(p), c(gj), Some(Z)], r);
+            let q = s.val(E::Tm(ch(TR::PFld(0, 1), 0), Part::Id));
+            s.term(p, TR::PFld(0, 1), k(K_APP), [c(q), c(b), Some(Z)], None);
+            let h = s.val(E::Prem(1, Part::X(1)));
+            let d = s.val(E::Tm(TR::PFld(1, 1), Part::X(1)));
+            s.term(h, TR::PFld(1, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), None], None);
+            let params = s.val(E::Dcl(TR::PFld(1, 1), Part::X(7)));
+            // fields = j + i + 1 and the count before the field is params + i.
+            let fields = s.out(Col::MulC(G, gj, ix));
+            s.recv([k(TAG_INFO), tc(d), k(2), tc(st), tc(params), tc(fields)]);
+            let m = s.out(Col::Mul(params, ix));
+            s.prem(1, F_SPINE, [c(q), c(h), c(m), Some(Z)], r);
+            // The index is a number: the count is at least the parameters.
+            s.ge(m, E::Prem(1, Part::X(2)), params, E::Dcl(TR::PFld(1, 1), Part::X(7)), 0);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
+        // rec ps ms mins idxs (c qs fs) es = rhs ps ms mins fs es, with
+        // rhs the rule of rec for c at the levels.
+        "IotaL" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let pf = |j: usize, x: usize| TR::PFld(j, x);
+            // a without the arguments after the major premise ends in it.
+            let (a1, ge_) = (s.val(E::Prem(1, Part::X(1))), s.val(E::Prem(1, Part::X(2))));
+            s.prem(1, F_PRE, [c(a), c(a1), c(ge_), Some(Z)], r);
+            let (a2, major) = (s.val(E::Tm(ch(pf(1, 1), 0), Part::Id)), s.val(E::Tm(ch(pf(1, 1), 1), Part::Id)));
+            s.term(a1, pf(1, 1), k(K_APP), [c(a2), c(major), Some(Z)], None);
+            // Before the indices: the recursor at its parameters, motives and minors.
+            let (a3, gind) = (s.val(E::Prem(2, Part::X(1))), s.val(E::Prem(2, Part::X(2))));
+            s.prem(2, F_PRE, [c(a2), c(a3), c(gind), Some(Z)], r);
+            let (h, gbefore) = (s.val(E::Prem(3, Part::X(1))), s.val(E::Prem(3, Part::X(2))));
+            s.prem(3, F_SPINE, [c(a3), c(h), c(gbefore), Some(Z)], r);
+            let (rd, ls) = (s.val(E::Tm(pf(3, 1), Part::X(1))), s.val(E::Tm(pf(3, 1), Part::X(2))));
+            s.term(h, pf(3, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(rd), c(ls)], None);
+            s.recv([k(TAG_INFO), tc(rd), k(3), Z, tc(gbefore), tc(gind)]);
+            // As many levels as the recursor has parameters.
+            let dcl: Vec<usize> = (0..4).map(|i| s.val(E::Dcl(pf(3, 1), Part::X(i)))).collect();
+            let ord = s.val(E::Dcl(pf(3, 1), Part::R));
+            s.list(ls, ch(pf(3, 1), 2), None, None, Some(tc(dcl[1])));
+            s.recv([k(TAG_DECL), tc(rd), tc(dcl[0]), tc(dcl[1]), tc(dcl[2]), tc(dcl[3]), tc(ord)]);
+            // The major premise: a constructor at its parameters and fields.
+            let mh = s.val(E::Prem(4, Part::X(1)));
+            let cd = s.val(E::Tm(pf(4, 1), Part::X(1)));
+            s.term(mh, pf(4, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(cd), None], None);
+            let (ind, cp, gfields) = (
+                s.val(E::Dcl(pf(4, 1), Part::X(9))),
+                s.val(E::Dcl(pf(4, 1), Part::X(7))),
+                s.val(E::Dcl(pf(4, 1), Part::X(8))),
+            );
+            s.recv([k(TAG_INFO), tc(cd), k(2), tc(ind), tc(cp), tc(gfields)]);
+            let mn = s.out(Col::Mul(cp, gfields));
+            s.prem(4, F_SPINE, [c(major), c(mh), c(mn), Some(Z)], r);
+            // The rule, its right-hand side at the levels.
+            let (rhs, rhs2) = (s.val(E::Prem(0, Part::X(0))), s.val(E::Prem(0, Part::X(2))));
+            s.recv([k(TAG_RULE), tc(rd), tc(cd), tc(gfields), tc(rhs)]);
+            s.prem(0, F_LINST, [c(rhs), c(ls), c(rhs2), Some(Z)], r);
+            // b: the right-hand side at the arguments before the indices,
+            // then the fields, then the arguments after the major premise.
+            let (b0, b1) = (s.val(E::Prem(5, Part::X(2))), s.val(E::Prem(6, Part::X(2))));
+            s.prem(5, F_EXT, [c(rhs2), c(a3), c(b0), c(gbefore)], r);
+            s.prem(6, F_EXT, [c(b0), c(major), c(b1), c(gfields)], r);
+            s.prem(7, F_EXT, [c(b1), c(a), c(b), c(ge_)], r);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
         "LEqLe" => {
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
             s.prem(0, F_LLE, [c(l), c(m), Some(Z), Some(Z)], r);
@@ -2324,6 +2683,14 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "LLeMaxL" => "LLeMaxL",
         "LLeIMaxL" => "LLeIMaxL",
         "LEqLe" => "LEqLe",
+        "SpineNil" => "SpineNil",
+        "SpineApp" => "SpineApp",
+        "PreNil" => "PreNil",
+        "PreApp" => "PreApp",
+        "ExtNil" => "ExtNil",
+        "ExtApp" => "ExtApp",
+        "ProjCtorAt" => "ProjCtorAt",
+        "IotaL" => "IotaL",
         "PiZero" => "PiZero",
         "PiIMax" => "PiIMax",
         "PiV" => "PiV",
@@ -2359,7 +2726,15 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 64] = [
+const FACT_TABLES: [&str; 72] = [
+    "SpineNil",
+    "SpineApp",
+    "PreNil",
+    "PreApp",
+    "ExtNil",
+    "ExtApp",
+    "ProjCtorAt",
+    "IotaL",
     "Const0",
     "ConstL",
     "Refl",
@@ -2596,26 +2971,26 @@ impl LeanCircuit {
         for kd in TERM_TABLES {
             ofs.push(Of::Term(kd));
         }
-        ofs.extend([Of::DeclChecked, Of::DeclBlock, Of::DeclFree]);
+        ofs.extend([Of::DeclChecked, Of::DeclBlock, Of::DeclFree, Of::RecRule]);
         for r in FACT_TABLES {
             if r == "Assumed" {
-                ofs.extend([Of::Rare, Of::Assumed]);
-            } else if !RARE.contains(&r) {
+                ofs.extend([Of::Rare(0), Of::Rare(1), Of::Assumed]);
+            } else if rare_place(r).is_none() {
                 ofs.push(Of::Fact(r));
             }
         }
         ofs.extend([Of::Goal(true), Of::Goal(false)]);
         let rare_of = |of: Of| match of {
-            Of::Fact(r) => RARE.iter().position(|&x| x == r),
+            Of::Fact(r) => rare_place(r),
             _ => None,
         };
         let at = |of: Of| {
-            let of = if rare_of(of).is_some() { Of::Rare } else { of };
+            let of = rare_of(of).map_or(of, |(w, _)| Of::Rare(w));
             ofs.iter().position(|&o| o == of).unwrap()
         };
         let mut members: Vec<Vec<usize>> = vec![Vec::new(); ofs.len()];
         // In the table of rare rules, each row's rule.
-        let mut rule_of: Vec<usize> = Vec::new();
+        let mut rule_of: Vec<Vec<usize>> = vec![Vec::new(); ofs.len()];
         let mut term_at = vec![(0usize, 0usize); g.terms.len()];
         for (i, t) in g.terms.iter().enumerate() {
             let s = at(Of::Term(table_kind(t)));
@@ -2640,13 +3015,14 @@ impl LeanCircuit {
             let s = at(of);
             fact_at[i] = (s, members[s].len());
             members[s].push(i);
-            if let Some(r) = rare_of(of) {
-                rule_of.push(r);
+            if let Some((_, r)) = rare_of(of) {
+                rule_of[s].push(r);
             }
         }
         for (i, goal) in b.goals.iter().enumerate() {
             members[at(Of::Goal(goal.value.is_some()))].push(i);
         }
+        members[at(Of::RecRule)] = (0..g.rules.len()).collect();
         // Range limbs wide enough for every rank, bound and order: 2^(2L) > span.
         let limb = g.limb.unwrap_or_else(|| {
             let span = b
@@ -2751,6 +3127,8 @@ impl LeanCircuit {
                 }
             } else if (f.tag == F_INST || f.tag == F_HAS) && x == 1 {
                 ve(f.raw[1] as i64)
+            } else if (matches!(f.tag, F_SPINE | F_PRE) && x == 2) || (f.tag == F_EXT && x == 3) {
+                ve(f.raw[x] as i64)
             } else {
                 vi(f.raw[x])
             }
@@ -2787,6 +3165,21 @@ impl LeanCircuit {
                 Part::O => unreachable!(),
             }
         };
+        let decl_by_key: HashMap<(u64, u64), usize> = g.decls.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+        let rule_part = |i: usize, p: Part| -> V {
+            let r = &g.rules[i];
+            match p {
+                Part::X(0) => V { f: decl_id(r.rec), e: 0 },
+                Part::X(1) => V { f: decl_id(decl_by_key[&r.ctor]), e: 0 },
+                Part::X(2) => ve(r.fields as i64),
+                Part::X(3) => V { f: term_id(r.rhs), e: 0 },
+                Part::X(4) => vi(g.decls[r.rec].key.0),
+                Part::X(5) => vi(g.decls[r.rec].key.1),
+                Part::X(6) => vi(r.ctor.0),
+                Part::X(7) => vi(r.ctor.1),
+                _ => unreachable!(),
+            }
+        };
         let decl_part = |i: usize, p: Part| -> V {
             let d = &g.decls[i];
             match p {
@@ -2806,6 +3199,14 @@ impl LeanCircuit {
                 },
                 Part::X(4) => vi(d.key.0),
                 Part::X(5) => vi(d.key.1),
+                Part::X(6) => vi(d.info.what),
+                Part::X(7) => ve(d.info.a as i64),
+                Part::X(8) => ve(d.info.b as i64),
+                // A constructor's inductive type.
+                Part::X(9) => match (d.info.what, decl_by_key.get(&d.info.key)) {
+                    (2, Some(&t)) => V { f: decl_id(t), e: 0 },
+                    _ => V::default(),
+                },
                 Part::R => ve(d.order),
                 _ => unreachable!(),
             }
@@ -2863,6 +3264,7 @@ impl LeanCircuit {
                 E::Own(p) => match of {
                     Of::Term(_) => term_part(own, *p),
                     Of::DeclChecked | Of::DeclBlock | Of::DeclFree => decl_part(own, *p),
+                    Of::RecRule => rule_part(own, *p),
                     Of::Goal(_) => {
                         let d = b.goals[own].decl;
                         match p {
@@ -2929,7 +3331,7 @@ impl LeanCircuit {
             for (j, &own) in members[s].iter().enumerate().filter(|_| mine(s)) {
                 let mut z = vec![F128::ZERO; cols.len()];
                 // In a table of several rules the row is of its rule's kind.
-                let group = (!sp.groups.is_empty()).then(|| &sp.groups[rule_of[j]]);
+                let group = (!sp.groups.is_empty()).then(|| &sp.groups[rule_of[s][j]]);
                 let of = group.map_or(of, |g| &g.of);
                 for (y, (_, src)) in sp.cols.iter().enumerate() {
                     let Some(src) = src else { continue };
@@ -2991,9 +3393,9 @@ impl LeanCircuit {
                         }
                         None => {
                             return Err(format!(
-                                "{}: row {j} of rule {} does not derive its fact",
+                                "{}: row {j} of rule {:?} does not derive its fact",
                                 sp.name,
-                                RARE[rule_of[j]]
+                                sp.groups[rule_of[s][j]].of
                             ));
                         }
                     }
@@ -3483,7 +3885,7 @@ pub fn pad_chunk(index: usize, slots: usize, k: usize) -> u64 {
 
 /// The index of the rare rules' table among a side's tables.
 pub fn rare_table() -> usize {
-    2 + TERM_TABLES.len() + 3 + FACT_TABLES.iter().filter(|r| **r != "Assumed" && !RARE.contains(r)).count()
+    2 + TERM_TABLES.len() + 4 + FACT_TABLES.iter().filter(|r| **r != "Assumed" && rare_place(r).is_none()).count()
 }
 
 /// What a leaf contributes to the statement: its slots' chunk words, and
@@ -4221,6 +4623,9 @@ impl Cone {
                 }
             };
             self.shared.decls[i].checked |= d.checked;
+            if d.info.what != 0 {
+                self.shared.decls[i].info = d.info;
+            }
             self.span = self.span.max(d.order + 1);
             decl.push(i);
         }
@@ -4272,6 +4677,9 @@ impl Cone {
                     }
                 }
             }
+        }
+        for r in &r.rules {
+            self.shared.rules.push(RuleRec { rec: decl[r.rec], ctor: r.ctor, fields: r.fields, rhs: tm[r.rhs] });
         }
         // Judgements and the goal.
         let base = batch.facts.len();

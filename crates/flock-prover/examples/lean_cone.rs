@@ -47,7 +47,7 @@ fn build_batch(k: usize, out: &str) -> (LeanCircuit, HashMap<Tuple, u64>) {
     let (c, left) = LeanCircuit::build_side(&g, &b, Side::Batch, batch_base(k), &HashMap::new())
         .unwrap_or_else(|e| panic!("batch {k}: {e}"));
     // What is left is asked of the shared side: terms and declarations.
-    let bad: Vec<_> = left.keys().filter(|t| ![1, 3].contains(&tag(t))).collect();
+    let bad: Vec<_> = left.keys().filter(|t| ![1, 3, 9, 10, 11, 13, 15].contains(&tag(t))).collect();
     assert!(
         bad.is_empty(),
         "batch {k} asks for {} tuples no one gives, e.g. {:?}",
@@ -145,23 +145,48 @@ fn main() {
             }
             let t = Instant::now();
             let mut cone = Cone::new();
+            // The cone's declaration rows (`lean_dump --info`), when given:
+            // they join the shared side first, and the rules that read a
+            // constructor or a recursor get their certificates.
+            let info = a.get(4).map(|f| Rows::parse(&fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}")));
+            if let Some(f) = a.get(4) {
+                let r = Rows::parse(&fs::read_to_string(f).unwrap()).unwrap();
+                cone.add(r, &mut Rows::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+            }
             let (mut facts, mut goals) = (0, 0);
+            let mut census: std::collections::BTreeMap<String, (usize, bool)> = Default::default();
             for (k, files) in by.iter().enumerate() {
                 let mut batch = Rows::default();
                 for f in files {
                     let text = fs::read_to_string(Path::new(dir).join(f)).unwrap();
-                    let r = Rows::parse(&text).unwrap_or_else(|e| panic!("{f}: {e}"));
+                    let r = Rows::parse_with(&text, info.as_ref()).unwrap_or_else(|e| panic!("{f}: {e}"));
                     cone.add(r, &mut batch)
                         .unwrap_or_else(|e| panic!("{f}: {e}"));
                 }
                 let (_, _, nf) = batch.counts();
                 facts += nf;
                 goals += files.len();
-                write(format!("{out}/b{k}.bin"), &batch);
+                // With `-` for the output, only the census of rules.
+                if out == "-" {
+                    for (r, (n, checked)) in batch.rule_census(&cone.shared) {
+                        let e = census.entry(r).or_insert((0usize, checked));
+                        e.0 += n;
+                    }
+                } else {
+                    write(format!("{out}/b{k}.bin"), &batch);
+                }
                 eprintln!("batch {k}: {} files, {nf} facts", files.len());
             }
             let (terms, checked, block, free) = cone.stats();
-            write(format!("{out}/cone.bin"), &cone.finish());
+            if out == "-" {
+                let mut v: Vec<_> = census.into_iter().collect();
+                v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+                for (r, (n, checked)) in v {
+                    println!("{r}\t{n}\t{}", if checked { "checked" } else { "assumed" });
+                }
+            } else {
+                write(format!("{out}/cone.bin"), &cone.finish());
+            }
             println!(
                 "{} batches, {goals} goals, {facts} facts; shared: {terms} terms, declarations {checked} checked, {block} in inductive blocks, {free} free; {:.0} s",
                 by.len(),

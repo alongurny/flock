@@ -427,10 +427,17 @@ fn main() {
             // others together.
             let rare_k: usize = std::env::var("LEAN_RARE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             let rare = flock_prover::lean_rows::rare_table();
-            let rare_census: Vec<usize> = census.iter().map(|r| r[rare]).collect();
+            // The table of the spine rules follows it and shares its leaves
+            // (LEAN_SPINE_SLOTS slots each, 2 unless said).
+            let spine_k: usize = std::env::var("LEAN_SPINE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            let late: Vec<(usize, usize)> = vec![(rare, rare_k), (rare + 1, spine_k)];
+            let late_census: Vec<Vec<usize>> =
+                late.iter().map(|&(t, _)| census.iter().map(|r| r[t]).collect()).collect();
             if rare_k > 0 {
                 for r in &mut census {
-                    r[rare] = 0;
+                    for &(t, _) in &late {
+                        r[t] = 0;
+                    }
                 }
             }
             let profile = profile(nu, &census, slots);
@@ -485,19 +492,24 @@ fn main() {
             let n_common = plan.len();
             let mut profiles: Vec<Profile> = vec![profile.clone(); n_common];
             if rare_k > 0 {
-                let rare_profile = Profile { nu, slots: vec![rare; rare_k] };
-                let all: Vec<(usize, usize)> = rare_census
+                let rare_profile =
+                    Profile { nu, slots: late.iter().flat_map(|&(t, k)| vec![t; k]).collect() };
+                let all: Vec<Vec<(usize, usize)>> = late_census
                     .iter()
-                    .enumerate()
-                    .flat_map(|(side, &c)| (0..c).map(move |ch| (side, ch)))
+                    .map(|c| c.iter().enumerate().flat_map(|(side, &c)| (0..c).map(move |ch| (side, ch))).collect())
                     .collect();
-                for part in all.chunks(rare_k) {
-                    let mut leaf: Vec<Option<(usize, usize)>> = part.iter().copied().map(Some).collect();
-                    leaf.resize(rare_k, None);
+                let n_late =
+                    late.iter().zip(&all).map(|(&(_, k), a)| a.len().div_ceil(k.max(1))).max().unwrap_or(0);
+                let width: usize = late.iter().map(|x| x.1).sum();
+                for l in 0..n_late {
+                    let mut leaf: Vec<Option<(usize, usize)>> = Vec::with_capacity(width);
+                    for (&(_, k), a) in late.iter().zip(&all) {
+                        leaf.extend((l * k..(l + 1) * k).map(|i| a.get(i).copied()));
+                    }
                     plan.push(leaf);
                 }
                 while (plan.len() - n_common) % 2 == 1 || plan.len() - n_common < 4 {
-                    plan.push(vec![None; rare_k]);
+                    plan.push(vec![None; width]);
                 }
                 profiles.resize(plan.len(), rare_profile);
             }
