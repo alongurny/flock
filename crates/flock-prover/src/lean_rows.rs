@@ -199,6 +199,15 @@ const F_LLE: u64 = 8;
 const F_SPINE: u64 = 9;
 const F_PRE: u64 = 10;
 const F_EXT: u64 = 11;
+/// The walk of a structure's constructor type that types a projection,
+/// added by [`certify_spines`]: `PTel(g, q, r)`, r is the constructor's
+/// type at the levels and the arguments of q (the structure applied to
+/// parameters); `FTel(g, proj S k x, r, prop)`, r is what is left of it
+/// after the parameters of x's type and the first k fields, each replaced
+/// by its projection. prop is 1 when every field passed that a later type
+/// mentions was shown a proof, 0 when the structure is not a proposition.
+const F_PTEL: u64 = 12;
+const F_FTEL: u64 = 13;
 
 // ---------------------------------------------------------------- the data
 
@@ -553,7 +562,13 @@ impl Rows {
                 Some("I") => {
                     let d = *decl_at.get(&n(1)?).ok_or(format!("no declaration: {line}"))?;
                     decls[d].info = match w[2] {
-                        "induct" => InfoRec { what: 1, key: (n(7)?, n(8)?), a: n(3)?, b: n(4)? },
+                        // The key is the constructor's when there is exactly one.
+                        "induct" => InfoRec {
+                            what: 1,
+                            key: if n(5)? == 1 { (n(7)?, n(8)?) } else { (0, 0) },
+                            a: n(3)?,
+                            b: n(4)?,
+                        },
                         "ctor" => InfoRec { what: 2, key: (n(3)?, n(4)?), a: n(5)?, b: n(6)? },
                         "rec" => InfoRec { what: 3, key: (0, 0), a: n(3)?, b: n(4)? },
                         "quot" => InfoRec { what: 4, key: (0, 0), a: n(3)?, b: 0 },
@@ -935,7 +950,7 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
 /// in `Spine`, `Pre` and `Ext` rows, and the row is renamed to the rule
 /// that takes them as premises (`ProjCtorAt`, `Iota0`, `IotaL`).
 fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>, info: &Rows) {
-    if !facts.iter().any(|f| matches!(f.rule.as_str(), "ProjCtor" | "Iota")) {
+    if !facts.iter().any(|f| matches!(f.rule.as_str(), "ProjCtor" | "Iota" | "Proj")) {
         return;
     }
     let by_key: HashMap<(u64, u64), InfoRec> = info.decls.iter().map(|d| (d.key, d.info)).collect();
@@ -946,6 +961,7 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
         base: usize,
         new: Vec<FactRec>,
         memo: HashMap<(u64, [u64; 4]), usize>,
+        clash: usize,
     }
     impl Cx<'_> {
         fn app(&self, t: usize) -> Option<(usize, usize)> {
@@ -954,13 +970,17 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
         }
         fn add(&mut self, rule: &str, tag: u64, raw: [u64; 4], premises: Vec<usize>) -> usize {
             if let Some(&i) = self.memo.get(&(tag, raw)) {
+                // A walk met again must be the same walk.
+                if matches!(tag, F_PTEL | F_FTEL) && self.new[i - self.base].premises != premises {
+                    self.clash += 1;
+                }
                 return i;
             }
             self.new.push(FactRec {
                 rule: rule.into(),
                 tag,
                 raw,
-                is_term: [true, true, tag == F_EXT, false],
+                is_term: [true, true, matches!(tag, F_EXT | F_PTEL | F_FTEL), false],
                 premises,
                 rank: 0,
                 owner: 0,
@@ -1008,9 +1028,168 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             let row = self.ext(u, v1, w1, n - 1)?;
             Some(self.add("ExtApp", F_EXT, [u as u64, v as u64, w as u64, n], vec![row]))
         }
+        /// The rows that walk the constructor's type for the projection
+        /// typed by fact i, and the rule and premises that fact gets. The
+        /// derivation has every step among the fact's premises, in order.
+        fn proj_walk(
+            &mut self,
+            facts: &[FactRec],
+            i: usize,
+            decls: &[DeclRec],
+            decl_ix: &HashMap<(u64, u64), usize>,
+            by_key: &HashMap<(u64, u64), InfoRec>,
+        ) -> Option<(&'static str, Vec<usize>)> {
+            let terms = self.terms;
+            let f = &facts[i];
+            let (g, e, t) = (f.raw[0], f.raw[1] as usize, f.raw[2] as usize);
+            let te = &terms[e];
+            if te.kind != K_PROJ {
+                return None;
+            }
+            let (s, idx, x) = (te.x[0].f.lo as usize, te.x[1].e as u64, te.child[2]?);
+            let p = &f.premises;
+            // Premise j, a fact of this kind in the context.
+            let fact = |j: usize, tag: u64| -> Option<&FactRec> {
+                let q = facts.get(*p.get(j)?)?;
+                (q.tag == tag && (tag == F_LINST || q.raw[0] == g)).then_some(q)
+            };
+            let level_of = |sort: u64| -> Option<&TermRec> {
+                let sort = &terms[sort as usize];
+                (sort.kind == K_LEAF && sort.x[0].f.lo == SUB_SORT).then(|| &terms[sort.child[1].unwrap()])
+            };
+            let zero = |l: &TermRec| l.kind == K_LLEAF && l.x[0].f.lo == 0;
+            // `Infer(g, a, S)` and `Eq(g, S, sort zero)` at premises j, j + 1.
+            let prop = |j: usize, a: usize| -> Option<()> {
+                let (c1, c2) = (fact(j, F_INFER)?, fact(j + 1, F_EQ)?);
+                (c1.raw[1] as usize == a && c2.raw[1] == c1.raw[2] && zero(level_of(c2.raw[2])?)).then_some(())
+            };
+            let (p0, p1, p2, p3, p4) =
+                (fact(0, F_INFER)?, fact(1, F_EQ)?, fact(2, F_INFER)?, fact(3, F_EQ)?, fact(4, F_LINST)?);
+            if p0.raw[1] as usize != x || p1.raw[1] != p0.raw[2] || p2.raw[1] != p0.raw[2] || p3.raw[1] != p2.raw[2] {
+                return None;
+            }
+            let iapp = p1.raw[2] as usize;
+            let lvl = level_of(p3.raw[2])?;
+            let is_prop = zero(lvl);
+            let base = match (is_prop, lvl.kind) {
+                (true, _) => "FTelNilP",
+                (_, K_LSUCC) => "FTelNilS",
+                (_, K_LMAX) => "FTelNilM",
+                (_, K_LIMAX) => "FTelNilI",
+                _ => return None,
+            };
+            let (h, n) = self.head(iapp);
+            let th = &terms[h];
+            if th.kind != K_LEAF || th.x[0].f.lo != SUB_CONST {
+                return None;
+            }
+            let d = th.x[1].f.lo as usize;
+            let info = by_key.get(&decls[d].key).copied().unwrap_or_default();
+            if d != s || info.what != 1 || info.key == (0, 0) || n != info.a + info.b {
+                return None;
+            }
+            let ctor = *decl_ix.get(&info.key)?;
+            if decls[ctor].ty != Some(p4.raw[0] as usize) || Some(p4.raw[1] as usize) != th.child[2] {
+                return None;
+            }
+            let (q, pre) = self.pre(iapp, info.b)?;
+            let (_, _, spine) = self.spine(q);
+            // q's prefixes, from the constant up.
+            let mut pref = vec![q];
+            while let Some((f0, _)) = self.app(*pref.last().unwrap()) {
+                pref.push(f0);
+            }
+            pref.reverse();
+            // `Eq(g, r, pi a body)` at premise j.
+            let pi = |j: usize, r: u64| -> Option<(usize, usize)> {
+                let q = fact(j, F_EQ)?;
+                let w = &terms[q.raw[2] as usize];
+                (q.raw[1] == r && w.kind == K_PI).then(|| (w.child[0].unwrap(), w.child[1].unwrap()))
+            };
+            let mut r = p4.raw[2];
+            let mut row = self.add("PTelNil", F_PTEL, [g, h as u64, r, 0], vec![p[4]]);
+            let mut j = 5;
+            for &qk in &pref[1..] {
+                let (_, arg) = self.app(qk)?;
+                let (_, body) = pi(j, r)?;
+                let q = facts.get(*p.get(j + 1)?)?;
+                if q.tag != F_INST || q.raw[0] as usize != body || q.raw[1] != 0 || q.raw[2] as usize != arg {
+                    return None;
+                }
+                r = q.raw[3];
+                row = self.add("PTelApp", F_PTEL, [g, qk as u64, r, 0], vec![row, p[j], p[j + 1]]);
+                j += 2;
+            }
+            let flag = is_prop as u64;
+            // The row for `proj S k x` once that term is known: the base,
+            // or the step from the projection before.
+            let close = |cx: &mut Self, pt: usize, r: u64, pending: Option<(&'static str, Vec<usize>)>| -> usize {
+                let (rule, pr) = pending.unwrap_or_else(|| {
+                    let mut pr = vec![p[0], p[1], pre, spine, row];
+                    if !is_prop {
+                        pr.extend([p[2], p[3]]);
+                    }
+                    (base, pr)
+                });
+                cx.add(rule, F_FTEL, [g, pt as u64, r, flag], pr)
+            };
+            let mut pending = None;
+            for k in 0..idx {
+                let (a, body) = pi(j, r)?;
+                let dep = is_prop && terms[body].lbr > 0;
+                let ji = if dep { j + 3 } else { j + 1 };
+                let q = facts.get(*p.get(ji)?)?;
+                let pk = q.raw[2] as usize;
+                let tp = &terms[pk];
+                if q.tag != F_INST
+                    || q.raw[0] as usize != body
+                    || q.raw[1] != 0
+                    || tp.kind != K_PROJ
+                    || tp.x[0].f.lo as usize != s
+                    || tp.x[1].e as u64 != k
+                    || tp.child[2] != Some(x)
+                {
+                    return None;
+                }
+                if dep {
+                    prop(j + 1, a)?;
+                }
+                let cur = close(self, pk, r, pending.take());
+                let mut pr = vec![cur, p[j], p[ji]];
+                let rule = if dep {
+                    pr.extend([p[j + 1], p[j + 2]]);
+                    "FTelStepP1"
+                } else if is_prop {
+                    "FTelStepP0"
+                } else {
+                    "FTelStep"
+                };
+                r = q.raw[3];
+                pending = Some((rule, pr));
+                j = ji + 1;
+            }
+            let (a, _) = pi(j, r)?;
+            if a != t {
+                return None;
+            }
+            if is_prop {
+                prop(j + 1, a)?;
+            }
+            if p.len() != j + 1 + 2 * is_prop as usize {
+                return None;
+            }
+            let cur = close(self, e, r, pending.take());
+            let mut pr = vec![cur, p[j]];
+            if is_prop {
+                pr.extend([p[j + 1], p[j + 2]]);
+            }
+            Some((if is_prop { "ProjTyP" } else { "ProjTy" }, pr))
+        }
     }
     let base = facts.len();
-    let mut cx = Cx { terms, base, new: Vec::new(), memo: HashMap::new() };
+    let mut cx = Cx { terms, base, new: Vec::new(), memo: HashMap::new(), clash: 0 };
+    let decl_ix: HashMap<(u64, u64), usize> = decls.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+    let mut tel: Vec<(usize, &str, Vec<usize>)> = Vec::new();
     // The declaration a constant term names, with its information.
     let konst = |t: usize| -> Option<((u64, u64), InfoRec)> {
         let t = &terms[t];
@@ -1021,6 +1200,12 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
     };
     for i in 0..base {
         let f = &facts[i];
+        if f.rule == "Proj" && f.tag == F_INFER {
+            if let Some((rule, premises)) = cx.proj_walk(facts, i, decls, &decl_ix, &by_key) {
+                tel.push((i, rule, premises));
+            }
+            continue;
+        }
         if f.tag != F_EQ {
             continue;
         }
@@ -1076,10 +1261,26 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             facts[i].premises.extend([p1, p2, p3, p4, e1, e2, e3]);
         }
     }
+    if cx.clash > 0 {
+        eprintln!("{} projection walks met again with other premises", cx.clash);
+    }
+    for (i, rule, premises) in tel {
+        facts[i].rule = rule.into();
+        facts[i].premises = premises;
+    }
     let new = std::mem::take(&mut cx.new);
     facts.extend(new);
-    for i in (base..facts.len()).chain(0..base) {
-        facts[i].rank = facts[i].premises.iter().map(|&p| facts[p].rank + 1).max().unwrap_or(0);
+    // The added rows and the derivation's read each other: until no rank moves.
+    loop {
+        let mut moved = false;
+        for i in (base..facts.len()).chain(0..base) {
+            let rank = facts[i].premises.iter().map(|&p| facts[p].rank + 1).max().unwrap_or(0);
+            moved |= rank != facts[i].rank;
+            facts[i].rank = rank;
+        }
+        if !moved {
+            break;
+        }
     }
 }
 
@@ -1124,6 +1325,9 @@ enum E {
     Tm(TR, Part),
     /// A part of the declaration of a constant term.
     Dcl(TR, Part),
+    /// A part of the declaration of the one constructor of the inductive
+    /// type a constant term names.
+    Ctor(TR, Part),
 }
 
 #[derive(Clone, Debug)]
@@ -1640,21 +1844,30 @@ const RARE: [&str; 38] = [
 /// spine out: one table, in leaves of their own like the rare rules'.
 const SPINES: [&str; 8] =
     ["SpineNil", "SpineApp", "PreNil", "PreApp", "ExtNil", "ExtApp", "ProjCtorAt", "IotaL"];
+/// The rules that type a projection, in a table of their own beside it.
+const TELS: [&str; 11] = [
+    "PTelNil", "PTelApp", "FTelNilP", "FTelNilS", "FTelNilM", "FTelNilI", "FTelStep", "FTelStepP0", "FTelStepP1",
+    "ProjTy", "ProjTyP",
+];
 
 fn rares(which: usize) -> &'static [&'static str] {
-    if which == 0 { &RARE } else { &SPINES }
+    match which {
+        0 => &RARE,
+        1 => &SPINES,
+        _ => &TELS,
+    }
 }
 
 /// The table of several rules a rule is in, and its place there.
 fn rare_place(rule: &str) -> Option<(usize, usize)> {
-    (0..2).find_map(|w| rares(w).iter().position(|&x| x == rule).map(|i| (w, i)))
+    (0..3).find_map(|w| rares(w).iter().position(|&x| x == rule).map(|i| (w, i)))
 }
 
 fn rare_spec(which: usize) -> Spec {
     let rules = rares(which);
     let parts: Vec<Spec> = rules.iter().map(|r| fact_spec(r)).collect();
     let n_in = parts.iter().map(|sp| sp.cols.iter().filter(|c| matches!(c.0, Col::In)).count()).max().unwrap();
-    let mut u = Spec::new(if which == 0 { "rare" } else { "spines" });
+    let mut u = Spec::new(["rare", "spines", "tels"][which]);
     let own: Vec<T> = [Part::Kind, Part::X(0), Part::X(1), Part::X(2), Part::X(3), Part::R, Part::O]
         .into_iter()
         .map(|p| tc(u.val(E::Own(p))))
@@ -1876,6 +2089,16 @@ fn fact_spec(rule: &str) -> Spec {
     // Lean's instantiate needs the substituted term closed: its L is g^0.
     let closed = |s: &mut Spec, a: usize| {
         s.term(a, f(2), T::Id, [None; 3], Some(one));
+    };
+    // A is a proof's type: premises j and j + 1 are `Infer(g, A, S)` and
+    // `Eq(g, S, sort zero)`.
+    let proof = |s: &mut Spec, j: usize, g: usize, a: usize| {
+        let (st, sz) = (s.val(E::Prem(j, Part::X(2))), s.val(E::Prem(j + 1, Part::X(2))));
+        s.prem(j, F_INFER, [c(g), c(a), c(st), Some(Z)], r);
+        s.prem(j + 1, F_EQ, [c(g), c(st), c(sz), Some(Z)], r);
+        let z = s.val(E::Tm(TR::PFld(j + 1, 2), Part::X(1)));
+        s.term(sz, TR::PFld(j + 1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(z), Some(Z)], None);
+        s.level(z, TR::Child(Box::new(TR::PFld(j + 1, 2)), 1), Some(k(K_LLEAF)), Some(Z), Some(Z));
     };
     match rule {
         "Refl" => {
@@ -2415,6 +2638,119 @@ fn fact_spec(rule: &str) -> Spec {
             s.prem(7, F_EXT, [c(b1), c(a), c(b), c(ge_)], r);
             send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
         }
+        // The type of a projection, by a walk of the constructor's type.
+        // It starts at the structure's constant: the type of its one
+        // constructor at the levels.
+        "PTelNil" => {
+            let (g, q, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (d, ls) = (s.val(E::Tm(f(1), Part::X(1))), s.val(E::Tm(f(1), Part::X(2))));
+            s.term(q, f(1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
+            let (cd, params, indices) = (
+                s.val(E::Dcl(f(1), Part::X(9))),
+                s.val(E::Dcl(f(1), Part::X(7))),
+                s.val(E::Dcl(f(1), Part::X(8))),
+            );
+            s.recv([k(TAG_INFO), tc(d), k(1), tc(cd), tc(params), tc(indices)]);
+            // The constructor's declaration, at as many levels as it has.
+            let dcl: Vec<usize> = (0..4).map(|i| s.val(E::Ctor(f(1), Part::X(i)))).collect();
+            let ord = s.val(E::Ctor(f(1), Part::R));
+            s.list(ls, ch(f(1), 2), None, None, Some(tc(dcl[1])));
+            s.recv([k(TAG_DECL), tc(cd), tc(dcl[0]), tc(dcl[1]), tc(dcl[2]), tc(dcl[3]), tc(ord)]);
+            s.ge(o, E::Own(Part::O), ord, E::Ctor(f(1), Part::R), 1);
+            s.prem(0, F_LINST, [c(dcl[3]), c(ls), c(rr), Some(Z)], r);
+            send(&mut s, F_PTEL, [tc(g), tc(q), tc(rr), Z]);
+        }
+        // One more parameter: the type so far is a pi, its body at the argument.
+        "PTelApp" => {
+            let (g, q, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (q1, a) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            s.term(q, f(1), k(K_APP), [c(q1), c(a), Some(Z)], None);
+            let (r1, w) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
+            let body = s.val(E::Tm(ch(TR::PFld(1, 2), 1), Part::Id));
+            s.term(w, TR::PFld(1, 2), k(K_PI), [None, c(body), Some(Z)], None);
+            s.prem(0, F_PTEL, [c(g), c(q1), c(r1), Some(Z)], r);
+            s.prem(1, F_EQ, [c(g), c(r1), c(w), Some(Z)], r);
+            s.prem(2, F_INST, [c(body), Some(one), c(a), c(rr)], r);
+            send(&mut s, F_PTEL, [tc(g), tc(q), tc(rr), Z]);
+        }
+        // Before the first field: x's type is the structure at exactly its
+        // parameters and indices, and the walk has passed the parameters.
+        // Without the proposition checks the type's sort is not zero (a
+        // successor, a maximum or an impredicative maximum).
+        "FTelNilP" | "FTelNilS" | "FTelNilM" | "FTelNilI" => {
+            let (g, pt, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (st, x) = (s.val(E::Tm(f(1), Part::X(0))), s.val(E::Tm(ch(f(1), 2), Part::Id)));
+            s.term(pt, f(1), k(K_PROJ), [c(st), Some(one), c(x)], None);
+            let (e_, ty) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
+            s.prem(0, F_INFER, [c(g), c(x), c(e_), Some(Z)], r);
+            s.prem(1, F_EQ, [c(g), c(e_), c(ty), Some(Z)], r);
+            let (q, gind) = (s.val(E::Prem(2, Part::X(1))), s.val(E::Prem(2, Part::X(2))));
+            s.prem(2, F_PRE, [c(ty), c(q), c(gind), Some(Z)], r);
+            let (h, gpar) = (s.val(E::Prem(3, Part::X(1))), s.val(E::Prem(3, Part::X(2))));
+            s.prem(3, F_SPINE, [c(q), c(h), c(gpar), Some(Z)], r);
+            s.term(h, TR::PFld(3, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(st), None], None);
+            let cd = s.val(E::Dcl(TR::PFld(3, 1), Part::X(9)));
+            s.recv([k(TAG_INFO), tc(st), k(1), tc(cd), tc(gpar), tc(gind)]);
+            s.prem(4, F_PTEL, [c(g), c(q), c(rr), Some(Z)], r);
+            let flag = if rule == "FTelNilP" {
+                k(1)
+            } else {
+                let (se, so) = (s.val(E::Prem(5, Part::X(2))), s.val(E::Prem(6, Part::X(2))));
+                s.prem(5, F_INFER, [c(g), c(e_), c(se), Some(Z)], r);
+                s.prem(6, F_EQ, [c(g), c(se), c(so), Some(Z)], r);
+                let l = s.val(E::Tm(TR::PFld(6, 2), Part::X(1)));
+                s.term(so, TR::PFld(6, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(l), Some(Z)], None);
+                let kind = match rule {
+                    "FTelNilS" => K_LSUCC,
+                    "FTelNilM" => K_LMAX,
+                    _ => K_LIMAX,
+                };
+                s.level(l, ch(TR::PFld(6, 2), 1), Some(k(kind)), None, None);
+                Z
+            };
+            send(&mut s, F_FTEL, [tc(g), tc(pt), tc(rr), flag]);
+        }
+        // One more field: the body at the projection before. Under the
+        // proposition checks, the body does not mention the field (P0) or
+        // the field's type is a proposition (P1).
+        "FTelStep" | "FTelStepP0" | "FTelStepP1" => {
+            let (g, pt, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let flag = if rule == "FTelStep" { Z } else { k(1) };
+            let (st, x) = (s.val(E::Tm(f(1), Part::X(0))), s.val(E::Tm(ch(f(1), 2), Part::Id)));
+            let pp = s.val(E::Prem(0, Part::X(1)));
+            let ix = s.val(E::Tm(TR::PFld(0, 1), Part::X(1)));
+            s.term(pp, TR::PFld(0, 1), k(K_PROJ), [c(st), c(ix), c(x)], None);
+            let ix1 = s.out(Col::Lin(G, ix));
+            s.term(pt, f(1), k(K_PROJ), [c(st), c(ix1), c(x)], None);
+            let (r1, w) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
+            let (a, body) =
+                (s.val(E::Tm(ch(TR::PFld(1, 2), 0), Part::Id)), s.val(E::Tm(ch(TR::PFld(1, 2), 1), Part::Id)));
+            s.term(w, TR::PFld(1, 2), k(K_PI), [c(a), c(body), Some(Z)], None);
+            s.prem(0, F_FTEL, [c(g), c(pp), c(r1), Some(flag)], r);
+            s.prem(1, F_EQ, [c(g), c(r1), c(w), Some(Z)], r);
+            s.prem(2, F_INST, [c(body), Some(one), c(pp), c(rr)], r);
+            match rule {
+                "FTelStepP0" => {
+                    s.term(body, ch(TR::PFld(1, 2), 1), T::Id, [None; 3], Some(one));
+                }
+                "FTelStepP1" => proof(&mut s, 3, g, a),
+                _ => {}
+            }
+            send(&mut s, F_FTEL, [tc(g), tc(pt), tc(rr), flag]);
+        }
+        // The projection's type is the domain of what the walk has left.
+        "ProjTy" | "ProjTyP" => {
+            let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let flag = if rule == "ProjTy" { Z } else { k(1) };
+            let (r1, w) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
+            s.term(w, TR::PFld(1, 2), k(K_PI), [c(t), None, Some(Z)], None);
+            s.prem(0, F_FTEL, [c(g), c(e), c(r1), Some(flag)], r);
+            s.prem(1, F_EQ, [c(g), c(r1), c(w), Some(Z)], r);
+            if rule == "ProjTyP" {
+                proof(&mut s, 2, g, t);
+            }
+            send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
+        }
         "LEqLe" => {
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
             s.prem(0, F_LLE, [c(l), c(m), Some(Z), Some(Z)], r);
@@ -2691,6 +3027,17 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "ExtApp" => "ExtApp",
         "ProjCtorAt" => "ProjCtorAt",
         "IotaL" => "IotaL",
+        "PTelNil" => "PTelNil",
+        "PTelApp" => "PTelApp",
+        "FTelNilP" => "FTelNilP",
+        "FTelNilS" => "FTelNilS",
+        "FTelNilM" => "FTelNilM",
+        "FTelNilI" => "FTelNilI",
+        "FTelStep" => "FTelStep",
+        "FTelStepP0" => "FTelStepP0",
+        "FTelStepP1" => "FTelStepP1",
+        "ProjTy" => "ProjTy",
+        "ProjTyP" => "ProjTyP",
         "PiZero" => "PiZero",
         "PiIMax" => "PiIMax",
         "PiV" => "PiV",
@@ -2726,7 +3073,18 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 72] = [
+const FACT_TABLES: [&str; 83] = [
+    "PTelNil",
+    "PTelApp",
+    "FTelNilP",
+    "FTelNilS",
+    "FTelNilM",
+    "FTelNilI",
+    "FTelStep",
+    "FTelStepP0",
+    "FTelStepP1",
+    "ProjTy",
+    "ProjTyP",
     "SpineNil",
     "SpineApp",
     "PreNil",
@@ -2974,7 +3332,7 @@ impl LeanCircuit {
         ofs.extend([Of::DeclChecked, Of::DeclBlock, Of::DeclFree, Of::RecRule]);
         for r in FACT_TABLES {
             if r == "Assumed" {
-                ofs.extend([Of::Rare(0), Of::Rare(1), Of::Assumed]);
+                ofs.extend([Of::Rare(0), Of::Rare(1), Of::Rare(2), Of::Assumed]);
             } else if rare_place(r).is_none() {
                 ofs.push(Of::Fact(r));
             }
@@ -3202,9 +3560,11 @@ impl LeanCircuit {
                 Part::X(6) => vi(d.info.what),
                 Part::X(7) => ve(d.info.a as i64),
                 Part::X(8) => ve(d.info.b as i64),
-                // A constructor's inductive type.
+                // A constructor's inductive type; the one constructor
+                // of an inductive type that has one.
                 Part::X(9) => match (d.info.what, decl_by_key.get(&d.info.key)) {
                     (2, Some(&t)) => V { f: decl_id(t), e: 0 },
+                    (1, Some(&t)) if d.info.key != (0, 0) => V { f: decl_id(t), e: 0 },
                     _ => V::default(),
                 },
                 Part::R => ve(d.order),
@@ -3280,6 +3640,10 @@ impl LeanCircuit {
                 E::Dcl(tr, p) => {
                     let t = &g.terms[resolve(tr, own, of)];
                     decl_part(t.x[1].f.lo as usize, *p)
+                }
+                E::Ctor(tr, p) => {
+                    let t = &g.terms[resolve(tr, own, of)];
+                    decl_part(decl_by_key[&g.decls[t.x[1].f.lo as usize].info.key], *p)
                 }
             }
         };

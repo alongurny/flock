@@ -430,8 +430,10 @@ fn main() {
             // The table of the spine rules follows it and shares its leaves
             // (LEAN_SPINE_SLOTS slots each, 2 unless said).
             let spine_k: usize = std::env::var("LEAN_SPINE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            // And the table of the rules that type a projection (LEAN_TEL_SLOTS, 1 unless said).
+            let tel_k: usize = std::env::var("LEAN_TEL_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
             let late: Vec<(usize, usize)> =
-                vec![(rare, rare_k), (rare + 1, spine_k), (flock_prover::lean_rows::rule_table(), 1)];
+                vec![(rare, rare_k), (rare + 1, spine_k), (rare + 2, tel_k), (flock_prover::lean_rows::rule_table(), 1)];
             let late_census: Vec<Vec<usize>> =
                 late.iter().map(|&(t, _)| census.iter().map(|r| r[t]).collect()).collect();
             if rare_k > 0 {
