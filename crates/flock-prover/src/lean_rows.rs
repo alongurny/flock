@@ -208,6 +208,12 @@ const F_EXT: u64 = 11;
 /// mentions was shown a proof, 0 when the structure is not a proposition.
 const F_PTEL: u64 = 12;
 const F_FTEL: u64 = 13;
+/// `NZ(l)`: the level l is not zero under any assignment of the parameters
+/// that the kernel would read as zero, so `sort l` is not the sort of
+/// propositions: l is a successor or a parameter, a maximum with such a
+/// side, or an impredicative maximum with such a second side. A level
+/// without this is zero under every assignment.
+const F_NZ: u64 = 14;
 
 // ---------------------------------------------------------------- the data
 
@@ -980,7 +986,7 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 rule: rule.into(),
                 tag,
                 raw,
-                is_term: [true, true, matches!(tag, F_EXT | F_PTEL | F_FTEL), false],
+                is_term: [true, tag != F_NZ, matches!(tag, F_EXT | F_PTEL | F_FTEL), false],
                 premises,
                 rank: 0,
                 owner: 0,
@@ -988,6 +994,22 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             let i = self.base + self.new.len() - 1;
             self.memo.insert((tag, raw), i);
             i
+        }
+        /// The row saying the level l is never read as zero, if it is so.
+        fn nz(&mut self, l: usize) -> Option<usize> {
+            let t = &self.terms[l];
+            let (kind, a, c0, c1) = (t.kind, t.x[0].f.lo, t.child[0], t.child[1]);
+            let (rule, pr) = match kind {
+                K_LSUCC => ("NZSucc", vec![]),
+                K_LLEAF => (["NZPar0", "NZPar1", "NZPar2"].get((a as usize).wrapping_sub(1)).copied()?, vec![]),
+                K_LMAX => match self.nz(c0?) {
+                    Some(p) => ("NZMaxL", vec![p]),
+                    None => ("NZMaxR", vec![self.nz(c1?)?]),
+                },
+                K_LIMAX => ("NZIMax", vec![self.nz(c1?)?]),
+                _ => return None,
+            };
+            Some(self.add(rule, F_NZ, [l as u64, 0, 0, 0], pr))
         }
         /// The head and the number of arguments.
         fn head(&self, mut t: usize) -> (usize, u64) {
@@ -1071,6 +1093,7 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             let iapp = p1.raw[2] as usize;
             let lvl = level_of(p3.raw[2])?;
             let is_prop = zero(lvl);
+            let lvl_ix = terms[p3.raw[2] as usize].child[1]?;
             let base = match (is_prop, lvl.kind) {
                 (true, _) => "FTelNilP",
                 (_, K_LSUCC) => "FTelNilS",
@@ -1078,6 +1101,8 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 (_, K_LIMAX) => "FTelNilI",
                 _ => return None,
             };
+            // A maximum must be shown not to be zero in disguise.
+            let nz = if matches!(base, "FTelNilM" | "FTelNilI") { Some(self.nz(lvl_ix)?) } else { None };
             let (h, n) = self.head(iapp);
             let th = &terms[h];
             if th.kind != K_LEAF || th.x[0].f.lo != SUB_CONST {
@@ -1128,6 +1153,7 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                     let mut pr = vec![p[0], p[1], pre, spine, row];
                     if !is_prop {
                         pr.extend([p[2], p[3]]);
+                        pr.extend(nz);
                     }
                     (base, pr)
                 });
@@ -1845,7 +1871,8 @@ const RARE: [&str; 38] = [
 const SPINES: [&str; 8] =
     ["SpineNil", "SpineApp", "PreNil", "PreApp", "ExtNil", "ExtApp", "ProjCtorAt", "IotaL"];
 /// The rules that type a projection, in a table of their own beside it.
-const TELS: [&str; 11] = [
+const TELS: [&str; 18] = [
+    "NZSucc", "NZPar0", "NZPar1", "NZPar2", "NZMaxL", "NZMaxR", "NZIMax",
     "PTelNil", "PTelApp", "FTelNilP", "FTelNilS", "FTelNilM", "FTelNilI", "FTelStep", "FTelStepP0", "FTelStepP1",
     "ProjTy", "ProjTyP",
 ];
@@ -2706,6 +2733,9 @@ fn fact_spec(rule: &str) -> Spec {
                     _ => K_LIMAX,
                 };
                 s.level(l, ch(TR::PFld(6, 2), 1), Some(k(kind)), None, None);
+                if rule != "FTelNilS" {
+                    s.prem(7, F_NZ, [c(l), Some(Z), Some(Z), Some(Z)], r);
+                }
                 Z
             };
             send(&mut s, F_FTEL, [tc(g), tc(pt), tc(rr), flag]);
@@ -2750,6 +2780,29 @@ fn fact_spec(rule: &str) -> Spec {
                 proof(&mut s, 2, g, t);
             }
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
+        }
+        // A level never read as zero: a successor, a parameter, a maximum
+        // with such a side, an impredicative maximum with such a second side.
+        "NZSucc" | "NZPar0" | "NZPar1" | "NZPar2" | "NZMaxL" | "NZMaxR" | "NZIMax" => {
+            let l = fld(&mut s, 0);
+            match rule {
+                "NZSucc" => {
+                    s.level(l, f(0), Some(k(K_LSUCC)), None, Some(Z));
+                }
+                "NZPar0" | "NZPar1" | "NZPar2" => {
+                    let i = (rule.as_bytes()[rule.len() - 1] - b'0') as u64;
+                    s.level(l, f(0), Some(k(K_LLEAF)), Some(k(i + 1)), Some(Z));
+                }
+                _ => {
+                    let side = if rule == "NZMaxL" { 0 } else { 1 };
+                    let x = s.val(E::Tm(ch(f(0), side), Part::Id));
+                    let kind = if rule == "NZIMax" { K_LIMAX } else { K_LMAX };
+                    let (a, b) = if side == 0 { (c(x), None) } else { (None, c(x)) };
+                    s.level(l, f(0), Some(k(kind)), a, b);
+                    s.prem(0, F_NZ, [c(x), Some(Z), Some(Z), Some(Z)], r);
+                }
+            }
+            send(&mut s, F_NZ, [tc(l), Z, Z, Z]);
         }
         "LEqLe" => {
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
@@ -3028,6 +3081,13 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "ProjCtorAt" => "ProjCtorAt",
         "IotaL" => "IotaL",
         "PTelNil" => "PTelNil",
+        "NZSucc" => "NZSucc",
+        "NZPar0" => "NZPar0",
+        "NZPar1" => "NZPar1",
+        "NZPar2" => "NZPar2",
+        "NZMaxL" => "NZMaxL",
+        "NZMaxR" => "NZMaxR",
+        "NZIMax" => "NZIMax",
         "PTelApp" => "PTelApp",
         "FTelNilP" => "FTelNilP",
         "FTelNilS" => "FTelNilS",
@@ -3073,7 +3133,14 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 83] = [
+const FACT_TABLES: [&str; 90] = [
+    "NZSucc",
+    "NZPar0",
+    "NZPar1",
+    "NZPar2",
+    "NZMaxL",
+    "NZMaxR",
+    "NZIMax",
     "PTelNil",
     "PTelApp",
     "FTelNilP",

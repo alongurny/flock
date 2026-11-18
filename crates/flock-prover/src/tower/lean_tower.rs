@@ -215,7 +215,12 @@ pub fn prove_lean_segment(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    flock_core::scratch::set_byte_budget(Some(pool_gb << 30));
+    let pool_bytes = std::env::var("LEAN_POOL_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|m| m.max(1) << 20)
+        .unwrap_or(pool_gb << 30);
+    flock_core::scratch::set_byte_budget(Some(pool_bytes));
 
     // ---- THE STATEMENT: the commitment root, and its challenges ----
     let root_digest = lean_cone_root(words);
