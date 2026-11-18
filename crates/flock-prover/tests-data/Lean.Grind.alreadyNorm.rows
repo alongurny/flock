@@ -1,0 +1,22 @@
+L 0 zero
+L 1 succ 0
+T 0 leaf sort 0 0
+T 1 pi 0 0
+T 2 bvar 0
+T 3 lam 0 2
+T 4 leaf sort 1 0
+T 5 leaf fvar 0 0
+C 0 empty
+C 1 push 0 0
+F 0 Sort infer 0 0 4 0 : 
+F 1 Refl eq 0 4 4 0 : 
+F 2 InstClosed inst 0 0 5 0 : 
+F 3 Sort infer 1 0 4 0 : 
+F 4 Refl eq 1 4 4 0 : 
+F 5 Pi infer 0 1 4 0 : 0 1 2 3 4
+F 6 InstHit inst 2 0 5 5 : 
+F 7 HasLast has 1 0 0 0 : 
+F 8 FVar infer 1 5 0 0 : 7
+F 9 Lam infer 0 3 1 0 : 0 1 6 8 2
+F 10 Refl eq 0 1 1 0 : 
+G 17495953381404789473 10560772693125692055 2 0 1 3 5 1 9 10 -1 5022 0

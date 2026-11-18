@@ -1,0 +1,467 @@
+L 0 param 0
+L 1 succ 0
+L 2 param 1
+L 3 succ 2
+L 4 max 0 2
+L 5 zero
+L 6 succ 1
+L 7 succ 3
+L 8 max 1 7
+L 9 max 1 3
+L 10 succ 4
+L 11 max 9 10
+L 12 max 8 11
+L 13 max 6 12
+S 0 nil
+S 1 cons 2 0
+S 2 cons 4 0
+S 3 cons 0 0
+T 0 leaf sort 1 0
+T 1 bvar 0
+T 2 leaf sort 3 0
+T 3 pi 1 2
+T 4 bvar 1
+T 5 pi 0 0
+T 6 leaf const 0 1
+T 7 app 4 1
+T 8 app 6 7
+T 9 pi 4 8
+T 10 leaf const 0 2
+T 11 bvar 2
+T 12 app 11 1
+T 13 pi 11 12
+T 14 app 10 13
+T 15 pi 9 14
+T 16 pi 3 15
+T 17 pi 0 16
+T 18 leaf sort 5 0
+T 19 pi 4 18
+T 20 pi 1 19
+T 21 leaf const 0 3
+T 22 app 21 4
+T 23 pi 20 22
+T 24 pi 0 23
+T 25 leaf const 1 2
+T 26 app 25 13
+T 27 bvar 3
+T 28 app 27 1
+T 29 pi 27 28
+T 30 bvar 4
+T 31 app 21 1
+T 32 pi 11 18
+T 33 pi 4 32
+T 34 pi 31 33
+T 35 pi 0 34
+T 36 leaf const 2 1
+T 37 app 30 1
+T 38 app 36 37
+T 39 app 38 28
+T 40 app 39 12
+T 41 app 40 7
+T 42 pi 30 41
+T 43 lam 29 42
+T 44 lam 13 43
+T 45 app 26 44
+T 46 lam 9 45
+T 47 lam 3 46
+T 48 lam 0 47
+T 49 leaf sort 6 0
+T 50 leaf fvar 0 0
+T 51 pi 50 2
+T 52 pi 50 8
+T 53 pi 50 12
+T 54 app 10 53
+T 55 pi 52 54
+T 56 pi 51 55
+T 57 leaf fvar 1 0
+T 58 leaf sort 7 0
+T 59 leaf sort 8 0
+T 60 app 57 1
+T 61 app 6 60
+T 62 pi 50 61
+T 63 pi 50 60
+T 64 app 10 63
+T 65 pi 62 64
+T 66 leaf fvar 2 0
+T 67 app 57 66
+T 68 app 6 67
+T 69 pi 2 2
+T 70 leaf sort 9 0
+T 71 leaf sort 10 0
+T 72 pi 71 71
+T 73 leaf fvar 3 0
+T 74 app 57 73
+T 75 leaf sort 11 0
+T 76 leaf sort 12 0
+T 77 leaf sort 13 0
+T 78 app 25 53
+T 79 pi 50 28
+T 80 pi 50 41
+T 81 lam 79 80
+T 82 lam 53 81
+T 83 app 78 82
+T 84 lam 52 83
+T 85 lam 51 84
+T 86 app 25 63
+T 87 app 36 60
+T 88 app 87 28
+T 89 app 88 12
+T 90 app 89 7
+T 91 pi 50 90
+T 92 lam 63 91
+T 93 lam 63 92
+T 94 app 86 93
+T 95 lam 62 94
+T 96 app 66 1
+T 97 app 87 96
+T 98 app 97 12
+T 99 app 98 7
+T 100 pi 50 99
+T 101 lam 63 100
+T 102 lam 63 101
+T 103 app 86 102
+T 104 app 10 4
+T 105 pi 20 104
+T 106 pi 71 105
+T 107 pi 63 18
+T 108 pi 63 107
+T 109 pi 108 64
+T 110 app 73 1
+T 111 app 97 110
+T 112 app 111 7
+T 113 pi 50 112
+T 114 lam 63 113
+T 115 leaf fvar 4 0
+T 116 app 57 115
+T 117 app 115 1
+T 118 app 111 117
+T 119 pi 50 118
+T 120 leaf fvar 5 0
+T 121 app 57 120
+T 122 app 36 121
+T 123 app 66 120
+T 124 app 122 123
+T 125 app 73 120
+T 126 app 124 125
+T 127 app 115 120
+T 128 app 126 127
+T 129 app 6 1
+T 130 pi 129 33
+T 131 pi 2 130
+T 132 app 6 121
+T 133 pi 121 18
+T 134 pi 121 133
+T 135 pi 132 134
+C 0 empty
+C 1 push 0 0
+C 2 push 1 50
+C 3 push 1 51
+C 4 push 3 50
+C 5 push 3 62
+C 6 push 5 50
+C 7 push 5 63
+C 8 push 7 50
+C 9 push 7 63
+C 10 push 9 50
+D 0 0 1 -1 10760933002699935174 893851268671662602 5 5 86
+D 1 0 1 -1 977425928502055088 9702444346810639824 6 24 87
+D 2 1 1 -1 17745257122451796619 8275170487640770161 2 35 89
+F 0 Sort infer 0 0 49 0 : 
+F 1 Refl eq 0 49 49 0 : 
+F 2 InstHit inst 1 0 50 50 : 
+F 3 InstClosed inst 2 1 50 2 : 
+F 4 InstBind inst 3 0 50 51 : 2 3
+F 5 InstHit inst 4 1 50 50 : 
+F 6 InstClosed inst 8 2 50 8 : 
+F 7 InstBind inst 9 1 50 52 : 5 6
+F 8 InstClosed inst 10 2 50 10 : 
+F 9 InstHit inst 11 2 50 50 : 
+F 10 InstClosed inst 12 3 50 12 : 
+F 11 InstBind inst 13 2 50 53 : 9 10
+F 12 InstApp inst 14 2 50 54 : 8 11
+F 13 InstBind inst 15 1 50 55 : 7 12
+F 14 InstBind inst 16 0 50 56 : 4 13
+F 15 HasLast has 1 0 0 0 : 
+F 16 FVar infer 1 50 0 0 : 15
+F 17 Refl eq 1 0 0 0 : 
+F 18 InstClosed inst 2 0 57 2 : 
+F 19 Sort infer 2 2 58 0 : 
+F 20 Refl eq 2 58 58 0 : 
+F 21 Pi infer 1 51 59 0 : 16 17 18 19 20
+F 22 Refl eq 1 59 59 0 : 
+F 23 InstClosed inst 50 0 57 50 : 
+F 24 InstClosed inst 6 1 57 6 : 
+F 25 InstHit inst 4 1 57 57 : 
+F 26 InstClosed inst 1 1 57 1 : 
+F 27 InstApp inst 7 1 57 60 : 25 26
+F 28 InstApp inst 8 1 57 61 : 24 27
+F 29 InstBind inst 52 0 57 62 : 23 28
+F 30 InstClosed inst 10 1 57 10 : 
+F 31 InstClosed inst 50 1 57 50 : 
+F 32 InstHit inst 11 2 57 57 : 
+F 33 InstClosed inst 1 2 57 1 : 
+F 34 InstApp inst 12 2 57 60 : 32 33
+F 35 InstBind inst 53 1 57 63 : 31 34
+F 36 InstApp inst 54 1 57 64 : 30 35
+F 37 InstBind inst 55 0 57 65 : 29 36
+F 38 HasUp has 3 0 0 0 : 15
+F 39 FVar infer 3 50 0 0 : 38
+F 40 Refl eq 3 0 0 0 : 
+F 41 InstClosed inst 6 0 66 6 : 
+F 42 InstClosed inst 57 0 66 57 : 
+F 43 InstHit inst 1 0 66 66 : 
+F 44 InstApp inst 60 0 66 67 : 42 43
+F 45 InstApp inst 61 0 66 68 : 41 44
+F 46 LInstLParam linstl 0 1 2 0 : 
+F 47 LInstLSucc linstl 1 1 3 0 : 46
+F 48 LInstSort linst 0 1 2 0 : 47
+F 49 LInstBind linst 5 1 69 0 : 48 48
+F 50 Const infer 4 6 69 0 : 49
+F 51 Refl eq 4 69 69 0 : 
+F 52 HasLast has 3 1 51 0 : 
+F 53 HasUp has 4 1 51 0 : 52
+F 54 FVar infer 4 57 51 0 : 53
+F 55 Refl eq 4 51 51 0 : 
+F 56 HasLast has 4 2 50 0 : 
+F 57 FVar infer 4 66 50 0 : 56
+F 58 Refl eq 4 50 50 0 : 
+F 59 InstClosed inst 2 0 66 2 : 
+F 60 App infer 4 67 2 0 : 54 55 57 58 59
+F 61 Refl eq 4 2 2 0 : 
+F 62 InstClosed inst 2 0 67 2 : 
+F 63 App infer 4 68 2 0 : 50 51 60 61 62
+F 64 Pi infer 3 62 70 0 : 39 40 45 63 61
+F 65 Refl eq 3 70 70 0 : 
+F 66 InstClosed inst 64 0 66 64 : 
+F 67 LInstLParam linstl 0 2 4 0 : 
+F 68 LInstLSucc linstl 1 2 10 0 : 67
+F 69 LInstSort linst 0 2 71 0 : 68
+F 70 LInstBind linst 5 2 72 0 : 69 69
+F 71 Const infer 5 10 72 0 : 70
+F 72 Refl eq 5 72 72 0 : 
+F 73 HasUp has 5 0 0 0 : 38
+F 74 FVar infer 5 50 0 0 : 73
+F 75 Refl eq 5 0 0 0 : 
+F 76 InstClosed inst 57 0 73 57 : 
+F 77 InstHit inst 1 0 73 73 : 
+F 78 InstApp inst 60 0 73 74 : 76 77
+F 79 HasUp has 5 1 51 0 : 52
+F 80 HasUp has 6 1 51 0 : 79
+F 81 FVar infer 6 57 51 0 : 80
+F 82 Refl eq 6 51 51 0 : 
+F 83 HasLast has 6 3 50 0 : 
+F 84 FVar infer 6 73 50 0 : 83
+F 85 Refl eq 6 50 50 0 : 
+F 86 InstClosed inst 2 0 73 2 : 
+F 87 App infer 6 74 2 0 : 81 82 84 85 86
+F 88 Refl eq 6 2 2 0 : 
+F 89 Pi infer 5 63 70 0 : 74 75 78 87 88
+F 90 LEqNorm leq 9 10 0 0 : 
+F 91 CongSort eq 5 70 71 0 : 90
+F 92 InstClosed inst 71 0 63 71 : 
+F 93 App infer 5 64 71 0 : 71 72 89 91 92
+F 94 Refl eq 5 71 71 0 : 
+F 95 Pi infer 3 65 75 0 : 64 65 66 93 94
+F 96 Refl eq 3 75 75 0 : 
+F 97 Pi infer 1 56 76 0 : 21 22 37 95 96
+F 98 Refl eq 1 76 76 0 : 
+F 99 Pi infer 0 17 77 0 : 0 1 14 97 98
+F 100 Refl eq 0 77 77 0 : 
+F 101 InstClosed inst 25 2 50 25 : 
+F 102 InstApp inst 26 2 50 78 : 101 11
+F 103 InstHit inst 27 3 50 50 : 
+F 104 InstClosed inst 28 4 50 28 : 
+F 105 InstBind inst 29 3 50 79 : 103 104
+F 106 InstHit inst 30 4 50 50 : 
+F 107 InstClosed inst 41 5 50 41 : 
+F 108 InstBind inst 42 4 50 80 : 106 107
+F 109 InstBind inst 43 3 50 81 : 105 108
+F 110 InstBind inst 44 2 50 82 : 11 109
+F 111 InstApp inst 45 2 50 83 : 102 110
+F 112 InstBind inst 46 1 50 84 : 7 111
+F 113 InstBind inst 47 0 50 85 : 4 112
+F 114 InstClosed inst 25 1 57 25 : 
+F 115 InstApp inst 78 1 57 86 : 114 35
+F 116 InstClosed inst 50 2 57 50 : 
+F 117 InstHit inst 27 3 57 57 : 
+F 118 InstClosed inst 1 3 57 1 : 
+F 119 InstApp inst 28 3 57 60 : 117 118
+F 120 InstBind inst 79 2 57 63 : 116 119
+F 121 InstClosed inst 50 3 57 50 : 
+F 122 InstClosed inst 36 4 57 36 : 
+F 123 InstHit inst 30 4 57 57 : 
+F 124 InstClosed inst 1 4 57 1 : 
+F 125 InstApp inst 37 4 57 60 : 123 124
+F 126 InstApp inst 38 4 57 87 : 122 125
+F 127 InstClosed inst 28 4 57 28 : 
+F 128 InstApp inst 39 4 57 88 : 126 127
+F 129 InstClosed inst 12 4 57 12 : 
+F 130 InstApp inst 40 4 57 89 : 128 129
+F 131 InstClosed inst 7 4 57 7 : 
+F 132 InstApp inst 41 4 57 90 : 130 131
+F 133 InstBind inst 80 3 57 91 : 121 132
+F 134 InstBind inst 81 2 57 92 : 120 133
+F 135 InstBind inst 82 1 57 93 : 35 134
+F 136 InstApp inst 83 1 57 94 : 115 135
+F 137 InstBind inst 84 0 57 95 : 29 136
+F 138 InstClosed inst 86 0 66 86 : 
+F 139 InstClosed inst 63 0 66 63 : 
+F 140 InstClosed inst 63 1 66 63 : 
+F 141 InstClosed inst 50 2 66 50 : 
+F 142 InstClosed inst 87 3 66 87 : 
+F 143 InstHit inst 27 3 66 66 : 
+F 144 InstClosed inst 1 3 66 1 : 
+F 145 InstApp inst 28 3 66 96 : 143 144
+F 146 InstApp inst 88 3 66 97 : 142 145
+F 147 InstClosed inst 12 3 66 12 : 
+F 148 InstApp inst 89 3 66 98 : 146 147
+F 149 InstClosed inst 7 3 66 7 : 
+F 150 InstApp inst 90 3 66 99 : 148 149
+F 151 InstBind inst 91 2 66 100 : 141 150
+F 152 InstBind inst 92 1 66 101 : 140 151
+F 153 InstBind inst 93 0 66 102 : 139 152
+F 154 InstApp inst 94 0 66 103 : 138 153
+F 155 LInstNone linst 20 2 20 0 : 
+F 156 LInstConst linst 21 2 10 0 : 67
+F 157 LInstNone linst 4 2 4 0 : 
+F 158 LInstApp linst 22 2 104 0 : 156 157
+F 159 LInstBind linst 23 2 105 0 : 155 158
+F 160 LInstBind linst 24 2 106 0 : 69 159
+F 161 Const infer 5 25 106 0 : 160
+F 162 Refl eq 5 106 106 0 : 
+F 163 InstHit inst 1 0 63 63 : 
+F 164 InstHit inst 4 1 63 63 : 
+F 165 InstClosed inst 18 2 63 18 : 
+F 166 InstBind inst 19 1 63 107 : 164 165
+F 167 InstBind inst 20 0 63 108 : 163 166
+F 168 InstClosed inst 10 1 63 10 : 
+F 169 InstApp inst 104 1 63 64 : 168 164
+F 170 InstBind inst 105 0 63 109 : 167 169
+F 171 App infer 5 86 109 0 : 161 162 89 91 170
+F 172 Refl eq 5 109 109 0 : 
+F 173 Refl eq 5 70 70 0 : 
+F 174 InstClosed inst 63 0 73 63 : 
+F 175 InstClosed inst 50 1 73 50 : 
+F 176 InstClosed inst 97 2 73 97 : 
+F 177 InstHit inst 11 2 73 73 : 
+F 178 InstClosed inst 1 2 73 1 : 
+F 179 InstApp inst 12 2 73 110 : 177 178
+F 180 InstApp inst 98 2 73 111 : 176 179
+F 181 InstClosed inst 7 2 73 7 : 
+F 182 InstApp inst 99 2 73 112 : 180 181
+F 183 InstBind inst 100 1 73 113 : 175 182
+F 184 InstBind inst 101 0 73 114 : 174 183
+F 185 HasUp has 7 0 0 0 : 73
+F 186 FVar infer 7 50 0 0 : 185
+F 187 Refl eq 7 0 0 0 : 
+F 188 InstClosed inst 57 0 115 57 : 
+F 189 InstHit inst 1 0 115 115 : 
+F 190 InstApp inst 60 0 115 116 : 188 189
+F 191 HasUp has 7 1 51 0 : 79
+F 192 HasUp has 8 1 51 0 : 191
+F 193 FVar infer 8 57 51 0 : 192
+F 194 Refl eq 8 51 51 0 : 
+F 195 HasLast has 8 4 50 0 : 
+F 196 FVar infer 8 115 50 0 : 195
+F 197 Refl eq 8 50 50 0 : 
+F 198 InstClosed inst 2 0 115 2 : 
+F 199 App infer 8 116 2 0 : 193 194 196 197 198
+F 200 Refl eq 8 2 2 0 : 
+F 201 Pi infer 7 63 70 0 : 186 187 190 199 200
+F 202 Refl eq 7 70 70 0 : 
+F 203 InstClosed inst 50 0 115 50 : 
+F 204 InstClosed inst 111 1 115 111 : 
+F 205 InstHit inst 4 1 115 115 : 
+F 206 InstClosed inst 1 1 115 1 : 
+F 207 InstApp inst 7 1 115 117 : 205 206
+F 208 InstApp inst 112 1 115 118 : 204 207
+F 209 InstBind inst 113 0 115 119 : 203 208
+F 210 HasUp has 9 0 0 0 : 185
+F 211 FVar infer 9 50 0 0 : 210
+F 212 Refl eq 9 0 0 0 : 
+F 213 InstClosed inst 36 0 120 36 : 
+F 214 InstClosed inst 57 0 120 57 : 
+F 215 InstHit inst 1 0 120 120 : 
+F 216 InstApp inst 60 0 120 121 : 214 215
+F 217 InstApp inst 87 0 120 122 : 213 216
+F 218 InstClosed inst 66 0 120 66 : 
+F 219 InstApp inst 96 0 120 123 : 218 215
+F 220 InstApp inst 97 0 120 124 : 217 219
+F 221 InstClosed inst 73 0 120 73 : 
+F 222 InstApp inst 110 0 120 125 : 221 215
+F 223 InstApp inst 111 0 120 126 : 220 222
+F 224 InstClosed inst 115 0 120 115 : 
+F 225 InstApp inst 117 0 120 127 : 224 215
+F 226 InstApp inst 118 0 120 128 : 223 225
+F 227 LInstConst linst 21 1 6 0 : 46
+F 228 LInstNone linst 1 1 1 0 : 
+F 229 LInstApp linst 31 1 129 0 : 227 228
+F 230 LInstNone linst 33 1 33 0 : 
+F 231 LInstBind linst 34 1 130 0 : 229 230
+F 232 LInstBind linst 35 1 131 0 : 48 231
+F 233 Const infer 10 36 131 0 : 232
+F 234 Refl eq 10 131 131 0 : 
+F 235 HasUp has 9 1 51 0 : 191
+F 236 HasUp has 10 1 51 0 : 235
+F 237 FVar infer 10 57 51 0 : 236
+F 238 Refl eq 10 51 51 0 : 
+F 239 HasLast has 10 5 50 0 : 
+F 240 FVar infer 10 120 50 0 : 239
+F 241 Refl eq 10 50 50 0 : 
+F 242 InstClosed inst 2 0 120 2 : 
+F 243 App infer 10 121 2 0 : 237 238 240 241 242
+F 244 Refl eq 10 2 2 0 : 
+F 245 InstClosed inst 6 0 121 6 : 
+F 246 InstHit inst 1 0 121 121 : 
+F 247 InstApp inst 129 0 121 132 : 245 246
+F 248 InstHit inst 4 1 121 121 : 
+F 249 InstHit inst 11 2 121 121 : 
+F 250 InstClosed inst 18 3 121 18 : 
+F 251 InstBind inst 32 2 121 133 : 249 250
+F 252 InstBind inst 33 1 121 134 : 248 251
+F 253 InstBind inst 130 0 121 135 : 247 252
+F 254 App infer 10 122 135 0 : 233 234 243 244 253
+F 255 Refl eq 10 135 135 0 : 
+F 256 HasLast has 5 2 62 0 : 
+F 257 HasUp has 7 2 62 0 : 256
+F 258 HasUp has 9 2 62 0 : 257
+F 259 HasUp has 10 2 62 0 : 258
+F 260 FVar infer 10 66 62 0 : 259
+F 261 Refl eq 10 62 62 0 : 
+F 262 InstClosed inst 6 0 120 6 : 
+F 263 InstApp inst 61 0 120 132 : 262 216
+F 264 App infer 10 123 132 0 : 260 261 240 241 263
+F 265 Refl eq 10 132 132 0 : 
+F 266 InstClosed inst 134 0 123 134 : 
+F 267 App infer 10 124 134 0 : 254 255 264 265 266
+F 268 Refl eq 10 134 134 0 : 
+F 269 HasLast has 7 3 63 0 : 
+F 270 HasUp has 9 3 63 0 : 269
+F 271 HasUp has 10 3 63 0 : 270
+F 272 FVar infer 10 73 63 0 : 271
+F 273 Refl eq 10 63 63 0 : 
+F 274 App infer 10 125 121 0 : 272 273 240 241 216
+F 275 Refl eq 10 121 121 0 : 
+F 276 InstClosed inst 133 0 125 133 : 
+F 277 App infer 10 126 133 0 : 267 268 274 275 276
+F 278 Refl eq 10 133 133 0 : 
+F 279 HasLast has 9 4 63 0 : 
+F 280 HasUp has 10 4 63 0 : 279
+F 281 FVar infer 10 115 63 0 : 280
+F 282 App infer 10 127 121 0 : 281 273 240 241 216
+F 283 InstClosed inst 18 0 127 18 : 
+F 284 App infer 10 128 18 0 : 277 278 282 275 283
+F 285 Refl eq 10 18 18 0 : 
+F 286 Pi infer 9 119 18 0 : 211 212 226 284 285
+F 287 InstClosed inst 18 0 115 18 : 
+F 288 Lam infer 7 114 107 0 : 201 202 209 286 287
+F 289 InstClosed inst 107 0 73 107 : 
+F 290 Lam infer 5 102 108 0 : 89 173 184 288 289
+F 291 Refl eq 5 108 108 0 : 
+F 292 InstClosed inst 64 0 102 64 : 
+F 293 App infer 5 103 64 0 : 171 172 290 291 292
+F 294 Lam infer 3 95 65 0 : 64 65 154 293 66
+F 295 Lam infer 1 85 56 0 : 21 22 137 294 37
+F 296 Lam infer 0 48 17 0 : 0 1 113 295 14
+F 297 Refl eq 0 17 17 0 : 
+G 3123873322767155154 7071603058824344065 2 2 17 48 99 100 296 297 -1 4847 0

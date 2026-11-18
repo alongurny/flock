@@ -801,6 +801,20 @@ impl Rows {
     }
 }
 
+/// A level row as text, for diagnostics.
+fn show_level(terms: &[TermRec], l: usize) -> String {
+    let t = &terms[l];
+    let c = |i: usize| show_level(terms, t.child[i].unwrap());
+    match t.kind {
+        K_LLEAF if t.x[0].f == F128::ZERO => "0".into(),
+        K_LLEAF => format!("p{}", t.x[0].f.lo - 1),
+        K_LSUCC => format!("s({})", c(0)),
+        K_LMAX => format!("max({},{})", c(0), c(1)),
+        K_LIMAX => format!("imax({},{})", c(0), c(1)),
+        k => format!("?{k}"),
+    }
+}
+
 fn facts_rank(f: &[FactRec], p: usize) -> i64 {
     f[p].rank
 }
@@ -814,12 +828,22 @@ fn facts_rank(f: &[FactRec], p: usize) -> i64 {
 /// assumed).
 fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
     struct Cx<'a> {
-        terms: &'a [TermRec],
+        terms: &'a mut Vec<TermRec>,
         base: usize,
         new: Vec<FactRec>,
         memo: HashMap<(usize, usize), Option<usize>>,
     }
     impl Cx<'_> {
+        /// The level `succ a`, as a row (added when the derivation has none).
+        fn succ_of(&mut self, a: usize) -> usize {
+            let hit = self.terms.iter().position(|t| t.kind == K_LSUCC && t.child[0] == Some(a));
+            hit.unwrap_or_else(|| {
+                let c = &self.terms[a];
+                let t = TermRec { kind: K_LSUCC, x: [V::default(); 3], child: [Some(a), None, None], lbr: 0, rank: c.rank + 1, fv: 0, lp: c.lp };
+                self.terms.push(t);
+                self.terms.len() - 1
+            })
+        }
         fn add(&mut self, rule: &str, l: usize, m: usize, premises: Vec<usize>) -> Option<usize> {
             self.new.push(FactRec {
                 rule: rule.into(),
@@ -836,7 +860,7 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
             if let Some(&r) = self.memo.get(&(l, m)) {
                 return r;
             }
-            let r = self.le_new(l, m);
+            let r = self.le_new(l, m).or_else(|| self.le_more(l, m));
             self.memo.insert((l, m), r);
             r
         }
@@ -880,6 +904,24 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
                 _ => None,
             }
         }
+        /// What [`Self::le_new`] misses: the successor of a maximum is the
+        /// maximum of the successors, and an impredicative maximum whose
+        /// second part is a successor is the maximum.
+        fn le_more(&mut self, l: usize, m: usize) -> Option<usize> {
+            let (tl, tm) = (self.terms[l].clone(), self.terms[m].clone());
+            if tl.kind == K_LSUCC && self.terms[tl.child[0].unwrap()].kind == K_LMAX {
+                let x = self.terms[tl.child[0].unwrap()].child;
+                let (sa, sb) = (self.succ_of(x[0].unwrap()), self.succ_of(x[1].unwrap()));
+                if let (Some(p), Some(q)) = (self.le(sa, m), self.le(sb, m)) {
+                    return self.add("LLeSuccMax", l, m, vec![p, q]);
+                }
+            }
+            if tm.kind == K_LIMAX && self.terms[tm.child[1].unwrap()].kind == K_LSUCC {
+                let p = self.le(l, tm.child[0].unwrap())?;
+                return self.add("LLeIMaxR0", l, m, vec![p]);
+            }
+            None
+        }
     }
     // Zero and one, as rows.
     let mut find = |terms: &mut Vec<TermRec>, kind: u64, child: Option<usize>| -> usize {
@@ -920,6 +962,8 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
             if let (Some(a), Some(b)) = (cx.le(l, m), cx.le(m, l)) {
                 facts[i].rule = "LEqLe".into();
                 facts[i].premises = vec![a, b];
+            } else if std::env::var_os("LEAN_SHOW_LEFT").is_some() {
+                eprintln!("LEFT LEqNorm {} = {}", show_level(cx.terms, l), show_level(cx.terms, m));
             }
             continue;
         }
@@ -936,8 +980,13 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
         let is = |kind: u64| tw.kind == kind && tw.child[0] == Some(u) && tw.child[1] == Some(v);
         let (is_max, is_imax) = (is(K_LMAX), is(K_LIMAX));
         let v_zero = cx.terms[v].kind == K_LLEAF && cx.terms[v].x[0].f == F128::ZERO;
+        // imax 1 v is v.
+        let u_one = cx.terms[u].kind == K_LSUCC
+            && cx.terms[u].child[0].is_some_and(|z| cx.terms[z].kind == K_LLEAF && cx.terms[z].x[0].f == F128::ZERO);
         let (rule, more) = if w == v && v_zero {
             ("PiZero", vec![])
+        } else if w == v && u_one {
+            ("PiOne", vec![])
         } else if is_imax {
             ("PiIMax", vec![])
         } else if let Some(p) = (w == v).then(|| cx.le(u, v)).flatten() {
@@ -947,6 +996,9 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
         } else if let Some((p, q)) = (w == u).then(|| cx.le(v, u).zip(cx.le(one, v))).flatten() {
             ("PiU", vec![p, q])
         } else {
+            if std::env::var_os("LEAN_SHOW_LEFT").is_some() {
+                eprintln!("LEFT Pi u={} v={} w={}", show_level(cx.terms, u), show_level(cx.terms, v), show_level(cx.terms, w));
+            }
             continue;
         };
         facts[i].rule = rule.into();
@@ -1438,7 +1490,8 @@ struct Spec {
     groups: Vec<Group>,
     /// What the row receives from the verifier, once on its live bit
     /// ([`leaf`] adds these ports; a statement names what is sent).
-    verifier: Vec<[T; W]>,
+    /// With the column of its rule's live bit in a table of several rules.
+    verifier: Vec<([T; W], Option<usize>)>,
 }
 
 fn pad<const N: usize>(t: [T; N]) -> [T; W] {
@@ -1580,7 +1633,7 @@ impl Spec {
         });
     }
     fn vrecv<const N: usize>(&mut self, t: [T; N]) {
-        self.verifier.push(pad(t));
+        self.verifier.push((pad(t), None));
     }
     fn send<const N: usize>(&mut self, t: [T; N]) {
         self.ports.push(Port {
@@ -1869,7 +1922,11 @@ let k0 = s.src(Src::Pub(E::Own(Part::X(4))));
 
 /// The rules too rare for a table each (a table costs every leaf a slot):
 /// their rows share one table.
-const RARE: [&str; 38] = [
+const RARE: [&str; 52] = [
+    "ProofIrrel", "Eta",
+    "LInstLParam3", "LInstLParam4", "LInstLParam5", "LInstLParam6", "LInstLParam7",
+    "LLeSuccMax", "LLeIMaxR0", "PiOne",
+    "NatZero", "NatSucc", "NatBinN", "NatBinB",
     "InstLet", "LInstLet", "LInstProj", "InstProj", "Zeta", "Let", "CongLam", "LInstSort", "CongSort", "LInstLZero",
     "LInstLSucc", "LInstLMax", "LInstLIMax", "LInstLParam0", "LInstLParam1", "LInstLParam2", "CongConst1",
     "CongConst2", "CongConst3", "LInstConst1", "LInstConst2", "LInstConst3", "LLeRefl", "LLeZero", "LLeSucc",
@@ -1955,6 +2012,13 @@ fn rare_spec(which: usize) -> Spec {
                 mult: vec![live],
                 preset: true,
             });
+        }
+        for (t, _) in &sp.verifier {
+            let t = t.map(|x| match x {
+                T::C(c) => T::C(at[c]),
+                x => x,
+            });
+            u.verifier.push((t, Some(live)));
         }
         u.groups.push(Group {
             of: Of::Fact(rule),
@@ -2534,7 +2598,7 @@ fn fact_spec(rule: &str) -> Spec {
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
         "LLeRefl" | "LLeZero" | "LLeSucc" | "LLeSuccSucc" | "LLeMaxR0" | "LLeMaxR1" | "LLeIMaxR" | "LLeMaxL"
-        | "LLeIMaxL" => {
+        | "LLeIMaxL" | "LLeSuccMax" | "LLeIMaxR0" => {
             // l ≤ m for every assignment of the parameters.
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
             let le = |s: &mut Spec, j: usize, a: usize, b: usize| {
@@ -2566,6 +2630,26 @@ fn fact_spec(rule: &str) -> Spec {
                     let kind = if rule == "LLeIMaxR" { K_LIMAX } else { K_LMAX };
                     s.level(m, f(1), Some(k(kind)), c(a), c(b));
                     le(&mut s, 0, l, if rule == "LLeMaxR0" { a } else { b });
+                }
+                // succ (max a b) ≤ m from succ a ≤ m and succ b ≤ m.
+                "LLeSuccMax" => {
+                    let x = part(&mut s, 0, 0);
+                    s.level(l, f(0), Some(k(K_LSUCC)), c(x), Some(Z));
+                    let xt = ch(f(0), 0);
+                    let (a, b) = (s.val(E::Tm(ch(xt.clone(), 0), Part::Id)), s.val(E::Tm(ch(xt.clone(), 1), Part::Id)));
+                    s.level(x, xt, Some(k(K_LMAX)), c(a), c(b));
+                    for (j, y) in [(0, a), (1, b)] {
+                        let sy = s.val(E::Prem(j, Part::X(0)));
+                        s.level(sy, TR::PFld(j, 0), Some(k(K_LSUCC)), c(y), Some(Z));
+                        le(&mut s, j, sy, m);
+                    }
+                }
+                // imax a (succ c) is max a (succ c), at least a.
+                "LLeIMaxR0" => {
+                    let (a, b) = (part(&mut s, 1, 0), part(&mut s, 1, 1));
+                    s.level(m, f(1), Some(k(K_LIMAX)), c(a), c(b));
+                    s.level(b, ch(f(1), 1), Some(k(K_LSUCC)), None, Some(Z));
+                    le(&mut s, 0, l, a);
                 }
                 // Both sides at most m (imax a b ≤ max a b).
                 _ => {
@@ -2891,13 +2975,41 @@ fn fact_spec(rule: &str) -> Spec {
             s.vrecv([k(TAG_ARITH), op[0], op[1], x, y, out[0], out[1], form]);
             send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
         }
+        // Two proofs of one proposition are equal: a : P, b : P', P = P',
+        // and P : sort 0.
+        "ProofIrrel" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (pa, pb) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
+            s.prem(0, F_INFER, [c(g), c(a), c(pa), Some(Z)], r);
+            s.prem(1, F_INFER, [c(g), c(b), c(pb), Some(Z)], r);
+            s.prem(2, F_EQ, [c(g), c(pa), c(pb), Some(Z)], r);
+            proof(&mut s, 3, g, pa);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
+        // fun x : A => f x is f, for f closed of a type pi B _ with A = B.
+        "Eta" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (dom, body) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            s.term(a, f(1), k(K_LAM), [c(dom), c(body), Some(Z)], None);
+            let x = s.val(E::Tm(ch(ch(f(1), 1), 1), Part::Id));
+            s.term(body, ch(f(1), 1), k(K_APP), [c(b), c(x), Some(Z)], None);
+            s.term(x, ch(ch(f(1), 1), 1), k(K_BVAR), [Some(one), Some(Z), Some(Z)], None);
+            closed(&mut s, b);
+            let (ft, pt) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
+            s.prem(0, F_INFER, [c(g), c(b), c(ft), Some(Z)], r);
+            s.prem(1, F_EQ, [c(g), c(ft), c(pt), Some(Z)], r);
+            let d = s.val(E::Tm(ch(TR::PFld(1, 2), 0), Part::Id));
+            s.term(pt, TR::PFld(1, 2), k(K_PI), [c(d), None, Some(Z)], None);
+            s.prem(2, F_EQ, [c(g), c(dom), c(d), Some(Z)], r);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
         "LEqLe" => {
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
             s.prem(0, F_LLE, [c(l), c(m), Some(Z), Some(Z)], r);
             s.prem(1, F_LLE, [c(m), c(l), Some(Z), Some(Z)], r);
             send(&mut s, F_LEQ, [tc(l), tc(m), Z, Z]);
         }
-        "PiZero" | "PiIMax" | "PiV" | "PiMax" | "PiU" => {
+        "PiZero" | "PiOne" | "PiIMax" | "PiV" | "PiMax" | "PiU" => {
             // pi A B : sort w, from A : sort u and, with a fresh variable
             // for the binder, B : sort v. w is imax u v, in the form the
             // rule's name says.
@@ -2947,6 +3059,14 @@ fn fact_spec(rule: &str) -> Spec {
             let w = match rule {
                 "PiZero" => {
                     s.level(v, ch(TR::PFld(4, 2), 1), Some(k(K_LLEAF)), Some(Z), Some(Z));
+                    v
+                }
+                // imax 1 v is v.
+                "PiOne" => {
+                    let ut = ch(TR::PFld(1, 2), 1);
+                    let zero = s.val(E::Tm(ch(ut.clone(), 0), Part::Id));
+                    s.level(u, ut.clone(), Some(k(K_LSUCC)), c(zero), Some(Z));
+                    s.level(zero, ch(ut, 0), Some(k(K_LLEAF)), Some(Z), Some(Z));
                     v
                 }
                 "PiV" => {
@@ -3065,7 +3185,8 @@ fn fact_spec(rule: &str) -> Spec {
             }
             send(&mut s, F_LINSTL, [tc(l), tc(ls), tc(res), Z]);
         }
-        "LInstLParam0" | "LInstLParam1" | "LInstLParam2" => {
+        "LInstLParam0" | "LInstLParam1" | "LInstLParam2" | "LInstLParam3" | "LInstLParam4" | "LInstLParam5"
+        | "LInstLParam6" | "LInstLParam7" => {
             // Parameter i gives the list's entry i.
             let i = (rule.as_bytes()[rule.len() - 1] - b'0') as usize;
             let (l, ls, res) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
@@ -3158,6 +3279,8 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "LLeIMaxR" => "LLeIMaxR",
         "LLeMaxL" => "LLeMaxL",
         "LLeIMaxL" => "LLeIMaxL",
+        "LLeSuccMax" => "LLeSuccMax",
+        "LLeIMaxR0" => "LLeIMaxR0",
         "LEqLe" => "LEqLe",
         "SpineNil" => "SpineNil",
         "SpineApp" => "SpineApp",
@@ -3195,6 +3318,9 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "ProjTy" => "ProjTy",
         "ProjTyP" => "ProjTyP",
         "PiZero" => "PiZero",
+        "PiOne" => "PiOne",
+        "ProofIrrel" => "ProofIrrel",
+        "Eta" => "Eta",
         "PiIMax" => "PiIMax",
         "PiV" => "PiV",
         "PiMax" => "PiMax",
@@ -3210,6 +3336,11 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
             1 => "LInstLParam0",
             2 => "LInstLParam1",
             3 => "LInstLParam2",
+            4 => "LInstLParam3",
+            5 => "LInstLParam4",
+            6 => "LInstLParam5",
+            7 => "LInstLParam6",
+            8 => "LInstLParam7",
             _ => return Of::Assumed,
         },
         "CongConst" => match f.premises.len() {
@@ -3229,7 +3360,17 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 96] = [
+const FACT_TABLES: [&str; 106] = [
+    "ProofIrrel",
+    "Eta",
+    "LInstLParam3",
+    "LInstLParam4",
+    "LInstLParam5",
+    "LInstLParam6",
+    "LInstLParam7",
+    "LLeSuccMax",
+    "LLeIMaxR0",
+    "PiOne",
     "NatZero",
     "NatSucc",
     "NatBinN",
@@ -4354,8 +4495,8 @@ pub fn leaf(
             sb.bus_port_counted(slot, BusDirection::Recv, terms, vec![io[live]]);
         }
         // A step of arithmetic reads what it gives from the verifier.
-        for t in &sp.verifier {
-            let live = live_col.iter().flatten().next().copied().expect("a rule has a live bit");
+        for (t, own) in &sp.verifier {
+            let live = own.or_else(|| live_col.iter().flatten().next().copied()).expect("a rule has a live bit");
             let terms: Vec<BusTerm> = t
                 .iter()
                 .map(|x| match *x {
@@ -4594,8 +4735,10 @@ pub fn leaf_arith(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]
     for (k, &s) in profile.slots.iter().enumerate() {
         let sp = &proto.specs[s];
         let Some(c) = slots[k] else { continue };
-        for t in &sp.verifier {
-            out.extend(c.rows.iter().map(|z| {
+        for (t, own) in &sp.verifier {
+            // In a table of several rules, only the rule's own rows.
+            let rows = c.rows.iter().filter(|z| own.is_none_or(|l| z[l] == F128::ONE));
+            out.extend(rows.map(|z| {
                 std::array::from_fn(|i| match t[i + 1] {
                     T::C(col) => z[col],
                     T::K(v) => v,
@@ -5434,6 +5577,76 @@ mod tests {
         assert!(arith_product(&ch, &[t, f]).is_ok());
         let t2 = Arith { out: [int(8), int(6)], ..step(11, 2, 2) };
         assert!(arith_product(&ch, &[t, t2]).is_err());
+    }
+
+    const ALREADY_NORM: &str = include_str!("../tests-data/Lean.Grind.alreadyNorm.rows");
+    const PI_HAS_LE: &str = include_str!("../tests-data/Pi.hasLe.rows");
+    const FORALL_CONGR: &str = include_str!("../tests-data/forall_congr.rows");
+    const AND_CASES_ON: &str = include_str!("../tests-data/And.casesOn.rows");
+    const FUNCTION_ID_COMP: &str = include_str!("../tests-data/Function.id_comp.rows");
+
+    #[test]
+    fn universe_irrelevance_and_eta_derivations_prove() {
+        for (text, rule) in [
+            (ALREADY_NORM, "PiOne"),
+            (PI_HAS_LE, "LLeSuccMax"),
+            (FORALL_CONGR, "LLeIMaxR0"),
+            (AND_CASES_ON, "ProofIrrel"),
+            (FUNCTION_ID_COMP, "Eta"),
+        ] {
+            let rows = certified_rows(text);
+            assert!(rows.facts.iter().any(|f| f.rule == rule), "missing {rule}");
+            assert!(rows.rule_census(&rows)[rule].1, "{rule} is taken as given");
+            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_one_rejects_a_universe_other_than_the_body_s() {
+        let (mut rows, target) = focus_rule(ALREADY_NORM, "PiOne");
+        // The sort of some other level.
+        let w = rows.facts[target].raw[2] as usize;
+        let other = rows.terms.iter().position(|t| {
+            t.kind == K_LEAF && t.x[0].f.lo == SUB_SORT && t.child[1] != rows.terms[w].child[1]
+        });
+        rows.facts[target].raw[2] = other.unwrap() as u64;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn lle_succ_max_rejects_a_bound_its_premises_do_not_give() {
+        let (mut rows, target) = focus_rule(PI_HAS_LE, "LLeSuccMax");
+        rows.facts[target].raw[1] = rows.facts[target].raw[0];
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn lle_imax_r0_rejects_a_bound_that_is_not_an_imax() {
+        let (mut rows, target) = focus_rule(FORALL_CONGR, "LLeIMaxR0");
+        // A maximum, or an imax whose second part is no successor.
+        let m = rows.facts[target].raw[1] as usize;
+        let other = rows.terms.iter().enumerate().position(|(i, t)| {
+            i != m
+                && (t.kind == K_LMAX
+                    || t.kind == K_LIMAX && rows.terms[t.child[1].unwrap()].kind != K_LSUCC)
+        });
+        rows.facts[target].raw[1] = other.unwrap() as u64;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn proof_irrel_rejects_a_term_its_premises_do_not_type() {
+        let (mut rows, target) = focus_rule(AND_CASES_ON, "ProofIrrel");
+        assert_ne!(rows.facts[target].raw[1], rows.facts[target].raw[2]);
+        rows.facts[target].raw[2] = rows.facts[target].raw[1];
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn eta_rejects_a_function_other_than_the_body_s() {
+        let (mut rows, target) = focus_rule(FUNCTION_ID_COMP, "Eta");
+        rows.facts[target].raw[2] = rows.facts[target].raw[1];
+        assert_rule_refused(&rows);
     }
 
     /// Proves every piece under challenges drawn from all commitments;
