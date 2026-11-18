@@ -225,6 +225,11 @@ const F_FTEL: u64 = 13;
 /// side, or an impredicative maximum with such a second side. A level
 /// without this is zero under every assignment.
 const F_NZ: u64 = 14;
+/// `EtaW(g, t, r, proj I k a)`: t is the one constructor of I at its
+/// parameters and fields 0 to k, field j equal (in g) to `proj I j a`, and
+/// r more fields to come.
+/// Added by [`certify_spines`] for structure eta.
+const F_ETAW: u64 = 15;
 
 // ---------------------------------------------------------------- the data
 
@@ -1019,7 +1024,7 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
 /// in `Spine`, `Pre` and `Ext` rows, and the row is renamed to the rule
 /// that takes them as premises (`ProjCtorAt`, `Iota0`, `IotaL`).
 fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>, info: &Rows) {
-    if !facts.iter().any(|f| matches!(f.rule.as_str(), "ProjCtor" | "Iota" | "Proj")) {
+    if !facts.iter().any(|f| matches!(f.rule.as_str(), "ProjCtor" | "Iota" | "Proj" | "QuotLift" | "EtaStruct")) {
         return;
     }
     let by_key: HashMap<(u64, u64), InfoRec> = info.decls.iter().map(|d| (d.key, d.info)).collect();
@@ -1049,7 +1054,7 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 rule: rule.into(),
                 tag,
                 raw,
-                is_term: [true, tag != F_NZ, matches!(tag, F_EXT | F_PTEL | F_FTEL), false],
+                is_term: [true, tag != F_NZ, matches!(tag, F_EXT | F_PTEL | F_FTEL), tag == F_ETAW],
                 premises,
                 rank: 0,
                 owner: 0,
@@ -1316,6 +1321,72 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             let (_, _, spine) = cx.spine(q);
             facts[i].rule = "ProjCtorAt".into();
             facts[i].premises = vec![pre, spine];
+            continue;
+        }
+        // Quot.lift f h (Quot.mk r x) es = f x es; Quot.ind likewise, with
+        // the quotient argument at 4 rather than 5.
+        if f.rule == "QuotLift" && f.premises.is_empty() {
+            let (h, n) = cx.head(a);
+            let Some((_, q)) = konst(h) else { continue };
+            let (rule, at) = match (q.what, q.a) {
+                (4, 2) => ("QuotLiftL", 5),
+                (4, 3) => ("QuotIndL", 4),
+                _ => continue,
+            };
+            if n < at + 1 {
+                continue;
+            }
+            let e = n - at - 1;
+            let Some((a1, p0)) = cx.pre(a, e) else { continue };
+            let Some((a0, quot)) = cx.app(a1) else { continue };
+            let (_, _, p1) = cx.spine(a0);
+            let Some((pf, p2)) = cx.pre(a0, at - 4) else { continue };
+            let Some((_, fun)) = cx.app(pf) else { continue };
+            let (mh, mn, p3) = cx.spine(quot);
+            if mn != 3 || !konst(mh).is_some_and(|(_, m)| m.what == 4 && m.a == 1) {
+                continue;
+            }
+            let Some((_, elem)) = cx.app(quot) else { continue };
+            let mut u = b;
+            for _ in 0..e {
+                let Some((x, _)) = cx.app(u) else { break };
+                u = x;
+            }
+            if cx.app(u) != Some((fun, elem)) {
+                continue;
+            }
+            let Some(p4) = cx.ext(u, a, b, e) else { continue };
+            facts[i].rule = rule.into();
+            facts[i].premises = vec![p0, p1, p2, p3, p4];
+            continue;
+        }
+        // A structure's value is its constructor at its fields'
+        // projections: the fields one by one, each from its projection.
+        if f.rule == "EtaStruct" {
+            let (g, pr) = (f.raw[0], f.premises.clone());
+            let (h, n) = cx.head(b);
+            let Some((_, c)) = konst(h) else { continue };
+            let fields = c.b as usize;
+            if c.what != 2 || n != c.a + c.b || fields == 0 || pr.len() != 3 + fields {
+                continue;
+            }
+            // t_k, the constructor at its parameters and k fields.
+            let mut ts = vec![b];
+            for _ in 0..fields {
+                let (x, _) = cx.app(*ts.last().unwrap()).unwrap();
+                ts.push(x);
+            }
+            ts.reverse();
+            let (_, _, sp) = cx.spine(ts[0]);
+            let mut w = sp;
+            for k in 0..fields {
+                let pj = facts[pr[3 + k]].raw[1];
+                let (rule, first) = if k == 0 { ("EtaFirst", sp) } else { ("EtaNext", w) };
+                let rest = (fields - 1 - k) as u64;
+                w = cx.add(rule, F_ETAW, [g, ts[k + 1] as u64, rest, pj], vec![first, pr[3 + k]]);
+            }
+            facts[i].rule = "EtaStructL".into();
+            facts[i].premises = vec![pr[0], pr[1], pr[2], w];
             continue;
         }
         if f.rule == "Iota" && f.premises.len() <= 1 {
@@ -1922,7 +1993,8 @@ let k0 = s.src(Src::Pub(E::Own(Part::X(4))));
 
 /// The rules too rare for a table each (a table costs every leaf a slot):
 /// their rows share one table.
-const RARE: [&str; 52] = [
+const RARE: [&str; 57] = [
+    "QuotLiftL", "QuotIndL", "EtaFirst", "EtaNext", "EtaStructL",
     "ProofIrrel", "Eta",
     "LInstLParam3", "LInstLParam4", "LInstLParam5", "LInstLParam6", "LInstLParam7",
     "LLeSuccMax", "LLeIMaxR0", "PiOne",
@@ -2975,6 +3047,103 @@ fn fact_spec(rule: &str) -> Spec {
             s.vrecv([k(TAG_ARITH), op[0], op[1], x, y, out[0], out[1], form]);
             send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
         }
+        // Quot.lift f h (Quot.mk r x) es = f x es (`at` 5), and Quot.ind
+        // likewise (`at` 4): a without the arguments after the quotient
+        // ends in it, before it the constant at `at` arguments, the last
+        // `at - 4` of them after the function; the quotient is Quot.mk at
+        // three, the last the element; b is the function at the element,
+        // then the arguments after the quotient.
+        "QuotLiftL" | "QuotIndL" => {
+            let (kind, at) = if rule == "QuotLiftL" { (2, 5) } else { (3, 4) };
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let pf = |j: usize, x: usize| TR::PFld(j, x);
+            let (a1, ge_) = (s.val(E::Prem(0, Part::X(1))), s.val(E::Prem(0, Part::X(2))));
+            s.prem(0, F_PRE, [c(a), c(a1), c(ge_), Some(Z)], r);
+            let (a0, q) = (s.val(E::Tm(ch(pf(0, 1), 0), Part::Id)), s.val(E::Tm(ch(pf(0, 1), 1), Part::Id)));
+            s.term(a1, pf(0, 1), k(K_APP), [c(a0), c(q), Some(Z)], None);
+            let h = s.val(E::Prem(1, Part::X(1)));
+            s.prem(1, F_SPINE, [c(a0), c(h), Some(T::K(gp(at))), Some(Z)], r);
+            let d = s.val(E::Tm(pf(1, 1), Part::X(1)));
+            s.term(h, pf(1, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), None], None);
+            s.recv([k(TAG_INFO), tc(d), k(4), Z, T::K(gp(kind)), one]);
+            let p = s.val(E::Prem(2, Part::X(1)));
+            s.prem(2, F_PRE, [c(a0), c(p), Some(T::K(gp(at - 4))), Some(Z)], r);
+            let fun = s.val(E::Tm(ch(pf(2, 1), 1), Part::Id));
+            s.term(p, pf(2, 1), k(K_APP), [None, c(fun), Some(Z)], None);
+            let mh = s.val(E::Prem(3, Part::X(1)));
+            s.prem(3, F_SPINE, [c(q), c(mh), Some(T::K(gp(3))), Some(Z)], r);
+            let md = s.val(E::Tm(pf(3, 1), Part::X(1)));
+            s.term(mh, pf(3, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(md), None], None);
+            s.recv([k(TAG_INFO), tc(md), k(4), Z, T::K(gp(1)), one]);
+            let elem = s.val(E::Tm(ch(pf(3, 0), 1), Part::Id));
+            s.term(q, pf(3, 0), k(K_APP), [None, c(elem), Some(Z)], None);
+            let u = s.val(E::Prem(4, Part::X(0)));
+            s.prem(4, F_EXT, [c(u), c(a), c(b), c(ge_)], r);
+            s.term(u, pf(4, 0), k(K_APP), [c(fun), c(elem), Some(Z)], None);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
+        // Structure eta, a field at a time. The first: t is the one
+        // constructor c of I at its parameters and field 0, which is
+        // `proj I 0 a`; r = fields - 1 are to come.
+        "EtaFirst" => {
+            let (g, t, rest, pj) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2), fld(&mut s, 3));
+            let (t0, f0) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            s.term(t, f(1), k(K_APP), [c(t0), c(f0), Some(Z)], None);
+            let h = s.val(E::Prem(0, Part::X(1)));
+            let ct = TR::PFld(0, 1);
+            let cd = s.val(E::Tm(ct.clone(), Part::X(1)));
+            s.term(h, ct.clone(), k(K_LEAF), [Some(k(SUB_CONST)), c(cd), None], None);
+            let (ind, params, fields) = (
+                s.val(E::Dcl(ct.clone(), Part::X(9))),
+                s.val(E::Dcl(ct.clone(), Part::X(7))),
+                s.val(E::Dcl(ct.clone(), Part::X(8))),
+            );
+            s.recv([k(TAG_INFO), tc(cd), k(2), tc(ind), tc(params), tc(fields)]);
+            // I names c as its one constructor.
+            let (ip, ii) = (s.val(E::Ctor(ct.clone(), Part::X(7))), s.val(E::Ctor(ct, Part::X(8))));
+            s.recv([k(TAG_INFO), tc(ind), k(1), tc(cd), tc(ip), tc(ii)]);
+            s.prem(0, F_SPINE, [c(t0), c(h), c(params), Some(Z)], r);
+            let a = s.val(E::Tm(ch(f(3), 2), Part::Id));
+            s.term(pj, f(3), k(K_PROJ), [c(ind), Some(one), c(a)], None);
+            s.prem(1, F_EQ, [c(g), c(pj), c(f0), Some(Z)], r);
+            // The count read from the row is not trusted: it is computed.
+            let _ = rest;
+            let gi = s.out(Col::Lin(gp(-1), fields));
+            send(&mut s, F_ETAW, [tc(g), tc(t), tc(gi), tc(pj)]);
+        }
+        // The next field: `proj I (k + 1) a`, one fewer to come.
+        "EtaNext" => {
+            let (g, t, rest, pj) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2), fld(&mut s, 3));
+            let (tp, fk) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            s.term(t, f(1), k(K_APP), [c(tp), c(fk), Some(Z)], None);
+            let (rp, pp) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(0, Part::X(3))));
+            s.prem(0, F_ETAW, [c(g), c(tp), c(rp), c(pp)], r);
+            let (ind, ip, a) = (
+                s.val(E::Tm(TR::PFld(0, 3), Part::X(0))),
+                s.val(E::Tm(TR::PFld(0, 3), Part::X(1))),
+                s.val(E::Tm(ch(TR::PFld(0, 3), 2), Part::Id)),
+            );
+            s.term(pp, TR::PFld(0, 3), k(K_PROJ), [c(ind), c(ip), c(a)], None);
+            let ix = s.out(Col::Lin(G, ip));
+            s.term(pj, f(3), k(K_PROJ), [c(ind), c(ix), c(a)], None);
+            s.prem(1, F_EQ, [c(g), c(pj), c(fk), Some(Z)], r);
+            let rp1 = s.out(Col::Lin(gp(-1), rp));
+            send(&mut s, F_ETAW, [tc(g), tc(t), tc(rp1), tc(pj)]);
+            let _ = rest;
+        }
+        // b is the constructor at every field, field j `proj I j a`, and a
+        // and b have one type.
+        "EtaStructL" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let (ta, tb) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
+            s.prem(0, F_INFER, [c(g), c(a), c(ta), Some(Z)], r);
+            s.prem(1, F_INFER, [c(g), c(b), c(tb), Some(Z)], r);
+            s.prem(2, F_EQ, [c(g), c(ta), c(tb), Some(Z)], r);
+            let pj = s.val(E::Prem(3, Part::X(3)));
+            s.prem(3, F_ETAW, [c(g), c(b), Some(one), c(pj)], r);
+            s.term(pj, TR::PFld(3, 3), k(K_PROJ), [None, None, c(a)], None);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
         // Two proofs of one proposition are equal: a : P, b : P', P = P',
         // and P : sort 0.
         "ProofIrrel" => {
@@ -3321,6 +3490,11 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "PiOne" => "PiOne",
         "ProofIrrel" => "ProofIrrel",
         "Eta" => "Eta",
+        "QuotLiftL" => "QuotLiftL",
+        "QuotIndL" => "QuotIndL",
+        "EtaFirst" => "EtaFirst",
+        "EtaNext" => "EtaNext",
+        "EtaStructL" => "EtaStructL",
         "PiIMax" => "PiIMax",
         "PiV" => "PiV",
         "PiMax" => "PiMax",
@@ -3360,7 +3534,12 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 106] = [
+const FACT_TABLES: [&str; 111] = [
+    "QuotLiftL",
+    "QuotIndL",
+    "EtaFirst",
+    "EtaNext",
+    "EtaStructL",
     "ProofIrrel",
     "Eta",
     "LInstLParam3",
@@ -3795,7 +3974,7 @@ impl LeanCircuit {
                 }
             } else if (f.tag == F_INST || f.tag == F_HAS) && x == 1 {
                 ve(f.raw[1] as i64)
-            } else if (matches!(f.tag, F_SPINE | F_PRE) && x == 2) || (f.tag == F_EXT && x == 3) {
+            } else if (matches!(f.tag, F_SPINE | F_PRE | F_ETAW) && x == 2) || (f.tag == F_EXT && x == 3) {
                 ve(f.raw[x] as i64)
             } else {
                 vi(f.raw[x])
@@ -5646,6 +5825,47 @@ mod tests {
     fn eta_rejects_a_function_other_than_the_body_s() {
         let (mut rows, target) = focus_rule(FUNCTION_ID_COMP, "Eta");
         rows.facts[target].raw[2] = rows.facts[target].raw[1];
+        assert_rule_refused(&rows);
+    }
+
+    const NODUP_ZERO: &str = include_str!("../tests-data/Multiset.nodup_zero.rows");
+    const MEM_ATTACH: &str = include_str!("../tests-data/Multiset.mem_attach.rows");
+    const NORMALIZE_SELF: &str = include_str!("../tests-data/Rat.normalize_self.rows");
+
+    #[test]
+    fn quotient_and_structure_eta_derivations_prove() {
+        for (text, rules) in [
+            (NODUP_ZERO, &["QuotLiftL"][..]),
+            (MEM_ATTACH, &["QuotIndL"][..]),
+            (NORMALIZE_SELF, &["EtaStructL", "EtaFirst", "EtaNext"][..]),
+        ] {
+            let rows = certified_rows(text);
+            for rule in rules {
+                assert!(rows.rule_census(&rows).get(*rule).is_some_and(|x| x.1), "{rule} is missing or taken as given");
+            }
+            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+        }
+    }
+
+    #[test]
+    fn quot_lift_rejects_a_result_other_than_the_function_at_the_element() {
+        let (mut rows, target) = focus_rule(NODUP_ZERO, "QuotLiftL");
+        rows.facts[target].raw[2] = rows.facts[target].raw[1];
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn eta_struct_rejects_a_value_that_is_not_the_constructor() {
+        let (mut rows, target) = focus_rule(NORMALIZE_SELF, "EtaStructL");
+        rows.facts[target].raw[2] = rows.facts[target].raw[1];
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn eta_next_rejects_the_previous_field_s_projection() {
+        let (mut rows, target) = focus_rule(NORMALIZE_SELF, "EtaNext");
+        let prev = rows.facts[target].premises[0];
+        rows.facts[target].raw[3] = rows.facts[prev].raw[3];
         assert_rule_refused(&rows);
     }
 
