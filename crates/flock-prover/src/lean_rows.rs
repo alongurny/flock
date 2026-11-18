@@ -4890,6 +4890,189 @@ mod tests {
         }
     }
 
+    const LINEAR_CONST: &str = include_str!("../tests-data/Lean.Omega.LinearCombo.const.rows");
+    const LINEAR_COEFFS: &str = include_str!("../tests-data/Lean.Omega.LinearCombo.coeffs.rows");
+    const AND_RIGHT: &str = include_str!("../tests-data/And.right.rows");
+    const INHABITED_DEFAULT: &str = include_str!("../tests-data/Inhabited.default.rows");
+    const HUGE_FUEL: &str = include_str!("../tests-data/Lean.Grind.CommRing.hugeFuel.rows");
+
+    fn certified_rows(text: &str) -> Rows {
+        // The fixtures carry just the declaration info for their local declarations.
+        let info = Rows::parse(text).unwrap();
+        Rows::parse_with(text, Some(&info)).unwrap()
+    }
+
+    #[test]
+    fn projection_and_literal_derivations_prove() {
+        for (text, rules) in [
+            (LINEAR_CONST, &["PTelNil", "FTelNilS", "ProjTy"][..]),
+            (LINEAR_COEFFS, &["FTelStep"][..]),
+            (AND_RIGHT, &["PTelApp", "FTelNilP", "FTelStepP0", "ProjTyP"][..]),
+            (INHABITED_DEFAULT, &["FTelNilM", "NZMaxL"][..]),
+            (HUGE_FUEL, &["LitNat"][..]),
+        ] {
+            let rows = certified_rows(text);
+            for rule in rules {
+                assert!(rows.facts.iter().any(|f| f.rule == *rule), "missing {rule}");
+            }
+            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+        }
+    }
+
+    // Keep the row under test checked, with its inputs given. A consumer
+    // rejecting the changed output would otherwise hide a missing check here.
+    fn focus_rule(text: &str, rule: &str) -> (Rows, usize) {
+        let mut rows = certified_rows(text);
+        let target = rows.facts.iter().position(|f| f.rule == rule).unwrap();
+        for (i, fact) in rows.facts.iter_mut().enumerate() {
+            if i != target {
+                fact.rule = "Given".into();
+            }
+        }
+        LeanCircuit::build(&rows).unwrap();
+        (rows, target)
+    }
+
+    fn assert_rule_refused(rows: &Rows) {
+        let build_refused = LeanCircuit::build(rows).is_err();
+        let proof_refused = LeanCircuit::build_with(rows, false)
+            .unwrap()
+            .prove_and_verify(false)
+            .is_err();
+        assert!(build_refused && proof_refused, "build refused: {build_refused}, proof refused: {proof_refused}");
+    }
+
+    fn dump_term(rows: &Rows, id: usize) -> u64 {
+        (rows.terms.iter().position(|t| matches!(t.kind, K_BVAR..=K_PROJ | K_FVAR)).unwrap() + id) as u64
+    }
+
+    // Supply an alternative premise with the same tag, owner and rank.
+    fn alternative_premise(rows: &mut Rows, target: usize, slot: usize, raw: [u64; 4]) -> usize {
+        let mut fact = rows.facts[rows.facts[target].premises[slot]].clone();
+        assert_eq!(fact.rule, "Given");
+        fact.raw = raw;
+        rows.facts.push(fact);
+        rows.facts.len() - 1
+    }
+
+    #[test]
+    fn ptel_nil_rejects_a_different_level_list_of_the_same_length() {
+        let text = format!("{INHABITED_DEFAULT}S 2 cons 1 0\n");
+        let (mut rows, target) = focus_rule(&text, "PTelNil");
+        let premise = rows.facts[target].premises[0];
+        let original = rows.facts[premise].raw[1] as usize;
+        let other = rows.terms.iter().position(|t| {
+            t.kind == K_CONS && t.child[0].is_some_and(|i| {
+                rows.terms[i].kind == K_LLEAF && rows.terms[i].x[0].f.lo == 0
+            })
+        }).unwrap();
+        assert_ne!(original, other);
+        assert_eq!(rows.terms[original].x[2].e, rows.terms[other].x[2].e);
+        rows.facts[premise].raw[1] = other as u64;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn ptel_app_rejects_substituting_a_different_argument() {
+        let (mut rows, target) = focus_rule(AND_RIGHT, "PTelApp");
+        let premise = rows.facts[target].premises[2];
+        // Use the second parameter of And in place of the first.
+        let other = dump_term(&rows, 21);
+        assert_ne!(rows.facts[premise].raw[2], other);
+        rows.facts[premise].raw[2] = other;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn ftel_nil_s_rejects_starting_at_a_later_field() {
+        let (mut rows, target) = focus_rule(LINEAR_COEFFS, "FTelNilS");
+        // T8 projects field 1 from the same major as the base row.
+        rows.facts[target].raw[1] = dump_term(&rows, 8);
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn ftel_step_rejects_a_proposition_predecessor() {
+        let (mut rows, target) = focus_rule(LINEAR_COEFFS, "FTelStep");
+        let predecessor = rows.facts[target].premises[0];
+        assert_eq!(rows.facts[predecessor].raw[3], 0);
+        rows.facts[predecessor].raw[3] = 1;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn ftel_step_p0_rejects_a_body_that_mentions_the_binder() {
+        // Give the field telescope an alternative Pi whose body is bvar 0.
+        let text = AND_RIGHT.replace("C 0 empty", "T 44 pi 16 6\nC 0 empty");
+        let (mut rows, target) = focus_rule(&text, "FTelStepP0");
+        let [g, _, _, _] = rows.facts[target].raw;
+        let predecessor = &rows.facts[rows.facts[target].premises[0]];
+        let [_, previous_projection, telescope, _] = predecessor.raw;
+        let pi = dump_term(&rows, 44);
+        let body = dump_term(&rows, 6);
+        assert_eq!(rows.terms[body as usize].lbr, 1);
+        let eq = alternative_premise(&mut rows, target, 1, [g, telescope, pi, 0]);
+        let inst = alternative_premise(&mut rows, target, 2, [body, 0, previous_projection, previous_projection]);
+        rows.facts[target].raw[2] = previous_projection;
+        rows.facts[target].premises[1..].copy_from_slice(&[eq, inst]);
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn proj_ty_p_rejects_a_data_field() {
+        let (mut rows, target) = focus_rule(AND_RIGHT, "ProjTyP");
+        let [g, _, _, _] = rows.facts[target].raw;
+        let telescope = rows.facts[rows.facts[target].premises[0]].raw[2];
+        // The alternative field type is Prop itself, which has sort 1.
+        let sort_zero = dump_term(&rows, 0);
+        let sort_one = dump_term(&rows, 15);
+        let pi = dump_term(&rows, 1);
+        let eq = alternative_premise(&mut rows, target, 1, [g, telescope, pi, 0]);
+        let infer = alternative_premise(&mut rows, target, 2, [g, sort_zero, sort_one, 0]);
+        let sort_eq = alternative_premise(&mut rows, target, 3, [g, sort_one, sort_one, 0]);
+        rows.facts[target].raw[2] = sort_zero;
+        rows.facts[target].premises[1..].copy_from_slice(&[eq, infer, sort_eq]);
+        assert_rule_refused(&rows);
+    }
+
+    fn inhabited_with_max_zero() -> String {
+        format!("{}L 7 max 1 1\n", INHABITED_DEFAULT.replace("C 0 empty", "T 25 leaf sort 7 0\nC 0 empty"))
+    }
+
+    #[test]
+    fn ftel_nil_m_rejects_max_zero_without_its_own_nz_premise() {
+        let (mut rows, target) = focus_rule(&inhabited_with_max_zero(), "FTelNilM");
+        let premise = rows.facts[target].premises[6];
+        // Normalize the inferred sort to max(0, 0) while still citing the
+        // original NZ premise for max(1, u).
+        rows.facts[premise].raw[2] = dump_term(&rows, 25);
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn nz_max_l_rejects_a_zero_left_side() {
+        let (mut rows, target) = focus_rule(&inhabited_with_max_zero(), "NZMaxL");
+        let sort = dump_term(&rows, 25) as usize;
+        rows.facts[target].raw[0] = rows.terms[sort].child[1].unwrap() as u64;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn lit_nat_rejects_a_type_with_nonempty_levels() {
+        // Give Nat itself a singleton level list on a spare constant term.
+        let text = HUGE_FUEL.replace("C 0 empty", "T 34 leaf const 0 2\nC 0 empty");
+        let (mut rows, target) = focus_rule(&text, "LitNat");
+        rows.facts[target].raw[2] = dump_term(&rows, 34);
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn lit_nat_rejects_a_nonliteral_term() {
+        let (mut rows, target) = focus_rule(HUGE_FUEL, "LitNat");
+        rows.facts[target].raw[1] = rows.facts[target].raw[2];
+        assert_rule_refused(&rows);
+    }
+
     /// Proves every piece under challenges drawn from all commitments;
     /// returns whether every piece verified and the buses balance.
     fn shared(c: &LeanCircuit, cap: usize, drop_last: bool) -> (usize, bool) {

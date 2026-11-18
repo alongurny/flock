@@ -1,0 +1,92 @@
+L 0 zero
+L 1 succ 0
+L 2 param 0
+L 3 succ 2
+S 0 nil
+S 1 cons 2 0
+S 2 cons 0 0
+T 0 leaf sort 1 0
+T 1 leaf const 0 0
+T 2 leaf sort 3 0
+T 3 pi 1 2
+T 4 pi 2 3
+T 5 leaf const 1 1
+T 6 bvar 1
+T 7 app 5 6
+T 8 bvar 0
+T 9 app 7 8
+T 10 bvar 2
+T 11 pi 9 10
+T 12 pi 1 11
+T 13 pi 2 12
+T 14 leaf const 2 2
+T 15 app 14 1
+T 16 leaf lit 14592534880185492380 0
+T 17 app 15 16
+T 18 leaf const 1 2
+T 19 app 18 1
+T 20 app 19 8
+T 21 pi 1 20
+T 22 leaf const 3 0
+T 23 app 22 16
+T 24 app 17 23
+T 25 app 18 6
+T 26 app 25 8
+T 27 pi 26 10
+T 28 pi 1 27
+T 29 pi 0 28
+T 30 pi 20 1
+T 31 pi 1 30
+T 32 app 19 16
+T 33 pi 32 1
+C 0 empty
+D 0 0 0 -1 10226290566345457657 11584833188611837601 5 0 2
+I 0 induct 0 0 2 1 17573513141635181691 3486135451607607673
+D 1 0 1 -1 17128951899282035377 17036175768235488794 5 4 16
+I 1 induct 2 0 1 0 39789830979486315 8459763091595732837
+D 2 1 1 -1 5049978783898300891 10151001286278409192 2 13 17
+D 3 1 0 -1 4212085537109669955 3074684648417571984 2 21 18
+F 0 Const infer 0 1 0 0 :
+F 1 Refl eq 0 0 0 0 :
+F 2 LInstLParam linstl 2 2 0 0 :
+F 3 LInstLSucc linstl 3 2 1 0 : 2
+F 4 LInstSort linst 2 2 0 0 : 3
+F 5 LInstNone linst 1 2 1 0 :
+F 6 LInstConst linst 5 2 18 0 : 2
+F 7 LInstNone linst 6 2 6 0 :
+F 8 LInstApp linst 7 2 25 0 : 6 7
+F 9 LInstNone linst 8 2 8 0 :
+F 10 LInstApp linst 9 2 26 0 : 8 9
+F 11 LInstNone linst 10 2 10 0 :
+F 12 LInstBind linst 11 2 27 0 : 10 11
+F 13 LInstBind linst 12 2 28 0 : 5 12
+F 14 LInstBind linst 13 2 29 0 : 4 13
+F 15 Const infer 0 14 29 0 : 14
+F 16 Refl eq 0 29 29 0 :
+F 17 InstClosed inst 1 0 1 1 :
+F 18 InstClosed inst 18 1 1 18 :
+F 19 InstHit inst 6 1 1 1 :
+F 20 InstApp inst 25 1 1 19 : 18 19
+F 21 InstClosed inst 8 1 1 8 :
+F 22 InstApp inst 26 1 1 20 : 20 21
+F 23 InstHit inst 10 2 1 1 :
+F 24 InstBind inst 27 1 1 30 : 22 23
+F 25 InstBind inst 28 0 1 31 : 17 24
+F 26 App infer 0 15 31 0 : 15 16 0 1 25
+F 27 Refl eq 0 31 31 0 :
+F 28 LitNat infer 0 16 1 0 :
+F 29 Refl eq 0 1 1 0 :
+F 30 InstClosed inst 19 0 16 19 :
+F 31 InstHit inst 8 0 16 16 :
+F 32 InstApp inst 20 0 16 32 : 30 31
+F 33 InstClosed inst 1 1 16 1 :
+F 34 InstBind inst 30 0 16 33 : 32 33
+F 35 App infer 0 17 33 0 : 26 27 28 29 34
+F 36 Refl eq 0 33 33 0 :
+F 37 Const infer 0 22 21 0 :
+F 38 Refl eq 0 21 21 0 :
+F 39 App infer 0 23 32 0 : 37 38 28 29 32
+F 40 Refl eq 0 32 32 0 :
+F 41 InstClosed inst 1 0 23 1 :
+F 42 App infer 0 24 1 0 : 35 36 39 40 41
+G 5453745171068219704 9820022808033733741 2 0 1 24 0 1 42 29 -1 3346 0

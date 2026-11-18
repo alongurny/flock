@@ -1,0 +1,99 @@
+L 0 param 0
+L 1 zero
+L 2 succ 1
+L 3 max 2 0
+L 4 succ 0
+L 5 imax 3 0
+L 6 imax 4 5
+S 0 nil
+S 1 cons 0 0
+T 0 leaf sort 0 0
+T 1 leaf sort 3 0
+T 2 pi 0 1
+T 3 leaf const 0 1
+T 4 bvar 0
+T 5 app 3 4
+T 6 bvar 1
+T 7 pi 5 6
+T 8 pi 0 7
+T 9 proj 0 0 4
+T 10 lam 5 9
+T 11 lam 0 10
+T 12 leaf sort 4 0
+T 13 leaf fvar 0 0
+T 14 app 3 13
+T 15 pi 14 13
+T 16 leaf fvar 1 0
+T 17 leaf sort 5 0
+T 18 leaf sort 6 0
+T 19 lam 14 9
+T 20 proj 0 0 16
+T 21 app 3 6
+T 22 pi 4 21
+T 23 pi 0 22
+T 24 pi 13 14
+C 0 empty
+C 1 push 0 0
+C 2 push 1 14
+D 0 0 1 -1 13997768789769896519 14077574841245558448 5 2 2439
+I 0 induct 1 0 1 0 758438698664882868 10575639972786992886
+D 1 0 1 -1 758438698664882868 10575639972786992886 6 23 2438
+I 1 ctor 13997768789769896519 14077574841245558448 1 1
+F 0 Sort infer 0 0 12 0 :
+F 1 Refl eq 0 12 12 0 :
+F 2 InstClosed inst 3 0 13 3 :
+F 3 InstHit inst 4 0 13 13 :
+F 4 InstApp inst 5 0 13 14 : 2 3
+F 5 InstHit inst 6 1 13 13 :
+F 6 InstBind inst 7 0 13 15 : 4 5
+F 7 LInstLParam linstl 0 1 0 0 :
+F 8 LInstSort linst 0 1 0 0 : 7
+F 9 LInstLZero linstl 1 1 1 0 :
+F 10 LInstLSucc linstl 2 1 2 0 : 9
+F 11 LInstLMax linstl 3 1 3 0 : 10 7
+F 12 LInstSort linst 1 1 1 0 : 11
+F 13 LInstBind linst 2 1 2 0 : 8 12
+F 14 Const infer 1 3 2 0 : 13
+F 15 Refl eq 1 2 2 0 :
+F 16 HasLast has 1 0 0 0 :
+F 17 FVar infer 1 13 0 0 : 16
+F 18 Refl eq 1 0 0 0 :
+F 19 InstClosed inst 1 0 13 1 :
+F 20 App infer 1 14 1 0 : 14 15 17 18 19
+F 21 Refl eq 1 1 1 0 :
+F 22 InstClosed inst 13 0 16 13 :
+F 23 HasUp has 2 0 0 0 : 16
+F 24 FVar infer 2 13 0 0 : 23
+F 25 Refl eq 2 0 0 0 :
+F 26 Pi infer 1 15 17 0 : 20 21 22 24 25
+F 27 Refl eq 1 17 17 0 :
+F 28 Pi infer 0 8 18 0 : 0 1 6 26 27
+F 29 Refl eq 0 18 18 0 :
+F 30 InstClosed inst 9 1 13 9 :
+F 31 InstBind inst 10 0 13 19 : 4 30
+F 32 InstHit inst 4 0 16 16 :
+F 33 InstProj inst 9 0 16 20 : 32
+F 34 HasLast has 2 1 14 0 :
+F 35 FVar infer 2 16 14 0 : 34
+F 36 Refl eq 2 14 14 0 :
+F 37 Refl eq 2 3 3 0 :
+F 38 Const infer 2 3 2 0 : 13
+F 39 Refl eq 2 2 2 0 :
+F 40 App infer 2 14 1 0 : 38 39 24 25 19
+F 41 Refl eq 2 1 1 0 :
+F 42 LInstNone linst 4 1 4 0 :
+F 43 LInstConst linst 3 1 3 0 : 7
+F 44 LInstNone linst 6 1 6 0 :
+F 45 LInstApp linst 21 1 21 0 : 43 44
+F 46 LInstBind linst 22 1 22 0 : 42 45
+F 47 LInstBind linst 23 1 23 0 : 8 46
+F 48 Refl eq 2 23 23 0 :
+F 49 InstClosed inst 3 1 13 3 :
+F 50 InstApp inst 21 1 13 14 : 49 5
+F 51 InstBind inst 22 0 13 24 : 3 50
+F 52 Refl eq 2 24 24 0 :
+F 53 Proj infer 2 20 13 0 : 35 36 40 41 47 48 51 52
+F 54 Lam infer 1 19 15 0 : 20 21 33 53 22
+F 55 Lam infer 0 11 8 0 : 0 1 31 54 6
+F 56 Refl eq 0 8 8 0 :
+G 2667147902317719738 7778858989069602550 2 1 8 11 28 29 55 56 -1 2442 0
