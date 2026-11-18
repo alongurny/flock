@@ -86,6 +86,10 @@ pub fn prove_lean_tower(
 pub struct LeanStatement {
     pub chunk_words: Vec<u64>,
     pub keys: Vec<[F128; 2]>,
+    /// The constants the rules read from the verifier, per reading row:
+    /// the number and its key ([`crate::lean_rows::prims_product`]). One
+    /// key per number: the keys of `Nat` and of `String`.
+    pub prims: Vec<(u64, [F128; 2])>,
 }
 
 /// A leaf's word in the commitment tree: its publics digest chained with
@@ -185,7 +189,8 @@ pub fn segments_balanced(
         return Err("a segment used other challenges".into());
     }
     let st = crate::lean_rows::statement_product(&ch, &statement.chunk_words, &statement.keys)?;
-    let send = segments.iter().fold(F128::ONE, |a, s| a * s.send);
+    let prims = crate::lean_rows::prims_product(&ch, &statement.prims)?;
+    let send = segments.iter().fold(prims, |a, s| a * s.send);
     let recv = segments.iter().fold(F128::ONE, |a, s| a * s.recv);
     Ok(send != F128::ZERO && send == recv * st)
 }
@@ -468,7 +473,7 @@ pub fn prove_lean_segment(
 #[ignore] // Heavier — run alone with `-- --ignored`.
 #[cfg(not(target_arch = "aarch64"))]
 fn lean_tower_spine() {
-    use crate::lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, leaf, leaf_statement};
+    use crate::lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, leaf, leaf_prims, leaf_statement};
     let small = include_str!("../../tests/data/lean_small.rows");
     let rows = Rows::merge((0..9000).map(|_| Rows::parse(small).unwrap()).collect());
     let c = LeanCircuit::build(&rows).unwrap();
@@ -486,6 +491,7 @@ fn lean_tower_spine() {
         let (w, k) = leaf_statement(&c, &profile, &slots, i);
         st.chunk_words.extend(w);
         st.keys.extend(k);
+        st.prims.extend(leaf_prims(&c, &profile, &slots));
     }
     let r = prove_lean_tower(
         super::test_config(),

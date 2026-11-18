@@ -20,7 +20,7 @@ use std::{collections::HashMap, fs, path::Path, time::Instant};
 use flock_field::F128;
 
 use flock_prover::{
-    lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, SlotRows, Tuple, leaf, leaf_statement},
+    lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, SlotRows, Tuple, leaf, leaf_prims, leaf_statement},
     tower::{
         LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root, lean_segments_root,
         prove_lean_segment, prove_lean_tower_streaming, segments_balanced,
@@ -180,6 +180,10 @@ impl Sources {
 
     fn statement(&self, profile: &Profile, slots: &[Option<(usize, usize)>], i: usize) -> (Vec<u64>, Vec<[F128; 2]>) {
         leaf_statement(&self.proto, profile, &self.slots(profile, slots), i)
+    }
+
+    fn prims(&self, profile: &Profile, slots: &[Option<(usize, usize)>]) -> Vec<(u64, [F128; 2])> {
+        leaf_prims(&self.proto, profile, &self.slots(profile, slots))
     }
 }
 
@@ -637,8 +641,13 @@ fn main() {
             let mut statement: LeanStatement = fs::read(&stmt_file)
                 .ok()
                 .map(|b| {
-                    let (w, k): (Vec<u64>, Vec<[(u64, u64); 2]>) = bincode::deserialize(&b).unwrap();
+                    let (w, k, pr): (Vec<u64>, Vec<[(u64, u64); 2]>, Vec<(u64, [(u64, u64); 2])>) =
+                        bincode::deserialize(&b).unwrap();
                     LeanStatement {
+                        prims: pr
+                            .into_iter()
+                            .map(|(n, [x, y])| (n, [F128::new(x.0, x.1), F128::new(y.0, y.1)]))
+                            .collect(),
                         chunk_words: w,
                         keys: k
                             .into_iter()
@@ -656,6 +665,7 @@ fn main() {
                     let (w, k) = src.statement(&profiles[i], p, index[i]);
                     statement.chunk_words.extend(w);
                     statement.keys.extend(k);
+                    statement.prims.extend(src.prims(&profiles[i], p));
                     if std::env::var_os("LEAN_DIGESTS").is_some() {
                         println!("leaf {i}: circuit blake3:{:02x?}", &piece.digest()[..6]);
                     }
@@ -670,7 +680,9 @@ fn main() {
                     .iter()
                     .map(|[x, y]| [(x.lo, x.hi), (y.lo, y.hi)])
                     .collect();
-                fs::write(&stmt_file, bincode::serialize(&(&statement.chunk_words, k)).unwrap())
+                let pr: Vec<(u64, [(u64, u64); 2])> =
+                    statement.prims.iter().map(|(n, [x, y])| (*n, [(x.lo, x.hi), (y.lo, y.hi)])).collect();
+                fs::write(&stmt_file, bincode::serialize(&(&statement.chunk_words, k, pr)).unwrap())
                     .unwrap();
             }
             println!(
@@ -678,6 +690,19 @@ fn main() {
                 statement.chunk_words.len(),
                 statement.keys.len()
             );
+            let mut named: Vec<(u64, [F128; 2], usize)> = Vec::new();
+            for &(n, key) in &statement.prims {
+                match named.iter_mut().find(|x| x.0 == n && x.1 == key) {
+                    Some(x) => x.2 += 1,
+                    None => named.push((n, key, 1)),
+                }
+            }
+            for (n, key, rows) in named {
+                println!(
+                    "statement: constant {n} has the key {:016x}{:016x} {:016x}{:016x} ({rows} rows read it)",
+                    key[0].hi, key[0].lo, key[1].hi, key[1].lo
+                );
+            }
             println!(
                 "first pass: {} leaves committed ({:.0} s, {})",
                 words.len(),

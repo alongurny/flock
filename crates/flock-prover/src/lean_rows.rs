@@ -130,6 +130,12 @@ const TAG_INFO: u64 = 13;
 const TAG_KEY: u64 = 14;
 /// A recursor's rule: `[recursor, constructor, g^fields, right-hand side]`.
 const TAG_RULE: u64 = 15;
+/// The key of a constant the kernel computes with: `[number, key words]`,
+/// from the verifier, to a rule that reads the constant ([`PRIM_NAT`]).
+const TAG_PRIM: u64 = 16;
+/// The type of number literals and the type of string literals.
+pub const PRIM_NAT: u64 = 1;
+pub const PRIM_STRING: u64 = 20;
 const PAD_CHUNK: u64 = 1 << 31;
 // Term kinds.
 const K_BVAR: u64 = 1;
@@ -2804,6 +2810,20 @@ fn fact_spec(rule: &str) -> Spec {
             }
             send(&mut s, F_NZ, [tc(l), Z, Z, Z]);
         }
+        // A literal's type is the constant `Nat` (`String`) without levels:
+        // the constant's key is the one the verifier names ([`leaf`] adds
+        // that receive, as it adds a checked declaration's send).
+        "LitNat" | "LitStr" => {
+            let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            let sub = if rule == "LitNat" { SUB_LIT } else { SUB_STR };
+            s.term(e, f(1), k(K_LEAF), [Some(k(sub)), None, None], None);
+            let (d, ls) = (s.val(E::Tm(f(2), Part::X(1))), s.val(E::Tm(f(2), Part::X(2))));
+            s.term(t, f(2), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
+            s.list(ls, ch(f(2), 2), Some(Z), Some(Z), Some(one));
+            let (k0, k1) = (s.val(E::Dcl(f(2), Part::X(4))), s.val(E::Dcl(f(2), Part::X(5))));
+            s.recv([k(TAG_KEY), tc(d), tc(k0), tc(k1)]);
+            send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
+        }
         "LEqLe" => {
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
             s.prem(0, F_LLE, [c(l), c(m), Some(Z), Some(Z)], r);
@@ -3081,6 +3101,8 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "ProjCtorAt" => "ProjCtorAt",
         "IotaL" => "IotaL",
         "PTelNil" => "PTelNil",
+        "LitNat" => "LitNat",
+        "LitStr" => "LitStr",
         "NZSucc" => "NZSucc",
         "NZPar0" => "NZPar0",
         "NZPar1" => "NZPar1",
@@ -3133,7 +3155,9 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 90] = [
+const FACT_TABLES: [&str; 92] = [
+    "LitNat",
+    "LitStr",
     "NZSucc",
     "NZPar0",
     "NZPar1",
@@ -4241,6 +4265,16 @@ pub fn leaf(
             terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
             sb.bus_port_counted(slot, BusDirection::Send, terms, vec![io[live]]);
         }
+        // A literal's rule reads the key of its type from the verifier, who
+        // sends the statement's key of `Nat` (`String`) once per such row.
+        if let Some(number) = prim_of(&sp.name) {
+            let keys = prim_key_cols(sp);
+            let live = live_col.iter().flatten().next().copied().expect("a rule has a live bit");
+            let konst = |v: u64| BusTerm { word: None, constant: int(v), row: None };
+            let mut terms = vec![konst(TAG_PRIM), konst(number), BusTerm::word(io[keys[0]]), BusTerm::word(io[keys[1]])];
+            terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
+            sb.bus_port_counted(slot, BusDirection::Recv, terms, vec![io[live]]);
+        }
         let n_live = live_col.iter().any(Option::is_some) as usize;
         let zero_row = vec![F128::ZERO; sp.cols.len()];
         for j in 0..1usize << nu {
@@ -4322,6 +4356,62 @@ pub fn rule_table() -> usize {
 
 pub fn rare_table() -> usize {
     2 + TERM_TABLES.len() + 4 + FACT_TABLES.iter().filter(|r| **r != "Assumed" && rare_place(r).is_none()).count()
+}
+
+/// The constant a table's rule reads from the verifier, if it reads one.
+fn prim_of(name: &str) -> Option<u64> {
+    match name {
+        "LitNat" => Some(PRIM_NAT),
+        "LitStr" => Some(PRIM_STRING),
+        _ => None,
+    }
+}
+
+/// The columns of such a table that hold the constant's key.
+fn prim_key_cols(sp: &Spec) -> Vec<usize> {
+    let cols: Vec<usize> = sp
+        .cols
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.1, Some(Src::Val(E::Dcl(_, Part::X(4) | Part::X(5))))))
+        .map(|(y, _)| y)
+        .collect();
+    assert_eq!(cols.len(), 2, "the two key words");
+    cols
+}
+
+/// The constants a leaf's rows read from the verifier: per row, the number
+/// and the key the row holds for it ([`prims_product`]).
+pub fn leaf_prims(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> Vec<(u64, [F128; 2])> {
+    let mut out = Vec::new();
+    for (k, &s) in profile.slots.iter().enumerate() {
+        let sp = &proto.specs[s];
+        if let (Some(c), Some(number)) = (slots[k], prim_of(&sp.name)) {
+            let keys = prim_key_cols(sp);
+            out.extend(c.rows.iter().map(|z| (number, [z[keys[0]], z[keys[1]]])));
+        }
+    }
+    out
+}
+
+/// The verifier's sends: per reading row, the key of the constant read.
+/// A statement names one key for each constant (the keys of `Nat` and
+/// `String`, which whoever reads the statement compares with the store's);
+/// rows that hold different keys for one constant are refused.
+pub fn prims_product(ch: &SharedChallenges, prims: &[(u64, [F128; 2])]) -> Result<F128, String> {
+    let mut named: HashMap<u64, [F128; 2]> = HashMap::new();
+    let mut p = F128::ONE;
+    for &(number, key) in prims {
+        if *named.entry(number).or_insert(key) != key {
+            return Err(format!("two keys for the constant {number}"));
+        }
+        let mut acc = ch.beta;
+        for (x, &g) in [int(TAG_PRIM), int(number), key[0], key[1]].iter().zip(&ch.gamma) {
+            acc += g * *x;
+        }
+        p *= acc;
+    }
+    Ok(p)
 }
 
 /// What a leaf contributes to the statement: its slots' chunk words, and
