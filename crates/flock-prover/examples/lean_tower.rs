@@ -659,7 +659,32 @@ fn main() {
             if words.len() != index.len() || statement.chunk_words.is_empty() {
                 words.clear();
                 statement = LeanStatement::default();
-                for (i, p) in plan.iter().enumerate() {
+                // A first pass that was cut short goes on from its last
+                // checkpoint: the words and the statement of the leaves done.
+                type Part = (Vec<[u8; 32]>, Vec<u64>, Vec<[(u64, u64); 2]>, Vec<(u64, [(u64, u64); 2])>);
+                let part_file = format!("{words_file}.part");
+                let f2 = |x: &(u64, u64)| F128::new(x.0, x.1);
+                if let Some((w, cw, k, pr)) =
+                    fs::read(&part_file).ok().and_then(|b| bincode::deserialize::<Part>(&b).ok())
+                {
+                    eprintln!("first pass: {} leaves from the checkpoint", w.len());
+                    words = w;
+                    statement.chunk_words = cw;
+                    statement.keys = k.iter().map(|[x, y]| [f2(x), f2(y)]).collect();
+                    statement.prims = pr.iter().map(|(n, [x, y])| (*n, [f2(x), f2(y)])).collect();
+                }
+                let done = words.len();
+                for (i, p) in plan.iter().enumerate().skip(done) {
+                    if i > done && i % 8 == 0 {
+                        let part: Part = (
+                            words.clone(),
+                            statement.chunk_words.clone(),
+                            statement.keys.iter().map(|[x, y]| [(x.lo, x.hi), (y.lo, y.hi)]).collect(),
+                            statement.prims.iter().map(|(n, [x, y])| (*n, [(x.lo, x.hi), (y.lo, y.hi)])).collect(),
+                        );
+                        fs::write(format!("{part_file}.new"), bincode::serialize(&part).unwrap()).unwrap();
+                        fs::rename(format!("{part_file}.new"), &part_file).unwrap();
+                    }
                     src.load(&profiles, &plan, i);
                     let piece = src.piece(&profiles[i], p, index[i]);
                     let (w, k) = src.statement(&profiles[i], p, index[i]);
@@ -684,6 +709,7 @@ fn main() {
                     statement.prims.iter().map(|(n, [x, y])| (*n, [(x.lo, x.hi), (y.lo, y.hi)])).collect();
                 fs::write(&stmt_file, bincode::serialize(&(&statement.chunk_words, k, pr)).unwrap())
                     .unwrap();
+                let _ = fs::remove_file(&part_file);
             }
             println!(
                 "statement: {} chunk words, {} checked keys",
