@@ -20,7 +20,7 @@ use std::{collections::HashMap, fs, path::Path, time::Instant};
 use flock_field::F128;
 
 use flock_prover::{
-    lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, SlotRows, Tuple, leaf, leaf_prims, leaf_statement},
+    lean_rows::{Arith, arith_entry, lit_hash, LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, SlotRows, Tuple, leaf, leaf_arith, leaf_prims, leaf_statement},
     tower::{
         LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root, lean_segments_root,
         prove_lean_segment, prove_lean_tower_streaming, segments_balanced,
@@ -30,6 +30,48 @@ use flock_prover::{
 fn read<T: serde::de::DeserializeOwned>(p: impl AsRef<Path>) -> T {
     let bytes = fs::read(p.as_ref()).unwrap_or_else(|e| panic!("{}: {e}", p.as_ref().display()));
     bincode::deserialize(&bytes).unwrap()
+}
+
+type P2 = (u64, u64);
+/// A statement on disk: chunk words, checked keys, the constants read and
+/// the steps of arithmetic.
+type StmtS = (Vec<u64>, Vec<[P2; 2]>, Vec<(u64, [P2; 2])>, Vec<(u64, [P2; 2], u64, u64, [P2; 2])>);
+
+fn stmt_ser(s: &LeanStatement) -> StmtS {
+    let p = |k: &[F128; 2]| [(k[0].lo, k[0].hi), (k[1].lo, k[1].hi)];
+    (
+        s.chunk_words.clone(),
+        s.keys.iter().map(p).collect(),
+        s.prims.iter().map(|(n, k)| (*n, p(k))).collect(),
+        s.arith.iter().map(|a| (a.op, p(&a.key), a.x, a.y, p(&a.out))).collect(),
+    )
+}
+
+fn stmt_de((chunk_words, keys, prims, arith): StmtS) -> LeanStatement {
+    let f = |k: [P2; 2]| [F128::new(k[0].0, k[0].1), F128::new(k[1].0, k[1].1)];
+    LeanStatement {
+        chunk_words,
+        keys: keys.into_iter().map(f).collect(),
+        prims: prims.into_iter().map(|(n, k)| (n, f(k))).collect(),
+        arith: arith.into_iter().map(|(op, key, x, y, out)| Arith { op, key: f(key), x, y, out: f(out) }).collect(),
+    }
+}
+
+/// `lean_dump`'s LEAN_DUMP_NAT file: the kernel's constants by key
+/// (`P number key0 key1`) and the literals' values by hash (`N value`).
+/// Empty when there is no file: a cone without arithmetic needs none.
+fn nat_file(path: &str) -> (HashMap<[u64; 2], u64>, HashMap<u64, u64>) {
+    let (mut numbers, mut lits) = (HashMap::new(), HashMap::new());
+    for line in fs::read_to_string(path).unwrap_or_default().lines() {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let n = |i: usize| w[i].parse::<u64>().unwrap_or_else(|_| panic!("{path}: {line}"));
+        match w[0] {
+            "P" => drop(numbers.insert([n(2), n(3)], n(1))),
+            "N" => drop(lits.insert(lit_hash(n(1)), n(1))),
+            _ => panic!("{path}: {line}"),
+        }
+    }
+    (numbers, lits)
 }
 
 fn batch_base(k: usize) -> usize {
@@ -184,6 +226,10 @@ impl Sources {
 
     fn prims(&self, profile: &Profile, slots: &[Option<(usize, usize)>]) -> Vec<(u64, [F128; 2])> {
         leaf_prims(&self.proto, profile, &self.slots(profile, slots))
+    }
+
+    fn arith(&self, profile: &Profile, slots: &[Option<(usize, usize)>]) -> Vec<[F128; 7]> {
+        leaf_arith(&self.proto, profile, &self.slots(profile, slots))
     }
 }
 
@@ -640,48 +686,27 @@ fn main() {
             let stmt_file = format!("{out}/statement-{}-{slots}-{}.bin", a[0], index.len());
             let mut statement: LeanStatement = fs::read(&stmt_file)
                 .ok()
-                .map(|b| {
-                    let (w, k, pr): (Vec<u64>, Vec<[(u64, u64); 2]>, Vec<(u64, [(u64, u64); 2])>) =
-                        bincode::deserialize(&b).unwrap();
-                    LeanStatement {
-                        prims: pr
-                            .into_iter()
-                            .map(|(n, [x, y])| (n, [F128::new(x.0, x.1), F128::new(y.0, y.1)]))
-                            .collect(),
-                        chunk_words: w,
-                        keys: k
-                            .into_iter()
-                            .map(|[x, y]| [F128::new(x.0, x.1), F128::new(y.0, y.1)])
-                            .collect(),
-                    }
-                })
+                .map(|b| stmt_de(bincode::deserialize(&b).expect("a statement file of this version")))
                 .unwrap_or_default();
             if words.len() != index.len() || statement.chunk_words.is_empty() {
                 words.clear();
                 statement = LeanStatement::default();
+                // What names the arithmetic's steps: the kernel's constants
+                // and the literals' values (`lean_dump` with LEAN_DUMP_NAT).
+                let (numbers, lits) = nat_file(&format!("{out}/nat.rows"));
                 // A first pass that was cut short goes on from its last
                 // checkpoint: the words and the statement of the leaves done.
-                type Part = (Vec<[u8; 32]>, Vec<u64>, Vec<[(u64, u64); 2]>, Vec<(u64, [(u64, u64); 2])>);
+                type Part = (Vec<[u8; 32]>, StmtS);
                 let part_file = format!("{words_file}.part");
-                let f2 = |x: &(u64, u64)| F128::new(x.0, x.1);
-                if let Some((w, cw, k, pr)) =
-                    fs::read(&part_file).ok().and_then(|b| bincode::deserialize::<Part>(&b).ok())
-                {
+                if let Some((w, s)) = fs::read(&part_file).ok().and_then(|b| bincode::deserialize::<Part>(&b).ok()) {
                     eprintln!("first pass: {} leaves from the checkpoint", w.len());
                     words = w;
-                    statement.chunk_words = cw;
-                    statement.keys = k.iter().map(|[x, y]| [f2(x), f2(y)]).collect();
-                    statement.prims = pr.iter().map(|(n, [x, y])| (*n, [f2(x), f2(y)])).collect();
+                    statement = stmt_de(s);
                 }
                 let done = words.len();
                 for (i, p) in plan.iter().enumerate().skip(done) {
                     if i > done && i % 8 == 0 {
-                        let part: Part = (
-                            words.clone(),
-                            statement.chunk_words.clone(),
-                            statement.keys.iter().map(|[x, y]| [(x.lo, x.hi), (y.lo, y.hi)]).collect(),
-                            statement.prims.iter().map(|(n, [x, y])| (*n, [(x.lo, x.hi), (y.lo, y.hi)])).collect(),
-                        );
+                        let part: Part = (words.clone(), stmt_ser(&statement));
                         fs::write(format!("{part_file}.new"), bincode::serialize(&part).unwrap()).unwrap();
                         fs::rename(format!("{part_file}.new"), &part_file).unwrap();
                     }
@@ -691,6 +716,11 @@ fn main() {
                     statement.chunk_words.extend(w);
                     statement.keys.extend(k);
                     statement.prims.extend(src.prims(&profiles[i], p));
+                    for raw in src.arith(&profiles[i], p) {
+                        statement
+                            .arith
+                            .push(arith_entry(&raw, &numbers, &lits).unwrap_or_else(|e| panic!("leaf {i}: {e}")));
+                    }
                     if std::env::var_os("LEAN_DIGESTS").is_some() {
                         println!("leaf {i}: circuit blake3:{:02x?}", &piece.digest()[..6]);
                     }
@@ -700,29 +730,24 @@ fn main() {
                     }
                 }
                 fs::write(&words_file, words.concat()).unwrap();
-                let k: Vec<[(u64, u64); 2]> = statement
-                    .keys
-                    .iter()
-                    .map(|[x, y]| [(x.lo, x.hi), (y.lo, y.hi)])
-                    .collect();
-                let pr: Vec<(u64, [(u64, u64); 2])> =
-                    statement.prims.iter().map(|(n, [x, y])| (*n, [(x.lo, x.hi), (y.lo, y.hi)])).collect();
-                fs::write(&stmt_file, bincode::serialize(&(&statement.chunk_words, k, pr)).unwrap())
-                    .unwrap();
+                fs::write(&stmt_file, bincode::serialize(&stmt_ser(&statement)).unwrap()).unwrap();
                 let _ = fs::remove_file(&part_file);
             }
             println!(
-                "statement: {} chunk words, {} checked keys",
+                "statement: {} chunk words, {} checked keys, {} steps of arithmetic",
                 statement.chunk_words.len(),
-                statement.keys.len()
+                statement.keys.len(),
+                statement.arith.len()
             );
             let mut named: Vec<(u64, [F128; 2], usize)> = Vec::new();
-            for &(n, key) in &statement.prims {
+            let ops = statement.arith.iter().map(|a| (a.op, a.key));
+            for (n, key) in statement.prims.iter().copied().chain(ops) {
                 match named.iter_mut().find(|x| x.0 == n && x.1 == key) {
                     Some(x) => x.2 += 1,
                     None => named.push((n, key, 1)),
                 }
             }
+            named.sort_unstable_by_key(|x| x.0);
             for (n, key, rows) in named {
                 println!(
                     "statement: constant {n} has the key {:016x}{:016x} {:016x}{:016x} ({rows} rows read it)",

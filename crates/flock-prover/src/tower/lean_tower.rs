@@ -90,6 +90,9 @@ pub struct LeanStatement {
     /// the number and its key ([`crate::lean_rows::prims_product`]). One
     /// key per number: the keys of `Nat` and of `String`.
     pub prims: Vec<(u64, [F128; 2])>,
+    /// The steps of arithmetic on literals the rules read from the
+    /// verifier, per reading row ([`crate::lean_rows::arith_product`]).
+    pub arith: Vec<crate::lean_rows::Arith>,
 }
 
 /// A leaf's word in the commitment tree: its publics digest chained with
@@ -190,7 +193,8 @@ pub fn segments_balanced(
     }
     let st = crate::lean_rows::statement_product(&ch, &statement.chunk_words, &statement.keys)?;
     let prims = crate::lean_rows::prims_product(&ch, &statement.prims)?;
-    let send = segments.iter().fold(prims, |a, s| a * s.send);
+    let (arith, _) = crate::lean_rows::arith_product(&ch, &statement.arith)?;
+    let send = segments.iter().fold(prims * arith, |a, s| a * s.send);
     let recv = segments.iter().fold(F128::ONE, |a, s| a * s.recv);
     Ok(send != F128::ZERO && send == recv * st)
 }

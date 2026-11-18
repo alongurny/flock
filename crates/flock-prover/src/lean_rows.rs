@@ -133,6 +133,11 @@ const TAG_RULE: u64 = 15;
 /// The key of a constant the kernel computes with: `[number, key words]`,
 /// from the verifier, to a rule that reads the constant ([`PRIM_NAT`]).
 const TAG_PRIM: u64 = 16;
+/// A step of arithmetic on literals, from the verifier, who computes it
+/// ([`arith_product`]): the operation's key, the literals read (as the rows
+/// name them, by a hash of their bytes), what it gives (a literal, or the
+/// key of `Bool.true` or `Bool.false`) and which of the two.
+const TAG_ARITH: u64 = 17;
 /// The type of number literals and the type of string literals.
 pub const PRIM_NAT: u64 = 1;
 pub const PRIM_STRING: u64 = 20;
@@ -1431,6 +1436,9 @@ struct Spec {
     taint: Option<usize>,
     /// The rules of a table of several rules (empty for a table of one).
     groups: Vec<Group>,
+    /// What the row receives from the verifier, once on its live bit
+    /// ([`leaf`] adds these ports; a statement names what is sent).
+    verifier: Vec<[T; W]>,
 }
 
 fn pad<const N: usize>(t: [T; N]) -> [T; W] {
@@ -1549,6 +1557,7 @@ impl Spec {
             last_f: 0,
             taint: None,
             groups: Vec::new(),
+            verifier: Vec::new(),
         }
     }
     fn src(&mut self, s: Src) -> usize {
@@ -1569,6 +1578,9 @@ impl Spec {
             mult: Vec::new(),
             preset: false,
         });
+    }
+    fn vrecv<const N: usize>(&mut self, t: [T; N]) {
+        self.verifier.push(pad(t));
     }
     fn send<const N: usize>(&mut self, t: [T; N]) {
         self.ports.push(Port {
@@ -2824,6 +2836,61 @@ fn fact_spec(rule: &str) -> Spec {
             s.recv([k(TAG_KEY), tc(d), tc(k0), tc(k1)]);
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
+        // Arithmetic on literals: `Nat.zero = 0`, `Nat.succ x = x + 1` and
+        // `op x y = z` for the operations Lean's kernel evaluates. The row
+        // holds the operation's key and the literals, and receives the
+        // step from the verifier, who computes what it gives: the circuit
+        // does no arithmetic. What an operation gives is a literal
+        // (`NatBinN`) or `Bool.true` or `Bool.false`, named by its key
+        // (`NatBinB`).
+        "NatZero" | "NatSucc" | "NatBinN" | "NatBinB" => {
+            let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
+            // A literal: the hash of its bytes.
+            let lit = |s: &mut Spec, id: usize, tr: TR| {
+                let h = s.val(E::Tm(tr.clone(), Part::X(1)));
+                s.term(id, tr, k(K_LEAF), [Some(k(SUB_LIT)), c(h), Some(Z)], None);
+                tc(h)
+            };
+            // A constant without levels: its key.
+            let konst = |s: &mut Spec, id: usize, tr: TR| {
+                let (d, ls) = (s.val(E::Tm(tr.clone(), Part::X(1))), s.val(E::Tm(tr.clone(), Part::X(2))));
+                s.term(id, tr.clone(), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
+                s.list(ls, ch(tr.clone(), 2), Some(Z), Some(Z), Some(one));
+                let (k0, k1) = (s.val(E::Dcl(tr.clone(), Part::X(4))), s.val(E::Dcl(tr, Part::X(5))));
+                s.recv([k(TAG_KEY), tc(d), tc(k0), tc(k1)]);
+                [tc(k0), tc(k1)]
+            };
+            // The operation and the literals it is applied to.
+            let (op, x, y) = match rule {
+                "NatZero" => (konst(&mut s, a, f(1)), Z, Z),
+                "NatSucc" => {
+                    let (fc, xa) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+                    s.term(a, f(1), k(K_APP), [c(fc), c(xa), Some(Z)], None);
+                    let op = konst(&mut s, fc, ch(f(1), 0));
+                    (op, lit(&mut s, xa, ch(f(1), 1)), Z)
+                }
+                _ => {
+                    let (fx, ya) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+                    s.term(a, f(1), k(K_APP), [c(fx), c(ya), Some(Z)], None);
+                    let fx_tr = ch(f(1), 0);
+                    let (fc, xa) = (
+                        s.val(E::Tm(ch(fx_tr.clone(), 0), Part::Id)),
+                        s.val(E::Tm(ch(fx_tr.clone(), 1), Part::Id)),
+                    );
+                    s.term(fx, fx_tr.clone(), k(K_APP), [c(fc), c(xa), Some(Z)], None);
+                    let op = konst(&mut s, fc, ch(fx_tr.clone(), 0));
+                    let x = lit(&mut s, xa, ch(fx_tr, 1));
+                    (op, x, lit(&mut s, ya, ch(f(1), 1)))
+                }
+            };
+            let (out, form) = if rule == "NatBinB" {
+                (konst(&mut s, b, f(2)), one)
+            } else {
+                ([lit(&mut s, b, f(2)), Z], Z)
+            };
+            s.vrecv([k(TAG_ARITH), op[0], op[1], x, y, out[0], out[1], form]);
+            send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
+        }
         "LEqLe" => {
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
             s.prem(0, F_LLE, [c(l), c(m), Some(Z), Some(Z)], r);
@@ -3102,6 +3169,13 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         "IotaL" => "IotaL",
         "PTelNil" => "PTelNil",
         "LitNat" => "LitNat",
+        "NatZero" => "NatZero",
+        "NatSucc" => "NatSucc",
+        // What an operation gives is a literal or a boolean.
+        "NatBin" => {
+            let b = &g.terms[f.raw[2] as usize];
+            if b.kind == K_LEAF && b.x[0].f.lo == SUB_LIT { "NatBinN" } else { "NatBinB" }
+        }
         "LitStr" => "LitStr",
         "NZSucc" => "NZSucc",
         "NZPar0" => "NZPar0",
@@ -3155,7 +3229,11 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
     Of::Fact(r)
 }
 
-const FACT_TABLES: [&str; 92] = [
+const FACT_TABLES: [&str; 96] = [
+    "NatZero",
+    "NatSucc",
+    "NatBinN",
+    "NatBinB",
     "LitNat",
     "LitStr",
     "NZSucc",
@@ -4275,6 +4353,19 @@ pub fn leaf(
             terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
             sb.bus_port_counted(slot, BusDirection::Recv, terms, vec![io[live]]);
         }
+        // A step of arithmetic reads what it gives from the verifier.
+        for t in &sp.verifier {
+            let live = live_col.iter().flatten().next().copied().expect("a rule has a live bit");
+            let terms: Vec<BusTerm> = t
+                .iter()
+                .map(|x| match *x {
+                    T::C(c) => BusTerm::word(io[c]),
+                    T::K(v) => BusTerm { word: None, constant: v, row: None },
+                    T::Id => unreachable!("the verifier does not know a row's id"),
+                })
+                .collect();
+            sb.bus_port_counted(slot, BusDirection::Recv, terms, vec![io[live]]);
+        }
         let n_live = live_col.iter().any(Option::is_some) as usize;
         let zero_row = vec![F128::ZERO; sp.cols.len()];
         for j in 0..1usize << nu {
@@ -4412,6 +4503,160 @@ pub fn prims_product(ch: &SharedChallenges, prims: &[(u64, [F128; 2])]) -> Resul
         p *= acc;
     }
     Ok(p)
+}
+
+/// One step of arithmetic on literals, as a statement names it: the
+/// operation ([`PRIM_NAT`]'s numbering: 2 `Nat.zero`, 3 `Nat.succ`, 4 add,
+/// 5 sub, 6 mul, 7 pow, 8 gcd, 9 mod, 10 div, 11 beq, 12 ble, 13 land,
+/// 14 lor, 15 xor, 16 shift left, 17 shift right), the key the rows hold
+/// for it, the numbers it is applied to, and for a comparison the key the
+/// rows hold for the boolean it gives (zero otherwise).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arith {
+    pub op: u64,
+    pub key: [F128; 2],
+    pub x: u64,
+    pub y: u64,
+    pub out: [F128; 2],
+}
+
+pub const PRIM_BOOL_TRUE: u64 = 18;
+pub const PRIM_BOOL_FALSE: u64 = 19;
+
+/// How rows name a literal: the first eight bytes of the BLAKE3 hash of
+/// its little-endian bytes without trailing zeros.
+pub fn lit_hash(v: u64) -> u64 {
+    let b = v.to_le_bytes();
+    let n = 8 - v.leading_zeros() as usize / 8;
+    u64::from_le_bytes(blake3::hash(&b[..n]).as_bytes()[..8].try_into().unwrap())
+}
+
+/// What Lean's kernel gives for the operation (type_checker.cpp
+/// `reduce_nat`): a number (`Ok`) or a boolean (`Err`). None for a result
+/// above 2^64 and for what the kernel does not evaluate.
+fn arith_eval(op: u64, x: u64, y: u64) -> Option<Result<u64, bool>> {
+    let n = |v: Option<u64>| v.map(Ok);
+    match op {
+        2 => (x == 0 && y == 0).then_some(Ok(0)),
+        3 => (y == 0).then(|| x.checked_add(1)).flatten().map(Ok),
+        4 => n(x.checked_add(y)),
+        5 => n(Some(x.saturating_sub(y))),
+        6 => n(x.checked_mul(y)),
+        7 => n(u32::try_from(y).ok().filter(|e| *e <= 1 << 24).and_then(|e| x.checked_pow(e))),
+        8 => {
+            let (mut a, mut b) = (x, y);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            n(Some(a))
+        }
+        9 => n(Some(if y == 0 { x } else { x % y })),
+        10 => n(Some(if y == 0 { 0 } else { x / y })),
+        11 => Some(Err(x == y)),
+        12 => Some(Err(x <= y)),
+        13 => n(Some(x & y)),
+        14 => n(Some(x | y)),
+        15 => n(Some(x ^ y)),
+        16 => n((y < 64 && x.leading_zeros() as u64 >= y).then(|| x << y)),
+        17 => n(Some(if y < 64 { x >> y } else { 0 })),
+        _ => None,
+    }
+}
+
+/// The tuple the verifier sends for a step (after the tag), and for a
+/// comparison the number of the boolean its `out` key is the key of.
+pub fn arith_tuple(a: &Arith) -> Result<([F128; 7], Option<u64>), String> {
+    let zero = F128::ZERO;
+    let r = arith_eval(a.op, a.x, a.y).ok_or(format!("no arithmetic for {} on {} and {}", a.op, a.x, a.y))?;
+    let (hx, hy) = match a.op {
+        2 => (zero, zero),
+        3 => (int(lit_hash(a.x)), zero),
+        _ => (int(lit_hash(a.x)), int(lit_hash(a.y))),
+    };
+    Ok(match r {
+        Ok(v) => {
+            if a.out != [zero; 2] {
+                return Err("a number is not named by a key".into());
+            }
+            ([a.key[0], a.key[1], hx, hy, int(lit_hash(v)), zero, zero], None)
+        }
+        Err(v) => (
+            [a.key[0], a.key[1], hx, hy, a.out[0], a.out[1], F128::ONE],
+            Some(if v { PRIM_BOOL_TRUE } else { PRIM_BOOL_FALSE }),
+        ),
+    })
+}
+
+/// The steps of arithmetic a leaf's rows read from the verifier, as the
+/// rows hold them: the tuple after its tag ([`arith_entry`] names each).
+pub fn leaf_arith(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> Vec<[F128; 7]> {
+    let mut out = Vec::new();
+    for (k, &s) in profile.slots.iter().enumerate() {
+        let sp = &proto.specs[s];
+        let Some(c) = slots[k] else { continue };
+        for t in &sp.verifier {
+            out.extend(c.rows.iter().map(|z| {
+                std::array::from_fn(|i| match t[i + 1] {
+                    T::C(col) => z[col],
+                    T::K(v) => v,
+                    T::Id => unreachable!(),
+                })
+            }));
+        }
+    }
+    out
+}
+
+/// Names the step a row holds: the operation by its key (`numbers`: the
+/// kernel's constants, number and key) and the literals by their hashes
+/// (`lits`: the values the cone's arithmetic uses).
+pub fn arith_entry(
+    raw: &[F128; 7],
+    numbers: &HashMap<[u64; 2], u64>,
+    lits: &HashMap<u64, u64>,
+) -> Result<Arith, String> {
+    let op = *numbers.get(&[raw[0].lo, raw[1].lo]).ok_or("a step by a constant the kernel does not know")?;
+    let lit = |h: F128| lits.get(&h.lo).copied().ok_or(format!("a literal without a value: {:016x}", h.lo));
+    let (x, y) = match op {
+        2 => (0, 0),
+        3 => (lit(raw[2])?, 0),
+        _ => (lit(raw[2])?, lit(raw[3])?),
+    };
+    let out = if raw[6] == F128::ONE { [raw[4], raw[5]] } else { [F128::ZERO; 2] };
+    let a = Arith { op, key: [raw[0], raw[1]], x, y, out };
+    if arith_tuple(&a)?.0 != *raw {
+        return Err(format!("the row does not hold what {op} gives on {x} and {y}"));
+    }
+    Ok(a)
+}
+
+/// The verifier's sends for the arithmetic: per reading row, the step
+/// with what it gives, computed here. One key per operation and per
+/// boolean; whoever reads the statement compares them with the store's.
+pub fn arith_product(ch: &SharedChallenges, arith: &[Arith]) -> Result<(F128, Vec<(u64, [F128; 2])>), String> {
+    let mut named: HashMap<u64, [F128; 2]> = HashMap::new();
+    let mut name = |number: u64, key: [F128; 2]| {
+        if *named.entry(number).or_insert(key) != key {
+            return Err(format!("two keys for the constant {number}"));
+        }
+        Ok(())
+    };
+    let mut p = F128::ONE;
+    for a in arith {
+        let (t, boolean) = arith_tuple(a)?;
+        name(a.op, a.key)?;
+        if let Some(b) = boolean {
+            name(b, a.out)?;
+        }
+        let mut acc = ch.beta + ch.gamma[0] * int(TAG_ARITH);
+        for (x, &g) in t.iter().zip(&ch.gamma[1..]) {
+            acc += g * *x;
+        }
+        p *= acc;
+    }
+    let mut named: Vec<(u64, [F128; 2])> = named.into_iter().collect();
+    named.sort_unstable_by_key(|x| x.0);
+    Ok((p, named))
 }
 
 /// What a leaf contributes to the statement: its slots' chunk words, and
@@ -5071,6 +5316,124 @@ mod tests {
         let (mut rows, target) = focus_rule(HUGE_FUEL, "LitNat");
         rows.facts[target].raw[1] = rows.facts[target].raw[2];
         assert_rule_refused(&rows);
+    }
+
+    const CHAR_OF_NAT: &str = include_str!("../tests-data/Char.ofNat._proof_1.rows");
+    const NEG_OF_NAT: &str = include_str!("../tests-data/Int.negOfNat.match_1.rows");
+
+    #[test]
+    fn arithmetic_derivations_prove() {
+        for (text, rules) in [(CHAR_OF_NAT, &["NatSucc", "NatBin"][..]), (NEG_OF_NAT, &["NatZero"][..])] {
+            let rows = certified_rows(text);
+            for rule in rules {
+                assert!(rows.facts.iter().any(|f| f.rule == *rule), "missing {rule}");
+            }
+            for i in 0..rows.facts.len() {
+                if matches!(rows.facts[i].rule.as_str(), "NatZero" | "NatSucc" | "NatBin") {
+                    assert_ne!(table_of(&rows, &rows, i), Of::Assumed);
+                }
+            }
+            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+        }
+    }
+
+    #[test]
+    fn nat_succ_rejects_a_result_that_is_not_a_literal() {
+        let (mut rows, target) = focus_rule(CHAR_OF_NAT, "NatSucc");
+        rows.facts[target].raw[2] = rows.facts[target].raw[1];
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn nat_succ_rejects_an_argument_that_is_not_a_literal() {
+        // `Nat.succ (Nat.succ x)` in place of `Nat.succ x`.
+        let (mut rows, target) = focus_rule(CHAR_OF_NAT, "NatSucc");
+        let a = rows.facts[target].raw[1] as usize;
+        let mut outer = rows.terms[a].clone();
+        outer.child[1] = Some(a);
+        outer.rank += 1;
+        rows.terms.push(outer);
+        rows.facts[target].raw[1] = (rows.terms.len() - 1) as u64;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn nat_bin_rejects_an_operand_that_is_not_a_literal() {
+        // `op x (op x)` in place of `op x y`.
+        let (mut rows, target) = focus_rule(CHAR_OF_NAT, "NatBin");
+        let a = rows.facts[target].raw[1] as usize;
+        let mut outer = rows.terms[a].clone();
+        outer.child[1] = outer.child[0];
+        rows.terms.push(outer);
+        rows.facts[target].raw[1] = (rows.terms.len() - 1) as u64;
+        assert_rule_refused(&rows);
+    }
+
+    #[test]
+    fn nat_zero_rejects_a_result_that_is_not_a_literal() {
+        let (mut rows, target) = focus_rule(NEG_OF_NAT, "NatZero");
+        rows.facts[target].raw[2] = rows.facts[target].raw[1];
+        assert_rule_refused(&rows);
+    }
+
+    fn step(op: u64, x: u64, y: u64) -> Arith {
+        Arith { op, key: [int(100 + op), int(7)], x, y, out: [F128::ZERO; 2] }
+    }
+
+    #[test]
+    fn the_verifier_computes_what_a_step_gives() {
+        let (t, b) = arith_tuple(&step(4, 2, 3)).unwrap();
+        assert_eq!((t[2], t[3], t[4], t[6], b), (int(lit_hash(2)), int(lit_hash(3)), int(lit_hash(5)), F128::ZERO, None));
+        assert_eq!(arith_tuple(&step(5, 2, 3)).unwrap().0[4], int(lit_hash(0)));
+        assert_eq!(arith_tuple(&step(10, 7, 0)).unwrap().0[4], int(lit_hash(0)));
+        assert_eq!(arith_tuple(&step(9, 7, 0)).unwrap().0[4], int(lit_hash(7)));
+        assert_eq!(arith_tuple(&step(3, 41, 0)).unwrap().0[4], int(lit_hash(42)));
+        // A comparison gives a boolean, named by the key the rows hold.
+        let le = Arith { out: [int(5), int(6)], ..step(12, 2, 3) };
+        let (t, b) = arith_tuple(&le).unwrap();
+        assert_eq!((t[4], t[5], t[6], b), (int(5), int(6), F128::ONE, Some(PRIM_BOOL_TRUE)));
+        assert_eq!(arith_tuple(&Arith { op: 11, ..le }).unwrap().1, Some(PRIM_BOOL_FALSE));
+        // What does not fit, and what the kernel does not evaluate.
+        assert!(arith_tuple(&step(6, u64::MAX, 2)).is_err());
+        assert!(arith_tuple(&step(3, 1, 1)).is_err());
+        assert!(arith_tuple(&step(1, 1, 1)).is_err());
+        assert!(arith_tuple(&Arith { out: [int(1), F128::ZERO], ..step(4, 2, 3) }).is_err());
+    }
+
+    #[test]
+    fn a_row_holding_a_wrong_result_is_refused() {
+        let numbers: HashMap<[u64; 2], u64> = [([104, 7], 4)].into_iter().collect();
+        let lits: HashMap<u64, u64> = (0..10).map(|v| (lit_hash(v), v)).collect();
+        let (good, _) = arith_tuple(&step(4, 2, 3)).unwrap();
+        assert_eq!(arith_entry(&good, &numbers, &lits), Ok(step(4, 2, 3)));
+        let mut bad = good;
+        bad[4] = int(lit_hash(6));
+        assert!(arith_entry(&bad, &numbers, &lits).is_err());
+        // The same step claimed to give a boolean.
+        let mut bad = good;
+        bad[6] = F128::ONE;
+        assert!(arith_entry(&bad, &numbers, &lits).is_err());
+        // A step by a constant that is no operation of the kernel.
+        let mut bad = good;
+        bad[0] = int(105);
+        assert!(arith_entry(&bad, &numbers, &lits).is_err());
+    }
+
+    #[test]
+    fn a_statement_names_one_key_for_each_operation() {
+        let ch = SharedChallenges { beta: int(3), gamma: (0..W as u64).map(|i| int(5 + i)).collect() };
+        let (p, named) = arith_product(&ch, &[step(4, 2, 3), step(4, 1, 1), step(5, 1, 1)]).unwrap();
+        assert_ne!(p, F128::ONE);
+        assert_eq!(named.iter().map(|x| x.0).collect::<Vec<_>>(), [4, 5]);
+        let other = Arith { key: [int(1), int(1)], ..step(4, 1, 1) };
+        assert!(arith_product(&ch, &[step(4, 2, 3), other]).is_err());
+        // The two booleans are constants of their own.
+        let t = Arith { out: [int(5), int(6)], ..step(12, 2, 3) };
+        let f = Arith { out: [int(5), int(6)], ..step(12, 3, 2) };
+        assert!(arith_product(&ch, &[t, t]).is_ok());
+        assert!(arith_product(&ch, &[t, f]).is_ok());
+        let t2 = Arith { out: [int(8), int(6)], ..step(11, 2, 2) };
+        assert!(arith_product(&ch, &[t, t2]).is_err());
     }
 
     /// Proves every piece under challenges drawn from all commitments;
