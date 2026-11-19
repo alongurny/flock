@@ -1449,6 +1449,20 @@ pub struct CircuitStructureMatrix<'a> {
 }
 
 impl<'a> CircuitStructureMatrix<'a> {
+    /// Every entry, column-major (`vals[(col << log2 n_rows) | row]`, the
+    /// layout of [`crate::matrix_fold::DenseMatrix`]): what a verification
+    /// key commits to once.
+    pub fn materialize(&self) -> crate::matrix_fold::DenseMatrix {
+        let (n_rows, n_cols) = (crate::matrix_fold::FoldMatrix::n_rows(self), crate::matrix_fold::FoldMatrix::n_cols(self));
+        let mut vals = Vec::with_capacity(n_rows * n_cols);
+        for c in 0..n_cols {
+            for r in 0..n_rows {
+                vals.push(self.entry(r, c));
+            }
+        }
+        crate::matrix_fold::DenseMatrix { vals, n_rows_log: n_rows.trailing_zeros() as usize }
+    }
+
     fn new(circuit: &'a Circuit) -> Self {
         let cell_cols = 1usize << (circuit.cells().mu() - circuit.cells().nu());
         let element_cols = if circuit.registry().num_element() == 0 {
@@ -2555,6 +2569,12 @@ mod tests {
             mc.value,
             "the MatrixClaim form discharges — the accumulator's path"
         );
+        // The materialized table and a verification key over it agree.
+        let dense = m.materialize();
+        assert_eq!(bilinear(&mc.row, &mc.col, &dense), mc.value, "the materialized table");
+        let t = crate::table_key::DenseTable::new(&dense.vals, dense.n_rows_log).expect("a key");
+        let o = t.open(&mc, &mut FsChallenger::new(b"k")).expect("the claim opens");
+        assert!(crate::table_key::verify_dense(&t.key, &mc, &o, &mut FsChallenger::new(b"k")));
 
         let mut bad = assertion.clone();
         bad.value += F128::ONE;
