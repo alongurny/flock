@@ -118,22 +118,40 @@ impl DenseTable {
     /// Prove `claim` against the key. `None` if the claim's weights do not
     /// fit the table or the claim is false.
     pub fn open<Ch: Challenger>(&self, claim: &MatrixClaim, ch: &mut Ch) -> Option<DenseOpening> {
-        let basis = TensorBasis::of(&self.key, claim)?;
-        let b = basis.materialize();
-        let honest = self
-            .vals
-            .iter()
-            .zip(&b)
-            .fold(F128::ZERO, |a, (x, y)| a + *x * *y);
-        if honest != claim.value {
-            return None;
+        self.open_many(std::slice::from_ref(claim), ch)
+    }
+
+    /// Prove every claim with ONE opening: a random combination
+    /// `Σ ρ^i·b_i` of their bases against `Σ ρ^i·value_i`, `ρ` drawn after
+    /// all claims are bound. `None` if any claim does not fit or is false.
+    pub fn open_many<Ch: Challenger>(&self, claims: &[MatrixClaim], ch: &mut Ch) -> Option<DenseOpening> {
+        let bases: Vec<TensorBasis> =
+            claims.iter().map(|c| TensorBasis::of(&self.key, c)).collect::<Option<_>>()?;
+        let mut b = vec![F128::ZERO; self.vals.len()];
+        let mut mats = Vec::with_capacity(bases.len());
+        for (basis, c) in bases.iter().zip(claims) {
+            let m = basis.materialize();
+            let honest = self.vals.iter().zip(&m).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
+            if honest != c.value {
+                return None;
+            }
+            mats.push(m);
         }
-        bind(ch, &self.key, claim);
+        let rho = bind(ch, &self.key, claims);
+        let mut target = F128::ZERO;
+        let mut p = F128::ONE;
+        for (m, c) in mats.iter().zip(claims) {
+            for (x, y) in b.iter_mut().zip(m) {
+                *x += p * *y;
+            }
+            target += p * c.value;
+            p *= rho;
+        }
         let proof = recursive_prover_with_basis(
             &self.config,
             self.vals.clone(),
             b,
-            claim.value,
+            target,
             &self.mat,
             &self.tree,
             ch,
@@ -149,35 +167,70 @@ pub fn verify_dense<Ch: Challenger>(
     opening: &DenseOpening,
     ch: &mut Ch,
 ) -> bool {
-    let Some(basis) = TensorBasis::of(key, claim) else {
+    verify_dense_many(key, std::slice::from_ref(claim), opening, ch)
+}
+
+/// Check one opening of every claim ([`DenseTable::open_many`]).
+pub fn verify_dense_many<Ch: Challenger>(
+    key: &DenseKey,
+    claims: &[MatrixClaim],
+    opening: &DenseOpening,
+    ch: &mut Ch,
+) -> bool {
+    if claims.is_empty() {
+        return false;
+    }
+    let Some(bases) = claims.iter().map(|c| TensorBasis::of(key, c)).collect::<Option<Vec<_>>>() else {
         return false;
     };
     let Some((_, vconfig)) = configs(key.log_n) else {
         return false;
     };
-    bind(ch, key, claim);
+    let rho = bind(ch, key, claims);
+    let mut target = F128::ZERO;
+    let mut p = F128::ONE;
+    let mut powers = Vec::with_capacity(claims.len());
+    for c in claims {
+        target += p * c.value;
+        powers.push(F256::from(p));
+        p *= rho;
+    }
     recursive_verifier_with_basis_succinct(
         &vconfig,
         &opening.proof,
         key.log_n,
-        claim.value,
+        target,
         &key.cap,
         None,
-        |prefix, residual_log| basis.fold_residual(prefix, residual_log),
+        |prefix, residual_log| {
+            let mut acc = vec![F256::ZERO; 1usize << residual_log];
+            for (basis, &q) in bases.iter().zip(&powers) {
+                for (a, x) in acc.iter_mut().zip(basis.fold_residual(prefix, residual_log)) {
+                    *a += q * x;
+                }
+            }
+            acc
+        },
         ch,
     )
 }
 
-fn bind<Ch: Challenger>(ch: &mut Ch, key: &DenseKey, claim: &MatrixClaim) {
+fn bind<Ch: Challenger>(ch: &mut Ch, key: &DenseKey, claims: &[MatrixClaim]) -> F128 {
     ch.observe_label(b"flock-table-key-dense-v0");
     for h in &key.cap {
         ch.observe_bytes(h.as_ref());
     }
-    for w in [&claim.row, &claim.col] {
-        ch.observe_f128_slice(&w.low);
-        ch.observe_f128_slice(&w.point);
+    ch.observe_bytes(&(claims.len() as u64).to_le_bytes());
+    for claim in claims {
+        for w in [&claim.row, &claim.col] {
+            ch.observe_bytes(&(w.low.len() as u64).to_le_bytes());
+            ch.observe_f128_slice(&w.low);
+            ch.observe_bytes(&(w.point.len() as u64).to_le_bytes());
+            ch.observe_f128_slice(&w.point);
+        }
+        ch.observe_f128(claim.value);
     }
-    ch.observe_f128(claim.value);
+    ch.sample_f128()
 }
 
 /// One factor of a tensor weight, over consecutive index bits.
@@ -370,6 +423,26 @@ mod tests {
             assert!(!verify_dense(&t.key, &bad, &o, &mut vc), "a wrong value");
             assert!(t.open(&bad, &mut FsChallenger::new(b"x")).is_none());
         }
+    }
+
+    #[test]
+    fn dense_key_opens_many_claims_at_once() {
+        let mut rng = RandomChallenger::new(0x3A11_C1A1);
+        let rows_log = 7;
+        let vals = rand_vec(&mut rng, 1 << 15);
+        let m = DenseMatrix { vals: vals.clone(), n_rows_log: rows_log };
+        let t = DenseTable::new(&vals, rows_log).unwrap();
+        let cs: Vec<MatrixClaim> = (0..5).map(|i| claim(&mut rng, &m, (i % 2, 7 - i % 2), (0, 8))).collect();
+        let o = t.open_many(&cs, &mut FsChallenger::new(b"m")).unwrap();
+        assert!(verify_dense_many(&t.key, &cs, &o, &mut FsChallenger::new(b"m")));
+        // Any one claim changed, dropped or reordered is rejected.
+        let mut bad = cs.clone();
+        bad[3].value += F128::ONE;
+        assert!(!verify_dense_many(&t.key, &bad, &o, &mut FsChallenger::new(b"m")));
+        assert!(!verify_dense_many(&t.key, &cs[..4], &o, &mut FsChallenger::new(b"m")));
+        let mut swapped = cs.clone();
+        swapped.swap(0, 1);
+        assert!(!verify_dense_many(&t.key, &swapped, &o, &mut FsChallenger::new(b"m")));
     }
 
     #[test]
