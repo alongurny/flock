@@ -1,222 +1,164 @@
-//! The root's table checks against a VERIFICATION KEY.
+//! The root's structure-table checks against a VERIFICATION KEY.
 //!
-//! A tower root ends with claims `Σ R(r)·C(c)·M[r,c] = v` on the fixed
-//! tables of its circuits: the constraint matrices of each boolean and
-//! element type (sparse) and each circuit's structure table (dense: wiring
-//! sigma, live mask, element constants, bus and public columns). The plain
-//! discharge evaluates every table. Here the tables are committed once, as
-//! a [`RootKey`]: every sparse matrix in one Spark-style key
-//! ([`flock_core::sparse_key`]) and every structure table in one dense key
-//! ([`flock_core::table_key`]). The root's claims are grouped by table,
-//! several claims on one table are folded into one ([`prove_fold`]), and
-//! one opening per key proves them all. The verifier replays the folds and
-//! checks the two openings; it reads no table.
+//! A tower root ends with claims `Σ R(r)·C(c)·M[r,c] = v` on each circuit's
+//! structure table ([`SigmaAssertion::matrix`]): eight planes over the
+//! cell space (masked ids, live mask, wiring sigma, element constants,
+//! Boolean pins, bus and public columns). All planes but sigma follow from
+//! a few counts and constants, so the verifier evaluates them itself in
+//! `O(rows + slots)`. The sigma plane holds one wire index per live cell,
+//! and evaluating it reads every live cell (millions): that plane is what
+//! the key commits.
 //!
-//! The jagged layouts stay direct (their check is `O(runs)`, about 2 ms).
+//! Live cells form a jagged table (slot `y` is live on rows `r < h_y`), so
+//! the key commits their sigma entries densely, column after column
+//! ([`flock_core::pcs::jagged`]), all circuits' tables as blocks of one
+//! dense key ([`flock_core::table_key`]). A claim's sigma part is reduced
+//! by the jagged sumcheck to one evaluation of the dense vector, and every
+//! such evaluation is proved by one opening. Several claims on one table
+//! are first folded into one ([`prove_fold`]).
 
 use flock_core::{
     challenger::{Challenger, FsChallenger},
     circuit::{Circuit, SigmaAssertion},
-    element_r1cs::SparseF128Matrix,
-    matrix_fold::{FoldMatrix, FoldProof, MatrixClaim, Weight, prove_fold, verify_fold},
-    r1cs::SparseBinaryMatrix,
-    sparse_key::{SparseKey, SparseOpening, SparseTable, verify_sparse_many},
+    matrix_fold::{FoldMatrix, FoldProof, MatrixClaim, prove_fold, verify_fold},
+    pcs::jagged::{self, JaggedAssistProof, JaggedParams, JaggedSumcheckProof},
     table_key::{DenseKey, DenseOpening, DenseTable, Factor, TensorBasis, verify_dense_bases},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::tower::F128;
 
-const DOMAIN: &[u8] = b"flock-tower-root-key-v0";
-
-/// One fixed table a root claim may name.
-#[derive(Clone, Copy)]
-pub enum Table<'a> {
-    Boolean(&'a SparseBinaryMatrix),
-    Element(&'a SparseF128Matrix),
-    Structure(&'a Circuit),
-}
-
-impl Table<'_> {
-    /// Identity for grouping: the same table object, wherever it is named.
-    fn id(&self) -> (u8, usize) {
-        match self {
-            Table::Boolean(m) => (0, *m as *const _ as usize),
-            Table::Element(m) => (1, *m as *const _ as usize),
-            Table::Structure(c) => (2, *c as *const _ as usize),
-        }
-    }
-}
+const DOMAIN: &[u8] = b"flock-tower-root-key-v1";
+/// The structure table's planes (`SigmaAssertion`'s column order).
+const PLANES_LOG: usize = 3;
+const SIGMA_PLANE: usize = 2;
 
 fn log2_ceil(n: usize) -> usize {
     n.max(1).next_power_of_two().trailing_zeros() as usize
 }
 
-/// The public key: the two commitments and every table's shape, in the
-/// order the tables were given.
+fn enc(i: usize) -> F128 {
+    F128::new(i as u64, 0)
+}
+
+/// One structure table's public shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructureShape {
+    /// The circuit's digest.
+    pub digest: [u8; 32],
+    /// Row bits (`ν`).
+    pub nu: usize,
+    /// Slot bits of one plane (`log2 base_cols`).
+    pub slots_log: usize,
+    /// Live rows per slot, `2^slots_log` of them.
+    pub heights: Vec<u64>,
+    /// Dense bits of the committed sigma entries.
+    pub m: usize,
+}
+
+impl StructureShape {
+    fn of(c: &Circuit) -> (Self, Vec<F128>) {
+        let s = SigmaAssertion::matrix(c);
+        let base = s.n_cols() >> PLANES_LOG;
+        let nu = c.cells().nu();
+        let cell_cols = 1usize << (c.cells().mu() - nu);
+        let live = c.live_mask();
+        let heights: Vec<u64> = (0..base)
+            .map(|y| if y < cell_cols { live.counts[y] as u64 } else { 0 })
+            .collect();
+        let area: u64 = heights.iter().sum();
+        let m = log2_ceil(area as usize).max(1);
+        let sigma = c.sigma();
+        let mut q = Vec::with_capacity(1 << m);
+        for (y, &h) in heights.iter().enumerate() {
+            for r in 0..h as usize {
+                q.push(enc(sigma[(y << nu) | r]));
+            }
+        }
+        q.resize(1 << m, F128::ZERO);
+        (
+            Self {
+                digest: c.digest(),
+                nu,
+                slots_log: log2_ceil(base),
+                heights,
+                m,
+            },
+            q,
+        )
+    }
+
+    fn params(&self) -> JaggedParams {
+        JaggedParams::from_heights(&self.heights, self.nu, self.m)
+    }
+}
+
+/// The public key: every structure table's shape and one dense commitment
+/// to all their sigma entries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootKey {
-    /// Per table: `None` for a sparse table (its slot is its rank among the
-    /// sparse ones), `Some((rows_log, cols_log))` for a dense one.
-    pub shapes: Vec<Option<(usize, usize)>>,
-    pub sparse: Option<SparseKey>,
-    pub dense: Option<DenseKey>,
-    /// Bits of one dense block (`max rows_log + cols_log`).
+    pub tables: Vec<StructureShape>,
+    /// Bits of one block (the largest `m`).
     pub block_log: usize,
+    pub dense: DenseKey,
 }
 
 /// The prover's side.
 pub struct RootKeyTables<'a> {
     pub key: RootKey,
-    tables: Vec<Table<'a>>,
-    sparse: Option<SparseTable>,
-    dense: Option<DenseTable>,
+    circuits: Vec<&'a Circuit>,
+    q: Vec<Vec<F128>>,
+    dense: DenseTable,
 }
 
-/// What a root proves: per table, the fold of its claims (when there are
-/// several), then one opening per key.
+/// Per table, the fold of its claims (when several) and the jagged
+/// reduction of its sigma part (when its sigma weight is nonzero); then
+/// one dense opening.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootKeyProof {
     pub folds: Vec<Option<FoldProof>>,
-    pub sparse: Option<SparseOpening>,
+    pub jagged: Vec<Option<(JaggedSumcheckProof, JaggedAssistProof)>>,
     pub dense: Option<DenseOpening>,
 }
 
-fn entries_bool(m: &SparseBinaryMatrix) -> Vec<(usize, usize, F128)> {
-    m.rows
-        .iter()
-        .enumerate()
-        .flat_map(|(r, cols)| cols.iter().map(move |&c| (r, c, F128::ONE)))
-        .collect()
+/// A claim's split: the non-sigma planes' value (computed from the
+/// circuit), the sigma plane's scale and points.
+struct Split {
+    rest: F128,
+    scale: F128,
+    z_row: Vec<F128>,
+    z_col: Vec<F128>,
 }
 
-fn entries_el(m: &SparseF128Matrix) -> Vec<(usize, usize, F128)> {
-    m.rows
+/// Split `c` on `circuit`'s structure table. `None` unless both weights are
+/// plain (`low` of length one) and match the table's shape.
+fn split(circuit: &Circuit, shape: &StructureShape, c: &MatrixClaim) -> Option<Split> {
+    let m = SigmaAssertion::matrix(circuit);
+    if c.row.low.len() != 1
+        || c.col.low.len() != 1
+        || c.row.point.len() != shape.nu
+        || c.col.point.len() != shape.slots_log + PLANES_LOG
+        || m.n_rows() != 1 << shape.nu
+        || m.n_cols() != 1 << (shape.slots_log + PLANES_LOG)
+    {
+        return None;
+    }
+    let base = 1usize << shape.slots_log;
+    let rw = c.row.materialize();
+    let mut cw = c.col.materialize();
+    cw[SIGMA_PLANE * base..(SIGMA_PLANE + 1) * base].fill(F128::ZERO);
+    let g = m.row_marginal(&cw, rw.len());
+    let rest = rw.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
+    let plane_eq = c.col.point[shape.slots_log..]
         .iter()
         .enumerate()
-        .flat_map(|(r, cols)| cols.iter().map(move |&(c, v)| (r, c, v)))
-        .collect()
-}
-
-impl<'a> RootKeyTables<'a> {
-    /// Build the key over `tables` (distinct tables; a table named twice
-    /// is kept once).
-    pub fn new(tables: &[Table<'a>]) -> Option<Self> {
-        let mut uniq: Vec<Table<'a>> = Vec::new();
-        for t in tables {
-            if !uniq.iter().any(|u| u.id() == t.id()) {
-                uniq.push(*t);
-            }
-        }
-        let mut sparse_entries: Vec<Vec<(usize, usize, F128)>> = Vec::new();
-        let (mut rl, mut cl) = (0usize, 0usize);
-        let mut dense_mats = Vec::new();
-        let mut shapes = Vec::new();
-        for t in &uniq {
-            match t {
-                Table::Boolean(m) => {
-                    rl = rl.max(log2_ceil(m.num_rows));
-                    cl = cl.max(log2_ceil(m.num_cols));
-                    sparse_entries.push(entries_bool(m));
-                    shapes.push(None);
-                }
-                Table::Element(m) => {
-                    rl = rl.max(log2_ceil(m.num_rows));
-                    cl = cl.max(log2_ceil(m.num_cols));
-                    sparse_entries.push(entries_el(m));
-                    shapes.push(None);
-                }
-                Table::Structure(c) => {
-                    let d = SigmaAssertion::matrix(c).materialize();
-                    let cols_log = log2_ceil(d.vals.len() >> d.n_rows_log);
-                    shapes.push(Some((d.n_rows_log, cols_log)));
-                    dense_mats.push(d);
-                }
-            }
-        }
-        let sparse = if sparse_entries.is_empty() {
-            None
-        } else {
-            let refs: Vec<&[(usize, usize, F128)]> = sparse_entries.iter().map(|e| e.as_slice()).collect();
-            Some(SparseTable::new_many(&refs, rl, cl)?)
-        };
-        let block_log = shapes.iter().flatten().map(|(r, c)| r + c).max().unwrap_or(0);
-        let dense = if dense_mats.is_empty() {
-            None
-        } else {
-            let blocks = dense_mats.len().next_power_of_two();
-            let mut vals = vec![F128::ZERO; blocks << block_log];
-            for (b, d) in dense_mats.iter().enumerate() {
-                vals[b << block_log..][..d.vals.len()].copy_from_slice(&d.vals);
-            }
-            Some(DenseTable::new(&vals, block_log)?)
-        };
-        Some(Self {
-            key: RootKey {
-                shapes,
-                sparse: sparse.as_ref().map(|s| s.key.clone()),
-                dense: dense.as_ref().map(|d| d.key.clone()),
-                block_log,
-            },
-            tables: uniq,
-            sparse,
-            dense,
-        })
-    }
-
-    /// The index of `t` in the key, if it holds it.
-    pub fn index(&self, t: &Table<'_>) -> Option<usize> {
-        self.tables.iter().position(|u| u.id() == t.id())
-    }
-
-    fn fold_matrix(&self, i: usize) -> Box<dyn FoldMatrix + '_> {
-        match self.tables[i] {
-            Table::Boolean(m) => Box::new(m.clone()),
-            Table::Element(m) => Box::new(m.clone()),
-            Table::Structure(c) => Box::new(SigmaAssertion::matrix(c)),
-        }
-    }
-
-    /// Prove every `(table index, claim)`. `None` if a claim is false or
-    /// does not fit its table.
-    pub fn prove(&self, claims: &[(usize, MatrixClaim)]) -> Option<RootKeyProof> {
-        let n = self.tables.len();
-        let mut ch = FsChallenger::new(DOMAIN);
-        bind(&mut ch, &self.key, claims);
-        let mut folds = vec![None; n];
-        let mut one = vec![None; n];
-        for i in 0..n {
-            let group: Vec<MatrixClaim> = claims.iter().filter(|(t, _)| *t == i).map(|(_, c)| c.clone()).collect();
-            match group.len() {
-                0 => {}
-                1 => one[i] = Some(group[0].clone()),
-                _ => {
-                    let m = self.fold_matrix(i);
-                    let combs: Vec<Vec<F128>> =
-                        group.iter().map(|c| m.col_marginal(&c.row.materialize(), m.n_cols())).collect();
-                    let (p, c) = prove_fold(m.as_ref(), &combs, &group, &mut ch);
-                    folds[i] = Some(p);
-                    one[i] = Some(c);
-                }
-            }
-        }
-        let (sparse_claims, dense_items) = self.key.final_claims(&one)?;
-        let sparse = match (&self.sparse, sparse_claims) {
-            (Some(t), Some(cs)) => Some(t.open_many(&cs, &mut ch)?),
-            (None, None) => None,
-            _ => return None,
-        };
-        let dense = match (&self.dense, dense_items) {
-            (Some(t), Some(items)) => Some(t.open_bases(&items, &mut ch)?),
-            (None, None) => None,
-            _ => return None,
-        };
-        Some(RootKeyProof {
-            folds,
-            sparse,
-            dense,
-        })
-    }
+        .fold(F128::ONE, |a, (j, &p)| a * if (SIGMA_PLANE >> j) & 1 == 1 { p } else { F128::ONE + p });
+    Some(Split {
+        rest,
+        scale: c.row.low[0] * c.col.low[0] * plane_eq,
+        z_row: c.row.point.clone(),
+        z_col: c.col.point[..shape.slots_log].to_vec(),
+    })
 }
 
 fn bind<Ch: Challenger>(ch: &mut Ch, key: &RootKey, claims: &[(usize, MatrixClaim)]) {
@@ -225,135 +167,228 @@ fn bind<Ch: Challenger>(ch: &mut Ch, key: &RootKey, claims: &[(usize, MatrixClai
     ch.observe_bytes(&bincode::serialize(claims).expect("claims serialize"));
 }
 
-/// A claim nobody makes on a table in the key: zero weight, value zero.
-fn zero_claim(rows_log: usize, cols_log: usize) -> MatrixClaim {
-    MatrixClaim {
-        row: Weight::low_eq(vec![F128::ZERO], vec![F128::ZERO; rows_log]),
-        col: Weight::eq(vec![F128::ZERO; cols_log]),
-        value: F128::ZERO,
-    }
-}
-
 impl RootKey {
-    /// The one claim per table, split into the sparse key's claims (one per
-    /// sparse table, in order) and the dense key's bases.
-    #[allow(clippy::type_complexity)]
-    fn final_claims(
-        &self,
-        one: &[Option<MatrixClaim>],
-    ) -> Option<(Option<Vec<MatrixClaim>>, Option<Vec<(TensorBasis, F128)>>)> {
-        let mut sparse = Vec::new();
-        let mut dense = Vec::new();
-        let mut block = 0usize;
-        let blocks_log = self
-            .shapes
-            .iter()
-            .filter(|s| s.is_some())
-            .count()
-            .next_power_of_two()
-            .trailing_zeros() as usize;
-        for (i, shape) in self.shapes.iter().enumerate() {
-            match shape {
-                None => {
-                    let k = self.sparse.as_ref()?;
-                    sparse.push(one[i].clone().unwrap_or_else(|| zero_claim(k.rows_log, k.cols_log)));
-                }
-                Some((rl, cl)) => {
-                    if let Some(c) = &one[i] {
-                        let (s1, mut f) = TensorBasis::weight_factors(&c.row, *rl, false)?;
-                        let (s2, f2) = TensorBasis::weight_factors(&c.col, *cl, false)?;
-                        f.extend(f2);
-                        if self.block_log > rl + cl {
-                            f.push(Factor::Eq(vec![F128::ZERO; self.block_log - rl - cl]));
-                        }
-                        f.push(Factor::Eq(
-                            (0..blocks_log)
-                                .map(|j| if (block >> j) & 1 == 1 { F128::ONE } else { F128::ZERO })
-                                .collect(),
-                        ));
-                        let k = self.dense.as_ref()?;
-                        let used = self.block_log + blocks_log;
-                        if k.log_n > used {
-                            f.push(Factor::Eq(vec![F128::ZERO; k.log_n - used]));
-                        }
-                        dense.push((TensorBasis::new(s1 * s2, f), c.value));
-                    }
-                    block += 1;
-                }
+    fn blocks_log(&self) -> usize {
+        log2_ceil(self.tables.len())
+    }
+
+    /// The dense basis that reads block `b` at `point` (`m` bits).
+    fn basis(&self, b: usize, m: usize, point: &[F128]) -> TensorBasis {
+        let mut f = vec![Factor::Eq(point.to_vec())];
+        if self.block_log > m {
+            f.push(Factor::Eq(vec![F128::ZERO; self.block_log - m]));
+        }
+        let bl = self.blocks_log();
+        if bl > 0 {
+            f.push(Factor::Eq(
+                (0..bl).map(|j| if (b >> j) & 1 == 1 { F128::ONE } else { F128::ZERO }).collect(),
+            ));
+        }
+        let used = self.block_log + bl;
+        if self.dense.log_n > used {
+            f.push(Factor::Eq(vec![F128::ZERO; self.dense.log_n - used]));
+        }
+        TensorBasis::new(F128::ONE, f)
+    }
+
+    /// Check every `(table index, claim)`. `circuits[i]` is table `i`'s
+    /// circuit, whose counts and constants give the non-sigma planes; its
+    /// sigma is never read.
+    pub fn verify(&self, circuits: &[&Circuit], claims: &[(usize, MatrixClaim)], proof: &RootKeyProof) -> bool {
+        let t_all = std::time::Instant::now();
+        let n = self.tables.len();
+        if circuits.len() != n
+            || proof.folds.len() != n
+            || proof.jagged.len() != n
+            || claims.iter().any(|(t, _)| *t >= n)
+        {
+            return false;
+        }
+        for (shape, c) in self.tables.iter().zip(circuits) {
+            let live = c.live_mask();
+            if c.digest() != shape.digest
+                || c.cells().nu() != shape.nu
+                || shape
+                    .heights
+                    .iter()
+                    .enumerate()
+                    .any(|(y, &h)| h != live.counts.get(y).map_or(0, |&x| x as u64))
+            {
+                return false;
             }
         }
-        let sparse = (!sparse.is_empty()).then_some(sparse);
-        let dense = (!dense.is_empty()).then_some(dense);
-        Some((sparse, dense))
-    }
-
-    /// Check every `(table index, claim)` against the key. Reads no table.
-    pub fn verify(&self, claims: &[(usize, MatrixClaim)], proof: &RootKeyProof) -> bool {
-        let n = self.shapes.len();
-        if proof.folds.len() != n || claims.iter().any(|(t, _)| *t >= n) {
-            return false;
+        if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+            eprintln!("root key: shape checks {:.1} ms", t_all.elapsed().as_secs_f64() * 1e3);
         }
         let mut ch = FsChallenger::new(DOMAIN);
         bind(&mut ch, self, claims);
-        let mut one = vec![None; n];
+        let mut items = Vec::new();
         for i in 0..n {
             let group: Vec<MatrixClaim> = claims.iter().filter(|(t, _)| *t == i).map(|(_, c)| c.clone()).collect();
-            match (group.len(), &proof.folds[i]) {
-                (0, None) => {}
-                (1, None) => one[i] = Some(group[0].clone()),
+            let one = match (group.len(), &proof.folds[i]) {
+                (0, None) => None,
+                (1, None) => Some(group[0].clone()),
                 (k, Some(p)) if k > 1 => match verify_fold(&group, p, &mut ch) {
-                    Ok(c) => one[i] = Some(c),
+                    Ok(c) => Some(c),
                     Err(_) => return false,
                 },
                 _ => return false,
+            };
+            let shape = &self.tables[i];
+            match (one, &proof.jagged[i]) {
+                (None, None) => {}
+                (Some(c), jp) => {
+                    let t_split = std::time::Instant::now();
+                    let Some(s) = split(circuits[i], shape, &c) else {
+                        return false;
+                    };
+                    let sig = c.value + s.rest; // characteristic 2
+                    let split_ms = t_split.elapsed().as_secs_f64() * 1e3;
+                    let t_j = std::time::Instant::now();
+                    match jp {
+                        None if s.scale.is_zero() && sig.is_zero() => {}
+                        Some(jp) if !s.scale.is_zero() => {
+                            let v = sig * s.scale.inv();
+                            match jagged::verify_with_assist(&shape.params(), &s.z_row, &s.z_col, v, &jp.0, &jp.1, &mut ch) {
+                                Some(d) => {
+                                    if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+                                        eprintln!("root key table {i}: split {split_ms:.1} ms, jagged {:.1} ms", t_j.elapsed().as_secs_f64() * 1e3);
+                                    }
+                                    items.push((self.basis(i, shape.m, &d.point), d.alpha))
+                                }
+                                None => return false,
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                _ => return false,
             }
         }
-        let Some((sparse_claims, dense_items)) = self.final_claims(&one) else {
-            return false;
-        };
-        let sparse_ok = match (&self.sparse, sparse_claims, &proof.sparse) {
-            (Some(k), Some(cs), Some(o)) => verify_sparse_many(k, &cs, o, &mut ch),
-            (None, None, None) => true,
+        let t_d = std::time::Instant::now();
+        let out = match (&proof.dense, items.is_empty()) {
+            (None, true) => true,
+            (Some(o), false) => verify_dense_bases(&self.dense, &items, o, &mut ch),
             _ => false,
         };
-        sparse_ok
-            && match (&self.dense, dense_items, &proof.dense) {
-                (Some(k), Some(items), Some(o)) => verify_dense_bases(k, &items, o, &mut ch),
-                (None, None, None) => true,
-                _ => false,
-            }
+        if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+            eprintln!("root key: dense opening {:.1} ms", t_d.elapsed().as_secs_f64() * 1e3);
+        }
+        out
     }
 }
 
-/// One line per distinct table: kind, shape and nonzeros (dense: entries).
-pub fn describe(tables: &[Table<'_>]) -> String {
-    let mut seen: Vec<(u8, usize)> = Vec::new();
-    let mut out = String::new();
-    for t in tables {
-        if seen.contains(&t.id()) {
-            continue;
-        }
-        seen.push(t.id());
-        let line = match t {
-            Table::Boolean(m) => format!(
-                "boolean {}x{} nnz {}",
-                m.num_rows,
-                m.num_cols,
-                m.rows.iter().map(|r| r.len()).sum::<usize>()
-            ),
-            Table::Element(m) => format!(
-                "element {}x{} nnz {}",
-                m.num_rows,
-                m.num_cols,
-                m.rows.iter().map(|r| r.len()).sum::<usize>()
-            ),
-            Table::Structure(c) => {
-                let m = SigmaAssertion::matrix(c);
-                format!("structure {}x{}", m.n_rows(), m.n_cols())
+impl<'a> RootKeyTables<'a> {
+    /// Build the key over the circuits' structure tables (a circuit named
+    /// twice is kept once).
+    pub fn new(circuits: &[&'a Circuit]) -> Option<Self> {
+        let mut uniq: Vec<&'a Circuit> = Vec::new();
+        for &c in circuits {
+            if !uniq.iter().any(|u| u.digest() == c.digest()) {
+                uniq.push(c);
             }
+        }
+        let (tables, q): (Vec<StructureShape>, Vec<Vec<F128>>) = uniq.iter().map(|c| StructureShape::of(c)).unzip();
+        let block_log = tables.iter().map(|t| t.m).max()?;
+        let blocks = tables.len().next_power_of_two();
+        let mut vals = vec![F128::ZERO; blocks << block_log];
+        for (b, qb) in q.iter().enumerate() {
+            vals[b << block_log..][..qb.len()].copy_from_slice(qb);
+        }
+        let dense = DenseTable::new(&vals, block_log)?;
+        Some(Self {
+            key: RootKey {
+                tables,
+                block_log,
+                dense: dense.key.clone(),
+            },
+            circuits: uniq,
+            q,
+            dense,
+        })
+    }
+
+    /// The circuits in key order (what [`RootKey::verify`] takes).
+    pub fn circuits(&self) -> &[&'a Circuit] {
+        &self.circuits
+    }
+
+    /// The index of the table with this circuit digest.
+    pub fn index(&self, digest: &[u8; 32]) -> Option<usize> {
+        self.key.tables.iter().position(|t| t.digest == *digest)
+    }
+
+    /// Prove every `(table index, claim)`. `None` if a claim is false or
+    /// not of the plain shape a root carries.
+    pub fn prove(&self, claims: &[(usize, MatrixClaim)]) -> Option<RootKeyProof> {
+        let n = self.key.tables.len();
+        let mut ch = FsChallenger::new(DOMAIN);
+        bind(&mut ch, &self.key, claims);
+        let mut folds = vec![None; n];
+        let mut jag = vec![None; n];
+        let mut items = Vec::new();
+        for i in 0..n {
+            let group: Vec<MatrixClaim> = claims.iter().filter(|(t, _)| *t == i).map(|(_, c)| c.clone()).collect();
+            let m = SigmaAssertion::matrix(self.circuits[i]);
+            let one = match group.len() {
+                0 => continue,
+                1 => group[0].clone(),
+                _ => {
+                    let combs: Vec<Vec<F128>> =
+                        group.iter().map(|c| m.col_marginal(&c.row.materialize(), m.n_cols())).collect();
+                    let (p, c) = prove_fold(&m, &combs, &group, &mut ch);
+                    folds[i] = Some(p);
+                    c
+                }
+            };
+            let shape = &self.key.tables[i];
+            let s = split(self.circuits[i], shape, &one)?;
+            let sig = one.value + s.rest; // characteristic 2
+            if s.scale.is_zero() {
+                if !sig.is_zero() {
+                    return None;
+                }
+                continue;
+            }
+            let v = sig * s.scale.inv();
+            let params = shape.params();
+            let mut replay = ch.clone();
+            let (jp, ja, honest) = jagged::prove_with_assist(&params, &self.q[i], &s.z_row, &s.z_col, &mut ch);
+            if honest != v {
+                return None;
+            }
+            let d = jagged::verify_with_assist(&params, &s.z_row, &s.z_col, v, &jp, &ja, &mut replay)?;
+            items.push((self.key.basis(i, shape.m, &d.point), d.alpha));
+            jag[i] = Some((jp, ja));
+        }
+        let dense = if items.is_empty() {
+            None
+        } else {
+            Some(self.dense.open_bases(&items, &mut ch)?)
         };
-        out.push_str(&line);
-        out.push('\n');
+        Some(RootKeyProof {
+            folds,
+            jagged: jag,
+            dense,
+        })
+    }
+}
+
+/// One line per circuit: its structure table's shape and live cells.
+pub fn describe(circuits: &[&Circuit]) -> String {
+    let mut out = String::new();
+    for c in circuits {
+        let m = SigmaAssertion::matrix(c);
+        let live = c.live_mask();
+        let n_live: usize = live.counts.iter().sum();
+        out.push_str(&format!(
+            "structure {}x{} cells 2^{} (nu {}), live {}\n",
+            m.n_rows(),
+            m.n_cols(),
+            c.cells().mu(),
+            c.cells().nu(),
+            n_live
+        ));
     }
     out
 }

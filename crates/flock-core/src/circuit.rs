@@ -1663,9 +1663,11 @@ impl FoldMatrix for CircuitStructureMatrix<'_> {
             rf += d_f[r];
             *dst = rc + rf * fx(r) + el;
         }
-        // The sigma plane, every live cell.
+        // The sigma plane, every live cell (skipped when its weight is zero,
+        // as for a verification key, which evaluates the other planes).
         let sigma = self.circuit.sigma();
-        let sig = (0..cell_cols)
+        let any_sigma = (0..cell_cols).any(|slot| !plane(SigmaAssertion::SIGMA_PLANE, slot).is_zero());
+        let sig = (0..if any_sigma { cell_cols } else { 0 })
             .into_par_iter()
             .fold(
                 || vec![F128::ZERO; n_rows],
