@@ -315,7 +315,10 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
         // A leaf of many slots has more public words (a chunk word per
         // slot, the range tables' values): LEAN_BODY_EXTRA widens the
         // public body every outer pads to.
-        env.publics += std::env::var("LEAN_BODY_EXTRA").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        env.publics += std::env::var("LEAN_BODY_EXTRA")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
     }
     env
 }

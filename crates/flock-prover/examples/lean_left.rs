@@ -12,10 +12,13 @@ use std::collections::BTreeMap;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let info = Rows::parse(&std::fs::read_to_string(&a[1]).expect("the info rows")).expect("info rows");
+    let info =
+        Rows::parse(&std::fs::read_to_string(&a[1]).expect("the info rows")).expect("info rows");
     let mut left: BTreeMap<String, usize> = BTreeMap::new();
     for name in std::fs::read_to_string(&a[3]).expect("a list").lines() {
-        let Ok(text) = std::fs::read_to_string(format!("{}/{name}", a[2])) else { continue };
+        let Ok(text) = std::fs::read_to_string(format!("{}/{name}", a[2])) else {
+            continue;
+        };
         let rows = Rows::parse_with(&text, Some(&info)).unwrap_or_else(|e| panic!("{name}: {e}"));
         if let Ok(want) = std::env::var("LEAN_FIND") {
             let census = rows.rule_census(&rows);

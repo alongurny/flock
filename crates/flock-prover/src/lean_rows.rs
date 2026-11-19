@@ -170,8 +170,8 @@ const K_NIL: u64 = 19;
 const K_CONS: u64 = 20;
 /// Every table of term rows, in order.
 const TERM_TABLES: [u64; 19] = [
-    K_BVAR, K_SORT, K_CONST, K_LIT, K_STR, K_APP, K_LAM, K_PI, K_LET, K_PROJ, K_CTX0, K_CTX, K_FVAR, K_LLEAF,
-    K_LSUCC, K_LMAX, K_LIMAX, K_NIL, K_CONS,
+    K_BVAR, K_SORT, K_CONST, K_LIT, K_STR, K_APP, K_LAM, K_PI, K_LET, K_PROJ, K_CTX0, K_CTX,
+    K_FVAR, K_LLEAF, K_LSUCC, K_LMAX, K_LIMAX, K_NIL, K_CONS,
 ];
 
 /// The table a term row goes to.
@@ -383,30 +383,48 @@ impl Rows {
                     .map_err(|e| format!("{e}: {line}"))
             };
             let lv = |i: usize| -> Result<usize, String> {
-                lvl_at.get(n(i)? as usize).copied().ok_or(format!("a level after its use: {line}"))
+                lvl_at
+                    .get(n(i)? as usize)
+                    .copied()
+                    .ok_or(format!("a level after its use: {line}"))
             };
             let (kind, x, child) = match (w.first().copied(), w.get(2).copied()) {
                 (Some("L"), Some("zero")) => (K_LLEAF, V::default(), [None; 3]),
                 (Some("L"), Some("param")) => (K_LLEAF, vi(n(3)? + 1), [None; 3]),
                 (Some("L"), Some("succ")) => (K_LSUCC, V::default(), [Some(lv(3)?), None, None]),
-                (Some("L"), Some("max")) => (K_LMAX, V::default(), [Some(lv(3)?), Some(lv(4)?), None]),
-                (Some("L"), Some("imax")) => (K_LIMAX, V::default(), [Some(lv(3)?), Some(lv(4)?), None]),
+                (Some("L"), Some("max")) => {
+                    (K_LMAX, V::default(), [Some(lv(3)?), Some(lv(4)?), None])
+                }
+                (Some("L"), Some("imax")) => {
+                    (K_LIMAX, V::default(), [Some(lv(3)?), Some(lv(4)?), None])
+                }
                 (Some("S"), Some("nil")) => (K_NIL, V::default(), [None; 3]),
                 (Some("S"), Some("cons")) => {
-                    let t = *list_at.get(n(4)? as usize).ok_or(format!("a list after its use: {line}"))?;
+                    let t = *list_at
+                        .get(n(4)? as usize)
+                        .ok_or(format!("a list after its use: {line}"))?;
                     (K_CONS, V::default(), [Some(lv(3)?), Some(t), None])
                 }
                 (Some("L" | "S"), _) => return Err(format!("a level row: {line}")),
                 _ => continue,
             };
-            let rank = child.iter().flatten().map(|&i| terms[i].rank + 1).max().unwrap_or(0);
+            let rank = child
+                .iter()
+                .flatten()
+                .map(|&i| terms[i].rank + 1)
+                .max()
+                .unwrap_or(0);
             // A list keeps its length.
             let len = match kind {
                 K_CONS => ve(terms[child[1].unwrap()].x[2].e + 1),
                 K_NIL => ve(0),
                 _ => V::default(),
             };
-            if w[0] == "L" { lvl_at.push(terms.len()) } else { list_at.push(terms.len()) };
+            if w[0] == "L" {
+                lvl_at.push(terms.len())
+            } else {
+                list_at.push(terms.len())
+            };
             terms.push(TermRec {
                 kind,
                 x: [x, V::default(), len],
@@ -431,7 +449,9 @@ impl Rows {
             match w.first().copied() {
                 Some("C") => {
                     let (x, child) = if w[2] == "push" {
-                        let q = *ctx_at.get(n(3)? as usize).ok_or(format!("a parent after its context: {line}"))?;
+                        let q = *ctx_at
+                            .get(n(3)? as usize)
+                            .ok_or(format!("a parent after its context: {line}"))?;
                         let a = n(4)? as usize + off;
                         if a >= terms.len() || !proper(&terms[a]) {
                             return Err(format!("a context's type is not a term: {line}"));
@@ -497,12 +517,24 @@ impl Rows {
                             // its id later.
                             match sub {
                                 SUB_SORT => {
-                                    let l = *lvl_at.get(n(4)? as usize).ok_or(format!("no such level: {line}"))?;
-                                    (K_LEAF, [vi(sub), V::default(), V::default()], [None, Some(l), None])
+                                    let l = *lvl_at
+                                        .get(n(4)? as usize)
+                                        .ok_or(format!("no such level: {line}"))?;
+                                    (
+                                        K_LEAF,
+                                        [vi(sub), V::default(), V::default()],
+                                        [None, Some(l), None],
+                                    )
                                 }
                                 SUB_CONST => {
-                                    let l = *list_at.get(n(5)? as usize).ok_or(format!("no such list: {line}"))?;
-                                    (K_LEAF, [vi(sub), vi(n(4)?), V::default()], [None, None, Some(l)])
+                                    let l = *list_at
+                                        .get(n(5)? as usize)
+                                        .ok_or(format!("no such list: {line}"))?;
+                                    (
+                                        K_LEAF,
+                                        [vi(sub), vi(n(4)?), V::default()],
+                                        [None, None, Some(l)],
+                                    )
                                 }
                                 _ => (K_LEAF, [vi(sub), vi(n(4)?), vi(n(5)?)], [None; 3]),
                             }
@@ -548,7 +580,12 @@ impl Rows {
                         .unwrap_or(0);
                     let fv = match kind {
                         K_FVAR => x[0].e + 1,
-                        _ => child.iter().flatten().map(|&i| terms[i].fv).max().unwrap_or(0),
+                        _ => child
+                            .iter()
+                            .flatten()
+                            .map(|&i| terms[i].fv)
+                            .max()
+                            .unwrap_or(0),
                     };
                     terms.push(TermRec {
                         kind,
@@ -569,7 +606,11 @@ impl Rows {
                         unfold: n(2)?,
                         levels: n(3)?,
                         value: (v >= 0).then_some(v as usize + off),
-                        ty: if more { Some(n(8)? as usize + off) } else { None },
+                        ty: if more {
+                            Some(n(8)? as usize + off)
+                        } else {
+                            None
+                        },
                         kind: if more { n(7)? } else { 0 },
                         key: if more { (n(5)?, n(6)?) } else { (0, 0) },
                         order: if more {
@@ -582,7 +623,9 @@ impl Rows {
                     });
                 }
                 Some("I") => {
-                    let d = *decl_at.get(&n(1)?).ok_or(format!("no declaration: {line}"))?;
+                    let d = *decl_at
+                        .get(&n(1)?)
+                        .ok_or(format!("no declaration: {line}"))?;
                     decls[d].info = match w[2] {
                         // The key is the constructor's when there is exactly one.
                         "induct" => InfoRec {
@@ -591,15 +634,37 @@ impl Rows {
                             a: n(3)?,
                             b: n(4)?,
                         },
-                        "ctor" => InfoRec { what: 2, key: (n(3)?, n(4)?), a: n(5)?, b: n(6)? },
-                        "rec" => InfoRec { what: 3, key: (0, 0), a: n(3)?, b: n(4)? },
-                        "quot" => InfoRec { what: 4, key: (0, 0), a: n(3)?, b: 0 },
+                        "ctor" => InfoRec {
+                            what: 2,
+                            key: (n(3)?, n(4)?),
+                            a: n(5)?,
+                            b: n(6)?,
+                        },
+                        "rec" => InfoRec {
+                            what: 3,
+                            key: (0, 0),
+                            a: n(3)?,
+                            b: n(4)?,
+                        },
+                        "quot" => InfoRec {
+                            what: 4,
+                            key: (0, 0),
+                            a: n(3)?,
+                            b: 0,
+                        },
                         x => return Err(format!("declaration info {x}")),
                     };
                 }
                 Some("R") => {
-                    let rec = *decl_at.get(&n(1)?).ok_or(format!("no declaration: {line}"))?;
-                    rules.push(RuleRec { rec, ctor: (n(2)?, n(3)?), fields: n(4)?, rhs: n(5)? as usize + off });
+                    let rec = *decl_at
+                        .get(&n(1)?)
+                        .ok_or(format!("no declaration: {line}"))?;
+                    rules.push(RuleRec {
+                        rec,
+                        ctor: (n(2)?, n(3)?),
+                        fields: n(4)?,
+                        rhs: n(5)? as usize + off,
+                    });
                 }
                 Some("F") => {
                     if n(1)? as usize != facts.len() {
@@ -638,7 +703,8 @@ impl Rows {
                         let v = raw[x] as usize;
                         let at = match what[x] {
                             Some(0) => ctx_at.get(v).copied(),
-                            Some(1) => (v + off < terms.len() && proper(&terms[v + off])).then_some(v + off),
+                            Some(1) => (v + off < terms.len() && proper(&terms[v + off]))
+                                .then_some(v + off),
                             Some(2) => lvl_at.get(v).copied(),
                             Some(_) => list_at.get(v).copied(),
                             None => continue,
@@ -841,10 +907,21 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
     impl Cx<'_> {
         /// The level `succ a`, as a row (added when the derivation has none).
         fn succ_of(&mut self, a: usize) -> usize {
-            let hit = self.terms.iter().position(|t| t.kind == K_LSUCC && t.child[0] == Some(a));
+            let hit = self
+                .terms
+                .iter()
+                .position(|t| t.kind == K_LSUCC && t.child[0] == Some(a));
             hit.unwrap_or_else(|| {
                 let c = &self.terms[a];
-                let t = TermRec { kind: K_LSUCC, x: [V::default(); 3], child: [Some(a), None, None], lbr: 0, rank: c.rank + 1, fv: 0, lp: c.lp };
+                let t = TermRec {
+                    kind: K_LSUCC,
+                    x: [V::default(); 3],
+                    child: [Some(a), None, None],
+                    lbr: 0,
+                    rank: c.rank + 1,
+                    fv: 0,
+                    lp: c.lp,
+                };
                 self.terms.push(t);
                 self.terms.len() - 1
             })
@@ -881,8 +958,14 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
             }
             // A maximum on the left: both parts.
             if matches!(lk, K_LMAX | K_LIMAX) {
-                if let (Some(a), Some(b)) = (self.le(lc[0].unwrap(), m), self.le(lc[1].unwrap(), m)) {
-                    return self.add(if lk == K_LMAX { "LLeMaxL" } else { "LLeIMaxL" }, l, m, vec![a, b]);
+                if let (Some(a), Some(b)) = (self.le(lc[0].unwrap(), m), self.le(lc[1].unwrap(), m))
+                {
+                    return self.add(
+                        if lk == K_LMAX { "LLeMaxL" } else { "LLeIMaxL" },
+                        l,
+                        m,
+                        vec![a, b],
+                    );
                 }
             }
             match mk {
@@ -930,7 +1013,9 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
     }
     // Zero and one, as rows.
     let mut find = |terms: &mut Vec<TermRec>, kind: u64, child: Option<usize>| -> usize {
-        let hit = terms.iter().position(|t| t.kind == kind && t.child[0] == child && t.x[0].f == F128::ZERO);
+        let hit = terms
+            .iter()
+            .position(|t| t.kind == kind && t.child[0] == child && t.x[0].f == F128::ZERO);
         hit.unwrap_or_else(|| {
             terms.push(TermRec {
                 kind,
@@ -944,7 +1029,10 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
             terms.len() - 1
         })
     };
-    if !facts.iter().any(|f| matches!(f.rule.as_str(), "Pi" | "LEqNorm")) {
+    if !facts
+        .iter()
+        .any(|f| matches!(f.rule.as_str(), "Pi" | "LEqNorm"))
+    {
         return;
     }
     let zero = find(terms, K_LLEAF, None);
@@ -968,7 +1056,11 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
                 facts[i].rule = "LEqLe".into();
                 facts[i].premises = vec![a, b];
             } else if std::env::var_os("LEAN_SHOW_LEFT").is_some() {
-                eprintln!("LEFT LEqNorm {} = {}", show_level(cx.terms, l), show_level(cx.terms, m));
+                eprintln!(
+                    "LEFT LEqNorm {} = {}",
+                    show_level(cx.terms, l),
+                    show_level(cx.terms, m)
+                );
             }
             continue;
         }
@@ -976,7 +1068,11 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
             continue;
         }
         let (su, sv) = (facts[f.premises[1]].raw[2], facts[f.premises[4]].raw[2]);
-        let (Some(u), Some(v), Some(w)) = (sort(cx.terms, su), sort(cx.terms, sv), sort(cx.terms, f.raw[2])) else {
+        let (Some(u), Some(v), Some(w)) = (
+            sort(cx.terms, su),
+            sort(cx.terms, sv),
+            sort(cx.terms, f.raw[2]),
+        ) else {
             continue;
         };
         // imax u v is: zero when v is; v when u ≤ v; max u v when 1 ≤ v,
@@ -987,7 +1083,8 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
         let v_zero = cx.terms[v].kind == K_LLEAF && cx.terms[v].x[0].f == F128::ZERO;
         // imax 1 v is v.
         let u_one = cx.terms[u].kind == K_LSUCC
-            && cx.terms[u].child[0].is_some_and(|z| cx.terms[z].kind == K_LLEAF && cx.terms[z].x[0].f == F128::ZERO);
+            && cx.terms[u].child[0]
+                .is_some_and(|z| cx.terms[z].kind == K_LLEAF && cx.terms[z].x[0].f == F128::ZERO);
         let (rule, more) = if w == v && v_zero {
             ("PiZero", vec![])
         } else if w == v && u_one {
@@ -1002,7 +1099,12 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
             ("PiU", vec![p, q])
         } else {
             if std::env::var_os("LEAN_SHOW_LEFT").is_some() {
-                eprintln!("LEFT Pi u={} v={} w={}", show_level(cx.terms, u), show_level(cx.terms, v), show_level(cx.terms, w));
+                eprintln!(
+                    "LEFT Pi u={} v={} w={}",
+                    show_level(cx.terms, u),
+                    show_level(cx.terms, v),
+                    show_level(cx.terms, w)
+                );
             }
             continue;
         };
@@ -1014,7 +1116,12 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
     // Ranks again: the added rows first (their premises are added rows
     // before them), then the derivation's in order.
     for i in (base..facts.len()).chain(0..base) {
-        facts[i].rank = facts[i].premises.iter().map(|&p| facts[p].rank + 1).max().unwrap_or(0);
+        facts[i].rank = facts[i]
+            .premises
+            .iter()
+            .map(|&p| facts[p].rank + 1)
+            .max()
+            .unwrap_or(0);
     }
 }
 
@@ -1024,12 +1131,20 @@ fn certify(terms: &mut Vec<TermRec>, facts: &mut Vec<FactRec>) {
 /// in `Spine`, `Pre` and `Ext` rows, and the row is renamed to the rule
 /// that takes them as premises (`ProjCtorAt`, `Iota0`, `IotaL`).
 fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>, info: &Rows) {
-    if !facts.iter().any(|f| matches!(f.rule.as_str(), "ProjCtor" | "Iota" | "Proj" | "QuotLift" | "EtaStruct")) {
+    if !facts.iter().any(|f| {
+        matches!(
+            f.rule.as_str(),
+            "ProjCtor" | "Iota" | "Proj" | "QuotLift" | "EtaStruct"
+        )
+    }) {
         return;
     }
     let by_key: HashMap<(u64, u64), InfoRec> = info.decls.iter().map(|d| (d.key, d.info)).collect();
-    let rule_of: HashMap<((u64, u64), (u64, u64)), u64> =
-        info.rules.iter().map(|r| ((info.decls[r.rec].key, r.ctor), r.fields)).collect();
+    let rule_of: HashMap<((u64, u64), (u64, u64)), u64> = info
+        .rules
+        .iter()
+        .map(|r| ((info.decls[r.rec].key, r.ctor), r.fields))
+        .collect();
     struct Cx<'a> {
         terms: &'a [TermRec],
         base: usize,
@@ -1054,7 +1169,12 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 rule: rule.into(),
                 tag,
                 raw,
-                is_term: [true, tag != F_NZ, matches!(tag, F_EXT | F_PTEL | F_FTEL), tag == F_ETAW],
+                is_term: [
+                    true,
+                    tag != F_NZ,
+                    matches!(tag, F_EXT | F_PTEL | F_FTEL),
+                    tag == F_ETAW,
+                ],
                 premises,
                 rank: 0,
                 owner: 0,
@@ -1069,7 +1189,12 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             let (kind, a, c0, c1) = (t.kind, t.x[0].f.lo, t.child[0], t.child[1]);
             let (rule, pr) = match kind {
                 K_LSUCC => ("NZSucc", vec![]),
-                K_LLEAF => (["NZPar0", "NZPar1", "NZPar2"].get((a as usize).wrapping_sub(1)).copied()?, vec![]),
+                K_LLEAF => (
+                    ["NZPar0", "NZPar1", "NZPar2"]
+                        .get((a as usize).wrapping_sub(1))
+                        .copied()?,
+                    vec![],
+                ),
                 K_LMAX => match self.nz(c0?) {
                     Some(p) => ("NZMaxL", vec![p]),
                     None => ("NZMaxR", vec![self.nz(c1?)?]),
@@ -1090,33 +1215,53 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
         /// The head and the number of arguments, with the row saying so.
         fn spine(&mut self, t: usize) -> (usize, u64, usize) {
             match self.app(t) {
-                None => (t, 0, self.add("SpineNil", F_SPINE, [t as u64, t as u64, 0, 0], vec![])),
+                None => (
+                    t,
+                    0,
+                    self.add("SpineNil", F_SPINE, [t as u64, t as u64, 0, 0], vec![]),
+                ),
                 Some((f, _)) => {
                     let (h, n, p) = self.spine(f);
-                    (h, n + 1, self.add("SpineApp", F_SPINE, [t as u64, h as u64, n + 1, 0], vec![p]))
+                    (
+                        h,
+                        n + 1,
+                        self.add("SpineApp", F_SPINE, [t as u64, h as u64, n + 1, 0], vec![p]),
+                    )
                 }
             }
         }
         /// t without its last n arguments, with the row saying so.
         fn pre(&mut self, t: usize, n: u64) -> Option<(usize, usize)> {
             if n == 0 {
-                return Some((t, self.add("PreNil", F_PRE, [t as u64, t as u64, 0, 0], vec![])));
+                return Some((
+                    t,
+                    self.add("PreNil", F_PRE, [t as u64, t as u64, 0, 0], vec![]),
+                ));
             }
             let (f, _) = self.app(t)?;
             let (p, row) = self.pre(f, n - 1)?;
-            Some((p, self.add("PreApp", F_PRE, [t as u64, p as u64, n, 0], vec![row])))
+            Some((
+                p,
+                self.add("PreApp", F_PRE, [t as u64, p as u64, n, 0], vec![row]),
+            ))
         }
         /// The row saying w is u applied to the last n arguments of v.
         fn ext(&mut self, u: usize, v: usize, w: usize, n: u64) -> Option<usize> {
             if n == 0 {
-                return (u == w).then(|| self.add("ExtNil", F_EXT, [u as u64, v as u64, w as u64, 0], vec![]));
+                return (u == w)
+                    .then(|| self.add("ExtNil", F_EXT, [u as u64, v as u64, w as u64, 0], vec![]));
             }
             let ((v1, x), (w1, y)) = (self.app(v)?, self.app(w)?);
             if x != y {
                 return None;
             }
             let row = self.ext(u, v1, w1, n - 1)?;
-            Some(self.add("ExtApp", F_EXT, [u as u64, v as u64, w as u64, n], vec![row]))
+            Some(self.add(
+                "ExtApp",
+                F_EXT,
+                [u as u64, v as u64, w as u64, n],
+                vec![row],
+            ))
         }
         /// The rows that walk the constructor's type for the projection
         /// typed by fact i, and the rule and premises that fact gets. The
@@ -1145,17 +1290,28 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             };
             let level_of = |sort: u64| -> Option<&TermRec> {
                 let sort = &terms[sort as usize];
-                (sort.kind == K_LEAF && sort.x[0].f.lo == SUB_SORT).then(|| &terms[sort.child[1].unwrap()])
+                (sort.kind == K_LEAF && sort.x[0].f.lo == SUB_SORT)
+                    .then(|| &terms[sort.child[1].unwrap()])
             };
             let zero = |l: &TermRec| l.kind == K_LLEAF && l.x[0].f.lo == 0;
             // `Infer(g, a, S)` and `Eq(g, S, sort zero)` at premises j, j + 1.
             let prop = |j: usize, a: usize| -> Option<()> {
                 let (c1, c2) = (fact(j, F_INFER)?, fact(j + 1, F_EQ)?);
-                (c1.raw[1] as usize == a && c2.raw[1] == c1.raw[2] && zero(level_of(c2.raw[2])?)).then_some(())
+                (c1.raw[1] as usize == a && c2.raw[1] == c1.raw[2] && zero(level_of(c2.raw[2])?))
+                    .then_some(())
             };
-            let (p0, p1, p2, p3, p4) =
-                (fact(0, F_INFER)?, fact(1, F_EQ)?, fact(2, F_INFER)?, fact(3, F_EQ)?, fact(4, F_LINST)?);
-            if p0.raw[1] as usize != x || p1.raw[1] != p0.raw[2] || p2.raw[1] != p0.raw[2] || p3.raw[1] != p2.raw[2] {
+            let (p0, p1, p2, p3, p4) = (
+                fact(0, F_INFER)?,
+                fact(1, F_EQ)?,
+                fact(2, F_INFER)?,
+                fact(3, F_EQ)?,
+                fact(4, F_LINST)?,
+            );
+            if p0.raw[1] as usize != x
+                || p1.raw[1] != p0.raw[2]
+                || p2.raw[1] != p0.raw[2]
+                || p3.raw[1] != p2.raw[2]
+            {
                 return None;
             }
             let iapp = p1.raw[2] as usize;
@@ -1170,7 +1326,11 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 _ => return None,
             };
             // A maximum must be shown not to be zero in disguise.
-            let nz = if matches!(base, "FTelNilM" | "FTelNilI") { Some(self.nz(lvl_ix)?) } else { None };
+            let nz = if matches!(base, "FTelNilM" | "FTelNilI") {
+                Some(self.nz(lvl_ix)?)
+            } else {
+                None
+            };
             let (h, n) = self.head(iapp);
             let th = &terms[h];
             if th.kind != K_LEAF || th.x[0].f.lo != SUB_CONST {
@@ -1182,7 +1342,8 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 return None;
             }
             let ctor = *decl_ix.get(&info.key)?;
-            if decls[ctor].ty != Some(p4.raw[0] as usize) || Some(p4.raw[1] as usize) != th.child[2] {
+            if decls[ctor].ty != Some(p4.raw[0] as usize) || Some(p4.raw[1] as usize) != th.child[2]
+            {
                 return None;
             }
             let (q, pre) = self.pre(iapp, info.b)?;
@@ -1197,7 +1358,8 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             let pi = |j: usize, r: u64| -> Option<(usize, usize)> {
                 let q = fact(j, F_EQ)?;
                 let w = &terms[q.raw[2] as usize];
-                (q.raw[1] == r && w.kind == K_PI).then(|| (w.child[0].unwrap(), w.child[1].unwrap()))
+                (q.raw[1] == r && w.kind == K_PI)
+                    .then(|| (w.child[0].unwrap(), w.child[1].unwrap()))
             };
             let mut r = p4.raw[2];
             let mut row = self.add("PTelNil", F_PTEL, [g, h as u64, r, 0], vec![p[4]]);
@@ -1206,17 +1368,30 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 let (_, arg) = self.app(qk)?;
                 let (_, body) = pi(j, r)?;
                 let q = facts.get(*p.get(j + 1)?)?;
-                if q.tag != F_INST || q.raw[0] as usize != body || q.raw[1] != 0 || q.raw[2] as usize != arg {
+                if q.tag != F_INST
+                    || q.raw[0] as usize != body
+                    || q.raw[1] != 0
+                    || q.raw[2] as usize != arg
+                {
                     return None;
                 }
                 r = q.raw[3];
-                row = self.add("PTelApp", F_PTEL, [g, qk as u64, r, 0], vec![row, p[j], p[j + 1]]);
+                row = self.add(
+                    "PTelApp",
+                    F_PTEL,
+                    [g, qk as u64, r, 0],
+                    vec![row, p[j], p[j + 1]],
+                );
                 j += 2;
             }
             let flag = is_prop as u64;
             // The row for `proj S k x` once that term is known: the base,
             // or the step from the projection before.
-            let close = |cx: &mut Self, pt: usize, r: u64, pending: Option<(&'static str, Vec<usize>)>| -> usize {
+            let close = |cx: &mut Self,
+                         pt: usize,
+                         r: u64,
+                         pending: Option<(&'static str, Vec<usize>)>|
+             -> usize {
                 let (rule, pr) = pending.unwrap_or_else(|| {
                     let mut pr = vec![p[0], p[1], pre, spine, row];
                     if !is_prop {
@@ -1281,8 +1456,15 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
         }
     }
     let base = facts.len();
-    let mut cx = Cx { terms, base, new: Vec::new(), memo: HashMap::new(), clash: 0 };
-    let decl_ix: HashMap<(u64, u64), usize> = decls.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+    let mut cx = Cx {
+        terms,
+        base,
+        new: Vec::new(),
+        memo: HashMap::new(),
+        clash: 0,
+    };
+    let decl_ix: HashMap<(u64, u64), usize> =
+        decls.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
     let mut tel: Vec<(usize, &str, Vec<usize>)> = Vec::new();
     // The declaration a constant term names, with its information.
     let konst = |t: usize| -> Option<((u64, u64), InfoRec)> {
@@ -1306,15 +1488,23 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
         let (a, b) = (f.raw[1] as usize, f.raw[2] as usize);
         if f.rule == "ProjCtor" && terms[a].kind == K_PROJ {
             let ta = &terms[a];
-            let (s, idx, x) = (ta.x[0].f.lo as usize, ta.x[1].e as u64, ta.child[2].unwrap());
+            let (s, idx, x) = (
+                ta.x[0].f.lo as usize,
+                ta.x[1].e as u64,
+                ta.child[2].unwrap(),
+            );
             let (h, n) = cx.head(x);
             let Some((_, c)) = konst(h) else { continue };
             if c.what != 2 || c.key != decls[s].key || n != c.a + c.b || idx >= c.b {
                 continue;
             }
             // x without the fields after idx ends in the field.
-            let Some((p, pre)) = cx.pre(x, c.b - 1 - idx) else { continue };
-            let Some((q, field)) = cx.app(p) else { continue };
+            let Some((p, pre)) = cx.pre(x, c.b - 1 - idx) else {
+                continue;
+            };
+            let Some((q, field)) = cx.app(p) else {
+                continue;
+            };
             if field != b {
                 continue;
             }
@@ -1337,16 +1527,24 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 continue;
             }
             let e = n - at - 1;
-            let Some((a1, p0)) = cx.pre(a, e) else { continue };
-            let Some((a0, quot)) = cx.app(a1) else { continue };
+            let Some((a1, p0)) = cx.pre(a, e) else {
+                continue;
+            };
+            let Some((a0, quot)) = cx.app(a1) else {
+                continue;
+            };
             let (_, _, p1) = cx.spine(a0);
-            let Some((pf, p2)) = cx.pre(a0, at - 4) else { continue };
+            let Some((pf, p2)) = cx.pre(a0, at - 4) else {
+                continue;
+            };
             let Some((_, fun)) = cx.app(pf) else { continue };
             let (mh, mn, p3) = cx.spine(quot);
             if mn != 3 || !konst(mh).is_some_and(|(_, m)| m.what == 4 && m.a == 1) {
                 continue;
             }
-            let Some((_, elem)) = cx.app(quot) else { continue };
+            let Some((_, elem)) = cx.app(quot) else {
+                continue;
+            };
             let mut u = b;
             for _ in 0..e {
                 let Some((x, _)) = cx.app(u) else { break };
@@ -1355,7 +1553,9 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             if cx.app(u) != Some((fun, elem)) {
                 continue;
             }
-            let Some(p4) = cx.ext(u, a, b, e) else { continue };
+            let Some(p4) = cx.ext(u, a, b, e) else {
+                continue;
+            };
             facts[i].rule = rule.into();
             facts[i].premises = vec![p0, p1, p2, p3, p4];
             continue;
@@ -1381,9 +1581,18 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
             let mut w = sp;
             for k in 0..fields {
                 let pj = facts[pr[3 + k]].raw[1];
-                let (rule, first) = if k == 0 { ("EtaFirst", sp) } else { ("EtaNext", w) };
+                let (rule, first) = if k == 0 {
+                    ("EtaFirst", sp)
+                } else {
+                    ("EtaNext", w)
+                };
                 let rest = (fields - 1 - k) as u64;
-                w = cx.add(rule, F_ETAW, [g, ts[k + 1] as u64, rest, pj], vec![first, pr[3 + k]]);
+                w = cx.add(
+                    rule,
+                    F_ETAW,
+                    [g, ts[k + 1] as u64, rest, pj],
+                    vec![first, pr[3 + k]],
+                );
             }
             facts[i].rule = "EtaStructL".into();
             facts[i].premises = vec![pr[0], pr[1], pr[2], w];
@@ -1396,24 +1605,40 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
                 continue;
             }
             let e = n - r.a - r.b - 1;
-            let Some((a1, p1)) = cx.pre(a, e) else { continue };
-            let Some((a2, major)) = cx.app(a1) else { continue };
-            let Some((a3, p2)) = cx.pre(a2, r.b) else { continue };
+            let Some((a1, p1)) = cx.pre(a, e) else {
+                continue;
+            };
+            let Some((a2, major)) = cx.app(a1) else {
+                continue;
+            };
+            let Some((a3, p2)) = cx.pre(a2, r.b) else {
+                continue;
+            };
             let (_, _, p3) = cx.spine(a3);
             let (mh, mn, p4) = cx.spine(major);
             let Some((ckey, c)) = konst(mh) else { continue };
-            let Some(&fields) = rule_of.get(&(rkey, ckey)) else { continue };
+            let Some(&fields) = rule_of.get(&(rkey, ckey)) else {
+                continue;
+            };
             if c.what != 2 || mn != c.a + c.b || fields != c.b {
                 continue;
             }
             // b is the right-hand side at the arguments before the indices,
             // the fields, and the arguments after the major premise.
-            let Some((b1, _)) = cx.pre(b, e) else { continue };
-            let Some((b0, _)) = cx.pre(b1, fields) else { continue };
-            let Some((rhs, _)) = cx.pre(b0, r.a) else { continue };
-            let (Some(e1), Some(e2), Some(e3)) =
-                (cx.ext(rhs, a3, b0, r.a), cx.ext(b0, major, b1, fields), cx.ext(b1, a, b, e))
-            else {
+            let Some((b1, _)) = cx.pre(b, e) else {
+                continue;
+            };
+            let Some((b0, _)) = cx.pre(b1, fields) else {
+                continue;
+            };
+            let Some((rhs, _)) = cx.pre(b0, r.a) else {
+                continue;
+            };
+            let (Some(e1), Some(e2), Some(e3)) = (
+                cx.ext(rhs, a3, b0, r.a),
+                cx.ext(b0, major, b1, fields),
+                cx.ext(b1, a, b, e),
+            ) else {
                 continue;
             };
             let with_levels = !facts[i].premises.is_empty();
@@ -1422,7 +1647,10 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
         }
     }
     if cx.clash > 0 {
-        eprintln!("{} projection walks met again with other premises", cx.clash);
+        eprintln!(
+            "{} projection walks met again with other premises",
+            cx.clash
+        );
     }
     for (i, rule, premises) in tel {
         facts[i].rule = rule.into();
@@ -1434,7 +1662,12 @@ fn certify_spines(terms: &[TermRec], decls: &[DeclRec], facts: &mut Vec<FactRec>
     loop {
         let mut moved = false;
         for i in (base..facts.len()).chain(0..base) {
-            let rank = facts[i].premises.iter().map(|&p| facts[p].rank + 1).max().unwrap_or(0);
+            let rank = facts[i]
+                .premises
+                .iter()
+                .map(|&p| facts[p].rank + 1)
+                .max()
+                .unwrap_or(0);
             moved |= rank != facts[i].rank;
             facts[i].rank = rank;
         }
@@ -1772,7 +2005,18 @@ impl Spec {
         let l = l.unwrap_or(T::C(lc));
         let r = self.val(E::Tm(tr.clone(), Part::R));
         self.last_f = self.val(E::Tm(tr, Part::F));
-        self.recv([k(TAG_TERM), T::C(id), kind, x[0], x[1], x[2], l, T::C(r), T::C(self.last_f), p]);
+        self.recv([
+            k(TAG_TERM),
+            T::C(id),
+            kind,
+            x[0],
+            x[1],
+            x[2],
+            l,
+            T::C(r),
+            T::C(self.last_f),
+            p,
+        ]);
         (lc, r)
     }
     /// Receives the level `tr` with id column `id`; the parts given are
@@ -1888,11 +2132,18 @@ fn spec(of: Of) -> Spec {
             let x: Vec<usize> = (0..4).map(|i| s.val(E::Own(Part::X(i)))).collect();
             let o = s.val(E::Own(Part::R));
             // The key, public: which declarations the proof checks or assumes.
-let k0 = s.src(Src::Pub(E::Own(Part::X(4))));
+            let k0 = s.src(Src::Pub(E::Own(Part::X(4))));
             let k1 = s.src(Src::Pub(E::Own(Part::X(5))));
             // What the reduction rules read, and the key, to whoever asks.
             let info: Vec<usize> = (6..10).map(|i| s.val(E::Own(Part::X(i)))).collect();
-            s.send([k(TAG_INFO), T::Id, tc(info[0]), tc(info[3]), tc(info[1]), tc(info[2])]);
+            s.send([
+                k(TAG_INFO),
+                T::Id,
+                tc(info[0]),
+                tc(info[3]),
+                tc(info[1]),
+                tc(info[2]),
+            ]);
             s.send([k(TAG_KEY), T::Id, tc(k0), tc(k1)]);
             let (unfold, value) = match of {
                 Of::DeclBlock => (Z, Z),
@@ -1908,7 +2159,9 @@ let k0 = s.src(Src::Pub(E::Own(Part::X(4))));
             // A recursor's rule for a constructor, both named by key (public).
             let mut s = Spec::new("rec_rule");
             let x: Vec<usize> = (0..4).map(|i| s.val(E::Own(Part::X(i)))).collect();
-            let keys: Vec<usize> = (4..8).map(|i| s.src(Src::Pub(E::Own(Part::X(i))))).collect();
+            let keys: Vec<usize> = (4..8)
+                .map(|i| s.src(Src::Pub(E::Own(Part::X(i)))))
+                .collect();
             s.recv([k(TAG_KEY), tc(x[0]), tc(keys[0]), tc(keys[1])]);
             s.recv([k(TAG_KEY), tc(x[1]), tc(keys[2]), tc(keys[3])]);
             s.send([k(TAG_RULE), tc(x[0]), tc(x[1]), tc(x[2]), tc(x[3])]);
@@ -1994,16 +2247,63 @@ let k0 = s.src(Src::Pub(E::Own(Part::X(4))));
 /// The rules too rare for a table each (a table costs every leaf a slot):
 /// their rows share one table.
 const RARE: [&str; 57] = [
-    "QuotLiftL", "QuotIndL", "EtaFirst", "EtaNext", "EtaStructL",
-    "ProofIrrel", "Eta",
-    "LInstLParam3", "LInstLParam4", "LInstLParam5", "LInstLParam6", "LInstLParam7",
-    "LLeSuccMax", "LLeIMaxR0", "PiOne",
-    "NatZero", "NatSucc", "NatBinN", "NatBinB",
-    "InstLet", "LInstLet", "LInstProj", "InstProj", "Zeta", "Let", "CongLam", "LInstSort", "CongSort", "LInstLZero",
-    "LInstLSucc", "LInstLMax", "LInstLIMax", "LInstLParam0", "LInstLParam1", "LInstLParam2", "CongConst1",
-    "CongConst2", "CongConst3", "LInstConst1", "LInstConst2", "LInstConst3", "LLeRefl", "LLeZero", "LLeSucc",
-    "LLeSuccSucc", "LLeMaxR0", "LLeMaxR1", "LLeIMaxR", "LLeMaxL", "LLeIMaxL", "LEqLe", "PiZero", "PiIMax", "PiV",
-    "PiMax", "PiU", "CongProj",
+    "QuotLiftL",
+    "QuotIndL",
+    "EtaFirst",
+    "EtaNext",
+    "EtaStructL",
+    "ProofIrrel",
+    "Eta",
+    "LInstLParam3",
+    "LInstLParam4",
+    "LInstLParam5",
+    "LInstLParam6",
+    "LInstLParam7",
+    "LLeSuccMax",
+    "LLeIMaxR0",
+    "PiOne",
+    "NatZero",
+    "NatSucc",
+    "NatBinN",
+    "NatBinB",
+    "InstLet",
+    "LInstLet",
+    "LInstProj",
+    "InstProj",
+    "Zeta",
+    "Let",
+    "CongLam",
+    "LInstSort",
+    "CongSort",
+    "LInstLZero",
+    "LInstLSucc",
+    "LInstLMax",
+    "LInstLIMax",
+    "LInstLParam0",
+    "LInstLParam1",
+    "LInstLParam2",
+    "CongConst1",
+    "CongConst2",
+    "CongConst3",
+    "LInstConst1",
+    "LInstConst2",
+    "LInstConst3",
+    "LLeRefl",
+    "LLeZero",
+    "LLeSucc",
+    "LLeSuccSucc",
+    "LLeMaxR0",
+    "LLeMaxR1",
+    "LLeIMaxR",
+    "LLeMaxL",
+    "LLeIMaxL",
+    "LEqLe",
+    "PiZero",
+    "PiIMax",
+    "PiV",
+    "PiMax",
+    "PiU",
+    "CongProj",
 ];
 
 /// One table for the rare rules. A row is of one rule: it has that rule's
@@ -2015,13 +2315,36 @@ const RARE: [&str; 57] = [
 /// the fact a row sends is one a rule live in that very row derived.
 /// The rules that read an application spine, and the rows that spell a
 /// spine out: one table, in leaves of their own like the rare rules'.
-const SPINES: [&str; 8] =
-    ["SpineNil", "SpineApp", "PreNil", "PreApp", "ExtNil", "ExtApp", "ProjCtorAt", "IotaL"];
+const SPINES: [&str; 8] = [
+    "SpineNil",
+    "SpineApp",
+    "PreNil",
+    "PreApp",
+    "ExtNil",
+    "ExtApp",
+    "ProjCtorAt",
+    "IotaL",
+];
 /// The rules that type a projection, in a table of their own beside it.
 const TELS: [&str; 18] = [
-    "NZSucc", "NZPar0", "NZPar1", "NZPar2", "NZMaxL", "NZMaxR", "NZIMax",
-    "PTelNil", "PTelApp", "FTelNilP", "FTelNilS", "FTelNilM", "FTelNilI", "FTelStep", "FTelStepP0", "FTelStepP1",
-    "ProjTy", "ProjTyP",
+    "NZSucc",
+    "NZPar0",
+    "NZPar1",
+    "NZPar2",
+    "NZMaxL",
+    "NZMaxR",
+    "NZIMax",
+    "PTelNil",
+    "PTelApp",
+    "FTelNilP",
+    "FTelNilS",
+    "FTelNilM",
+    "FTelNilI",
+    "FTelStep",
+    "FTelStepP0",
+    "FTelStepP1",
+    "ProjTy",
+    "ProjTyP",
 ];
 
 fn rares(which: usize) -> &'static [&'static str] {
@@ -2040,13 +2363,37 @@ fn rare_place(rule: &str) -> Option<(usize, usize)> {
 fn rare_spec(which: usize) -> Spec {
     let rules = rares(which);
     let parts: Vec<Spec> = rules.iter().map(|r| fact_spec(r)).collect();
-    let n_in = parts.iter().map(|sp| sp.cols.iter().filter(|c| matches!(c.0, Col::In)).count()).max().unwrap();
+    let n_in = parts
+        .iter()
+        .map(|sp| sp.cols.iter().filter(|c| matches!(c.0, Col::In)).count())
+        .max()
+        .unwrap();
     let mut u = Spec::new(["rare", "spines", "tels"][which]);
-    let own: Vec<T> = [Part::Kind, Part::X(0), Part::X(1), Part::X(2), Part::X(3), Part::R, Part::O]
-        .into_iter()
-        .map(|p| tc(u.val(E::Own(p))))
-        .collect();
-    let fact = |tag: u64| [k(tag), T::Id, own[0], own[1], own[2], own[3], own[4], own[5], own[6]];
+    let own: Vec<T> = [
+        Part::Kind,
+        Part::X(0),
+        Part::X(1),
+        Part::X(2),
+        Part::X(3),
+        Part::R,
+        Part::O,
+    ]
+    .into_iter()
+    .map(|p| tc(u.val(E::Own(p))))
+    .collect();
+    let fact = |tag: u64| {
+        [
+            k(tag),
+            T::Id,
+            own[0],
+            own[1],
+            own[2],
+            own[3],
+            own[4],
+            own[5],
+            own[6],
+        ]
+    };
     u.recv(fact(TAG_UFACT));
     u.send(fact(TAG_FACT));
     let first = u.cols.len();
@@ -2061,7 +2408,10 @@ fn rare_spec(which: usize) -> Spec {
         for (y, (col, src)) in sp.cols.iter().enumerate() {
             at[y] = match *col {
                 Col::In => {
-                    inputs.push((first + inputs.len(), src.clone().expect("an input has a source")));
+                    inputs.push((
+                        first + inputs.len(),
+                        src.clone().expect("an input has a source"),
+                    ));
                     first + inputs.len() - 1
                 }
                 Col::Mul(a, b) => u.out(Col::Mul(at[a], at[b])),
@@ -2075,7 +2425,10 @@ fn rare_spec(which: usize) -> Spec {
                 x => x,
             });
             if p.send {
-                assert!(matches!(t[0], T::K(v) if v == int(TAG_FACT)), "a rule sends its fact");
+                assert!(
+                    matches!(t[0], T::K(v) if v == int(TAG_FACT)),
+                    "a rule sends its fact"
+                );
                 t[0] = tc(u.out(Col::Lin(int(TAG_UFACT), live)));
             }
             u.ports.push(Port {
@@ -2113,14 +2466,36 @@ fn term_spec(kind: u64) -> Spec {
             let r = s.val(own(Part::R));
             s.recv([k(TAG_RANGE), tc(a0), T::K(F128::ONE), Z, Z, Z, Z, Z]);
             s.recv([k(TAG_RANGE + 1), tc(a1), T::K(F128::ONE), Z, Z, Z, Z, Z]);
-            s.send([k(TAG_TERM), T::Id, k(K_BVAR), tc(j), Z, Z, tc(l), tc(r), T::K(F128::ONE), Z]);
+            s.send([
+                k(TAG_TERM),
+                T::Id,
+                k(K_BVAR),
+                tc(j),
+                Z,
+                Z,
+                tc(l),
+                tc(r),
+                T::K(F128::ONE),
+                Z,
+            ]);
         }
         K_FVAR => {
             // Closed, and its bound on free variables is its level plus one.
             let n = s.val(own(Part::X(0)));
             let f = s.out(Col::Lin(G, n));
             let r = s.val(own(Part::R));
-            s.send([k(TAG_TERM), T::Id, k(K_FVAR), tc(n), Z, Z, T::K(F128::ONE), tc(r), tc(f), Z]);
+            s.send([
+                k(TAG_TERM),
+                T::Id,
+                k(K_FVAR),
+                tc(n),
+                Z,
+                Z,
+                T::K(F128::ONE),
+                tc(r),
+                tc(f),
+                Z,
+            ]);
         }
         K_CTX0 => {
             s.send([k(TAG_CTX), T::Id, Z, Z, T::K(F128::ONE)]);
@@ -2164,15 +2539,38 @@ fn term_spec(kind: u64) -> Spec {
                 _ => (SUB_STR, tc(x2)),
             };
             // A literal has no level.
-            let p = if matches!(kind, K_SORT | K_CONST) { tc(p) } else { Z };
+            let p = if matches!(kind, K_SORT | K_CONST) {
+                tc(p)
+            } else {
+                Z
+            };
             let one = T::K(F128::ONE);
-            s.send([k(TAG_TERM), T::Id, k(K_LEAF), k(sub), tc(x1), x2, one, tc(r), one, p]);
+            s.send([
+                k(TAG_TERM),
+                T::Id,
+                k(K_LEAF),
+                k(sub),
+                tc(x1),
+                x2,
+                one,
+                tc(r),
+                one,
+                p,
+            ]);
         }
         K_LLEAF => {
             // Zero (a = 0) or a parameter (a = its index plus one).
             let a = s.val(own(Part::X(0)));
             // Zero exactly when it is no parameter.
-            s.send([k(TAG_LVL), T::Id, k(K_LLEAF), tc(a), Z, T::K(F128::ONE), tc(a)]);
+            s.send([
+                k(TAG_LVL),
+                T::Id,
+                k(K_LLEAF),
+                tc(a),
+                Z,
+                T::K(F128::ONE),
+                tc(a),
+            ]);
         }
         K_LSUCC | K_LMAX | K_LIMAX => {
             let r = s.val(own(Part::R));
@@ -2233,7 +2631,18 @@ fn term_spec(kind: u64) -> Spec {
                 }
                 s.ge(fv, own(Part::F), fc, E::Tm(ch, Part::F), 0);
             }
-            s.send([k(TAG_TERM), T::Id, k(kind), x[0], x[1], x[2], tc(l), tc(r), tc(fv), tc(p)]);
+            s.send([
+                k(TAG_TERM),
+                T::Id,
+                k(kind),
+                x[0],
+                x[1],
+                x[2],
+                tc(l),
+                tc(r),
+                tc(fv),
+                tc(p),
+            ]);
         }
     }
     s
@@ -2274,12 +2683,27 @@ fn fact_spec(rule: &str) -> Spec {
     // A is a proof's type: premises j and j + 1 are `Infer(g, A, S)` and
     // `Eq(g, S, sort zero)`.
     let proof = |s: &mut Spec, j: usize, g: usize, a: usize| {
-        let (st, sz) = (s.val(E::Prem(j, Part::X(2))), s.val(E::Prem(j + 1, Part::X(2))));
+        let (st, sz) = (
+            s.val(E::Prem(j, Part::X(2))),
+            s.val(E::Prem(j + 1, Part::X(2))),
+        );
         s.prem(j, F_INFER, [c(g), c(a), c(st), Some(Z)], r);
         s.prem(j + 1, F_EQ, [c(g), c(st), c(sz), Some(Z)], r);
         let z = s.val(E::Tm(TR::PFld(j + 1, 2), Part::X(1)));
-        s.term(sz, TR::PFld(j + 1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(z), Some(Z)], None);
-        s.level(z, TR::Child(Box::new(TR::PFld(j + 1, 2)), 1), Some(k(K_LLEAF)), Some(Z), Some(Z));
+        s.term(
+            sz,
+            TR::PFld(j + 1, 2),
+            k(K_LEAF),
+            [Some(k(SUB_SORT)), c(z), Some(Z)],
+            None,
+        );
+        s.level(
+            z,
+            TR::Child(Box::new(TR::PFld(j + 1, 2)), 1),
+            Some(k(K_LLEAF)),
+            Some(Z),
+            Some(Z),
+        );
     };
     match rule {
         "Refl" => {
@@ -2588,18 +3012,36 @@ fn fact_spec(rule: &str) -> Spec {
             );
             s.recv([k(TAG_CTX), tc(g), tc(gp_), tc(ga), tc(ng)]);
             let var = s.val(E::Prem(2, Part::X(2)));
-            s.term(var, TR::PFld(2, 2), k(K_FVAR), [c(ng), Some(Z), Some(Z)], None);
+            s.term(
+                var,
+                TR::PFld(2, 2),
+                k(K_FVAR),
+                [c(ng), Some(Z), Some(Z)],
+                None,
+            );
             let ext = s.val(E::Prem(3, Part::X(0)));
             let ng1 = s.out(Col::Lin(G, ng));
             s.recv([k(TAG_CTX), tc(ext), tc(g), tc(a), tc(ng1)]);
             // The codomain does not mention the variable: fv(B) ≤ n.
             s.term(cod, ch(f(2), 1), T::Id, [None; 3], None);
             let fc = s.last_f;
-            s.ge(ng, E::Tm(f(0), Part::X(2)), fc, E::Tm(ch(f(2), 1), Part::F), 0);
+            s.ge(
+                ng,
+                E::Tm(f(0), Part::X(2)),
+                fc,
+                E::Tm(ch(f(2), 1), Part::F),
+                0,
+            );
             let sa = s.val(E::Prem(0, Part::X(2)));
             let su = s.val(E::Prem(1, Part::X(2)));
             let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
-            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(u), Some(Z)], None);
+            s.term(
+                su,
+                TR::PFld(1, 2),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), c(u), Some(Z)],
+                None,
+            );
             let bo = s.val(E::Prem(2, Part::X(3)));
             let bt = s.val(E::Prem(3, Part::X(2)));
             s.prem(0, F_INFER, [c(g), c(a), c(sa), Some(Z)], r);
@@ -2629,7 +3071,13 @@ fn fact_spec(rule: &str) -> Spec {
             );
             s.recv([k(TAG_CTX), tc(g), tc(gp_), tc(ga), tc(ng)]);
             let var = s.val(E::Prem(1, Part::X(2)));
-            s.term(var, TR::PFld(1, 2), k(K_FVAR), [c(ng), Some(Z), Some(Z)], None);
+            s.term(
+                var,
+                TR::PFld(1, 2),
+                k(K_FVAR),
+                [c(ng), Some(Z), Some(Z)],
+                None,
+            );
             let ext = s.val(E::Prem(3, Part::X(0)));
             let ng1 = s.out(Col::Lin(G, ng));
             s.recv([k(TAG_CTX), tc(ext), tc(g), tc(a1), tc(ng1)]);
@@ -2658,7 +3106,13 @@ fn fact_spec(rule: &str) -> Spec {
             let sa = s.val(E::Prem(0, Part::X(2)));
             let su = s.val(E::Prem(1, Part::X(2)));
             let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
-            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(u), Some(Z)], None);
+            s.term(
+                su,
+                TR::PFld(1, 2),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), c(u), Some(Z)],
+                None,
+            );
             let vt = s.val(E::Prem(2, Part::X(2)));
             let b2 = s.val(E::Prem(4, Part::X(3)));
             s.prem(0, F_INFER, [c(g), c(a), c(sa), Some(Z)], r);
@@ -2669,8 +3123,8 @@ fn fact_spec(rule: &str) -> Spec {
             s.prem(5, F_INFER, [c(g), c(b2), c(t), Some(Z)], r);
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
-        "LLeRefl" | "LLeZero" | "LLeSucc" | "LLeSuccSucc" | "LLeMaxR0" | "LLeMaxR1" | "LLeIMaxR" | "LLeMaxL"
-        | "LLeIMaxL" | "LLeSuccMax" | "LLeIMaxR0" => {
+        "LLeRefl" | "LLeZero" | "LLeSucc" | "LLeSuccSucc" | "LLeMaxR0" | "LLeMaxR1"
+        | "LLeIMaxR" | "LLeMaxL" | "LLeIMaxL" | "LLeSuccMax" | "LLeIMaxR0" => {
             // l ≤ m for every assignment of the parameters.
             let (l, m) = (fld(&mut s, 0), fld(&mut s, 1));
             let le = |s: &mut Spec, j: usize, a: usize, b: usize| {
@@ -2708,7 +3162,10 @@ fn fact_spec(rule: &str) -> Spec {
                     let x = part(&mut s, 0, 0);
                     s.level(l, f(0), Some(k(K_LSUCC)), c(x), Some(Z));
                     let xt = ch(f(0), 0);
-                    let (a, b) = (s.val(E::Tm(ch(xt.clone(), 0), Part::Id)), s.val(E::Tm(ch(xt.clone(), 1), Part::Id)));
+                    let (a, b) = (
+                        s.val(E::Tm(ch(xt.clone(), 0), Part::Id)),
+                        s.val(E::Tm(ch(xt.clone(), 1), Part::Id)),
+                    );
                     s.level(x, xt, Some(k(K_LMAX)), c(a), c(b));
                     for (j, y) in [(0, a), (1, b)] {
                         let sy = s.val(E::Prem(j, Part::X(0)));
@@ -2737,7 +3194,11 @@ fn fact_spec(rule: &str) -> Spec {
         // Application spines. A count is an exponent, one more a step.
         "SpineNil" | "PreNil" => {
             let t = fld(&mut s, 0);
-            send(&mut s, if rule == "SpineNil" { F_SPINE } else { F_PRE }, [tc(t), tc(t), one, Z]);
+            send(
+                &mut s,
+                if rule == "SpineNil" { F_SPINE } else { F_PRE },
+                [tc(t), tc(t), one, Z],
+            );
         }
         "SpineApp" | "PreApp" => {
             let tag = if rule == "SpineApp" { F_SPINE } else { F_PRE };
@@ -2772,7 +3233,10 @@ fn fact_spec(rule: &str) -> Spec {
         // S at params + i arguments.
         "ProjCtorAt" => {
             let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
-            let (st, ix) = (s.val(E::Tm(f(1), Part::X(0))), s.val(E::Tm(f(1), Part::X(1))));
+            let (st, ix) = (
+                s.val(E::Tm(f(1), Part::X(0))),
+                s.val(E::Tm(f(1), Part::X(1))),
+            );
             let x = s.val(E::Tm(ch(f(1), 2), Part::Id));
             s.term(a, f(1), k(K_PROJ), [c(st), c(ix), c(x)], None);
             let (p, gj) = (s.val(E::Prem(0, Part::X(1))), s.val(E::Prem(0, Part::X(2))));
@@ -2781,7 +3245,13 @@ fn fact_spec(rule: &str) -> Spec {
             s.term(p, TR::PFld(0, 1), k(K_APP), [c(q), c(b), Some(Z)], None);
             let h = s.val(E::Prem(1, Part::X(1)));
             let d = s.val(E::Tm(TR::PFld(1, 1), Part::X(1)));
-            s.term(h, TR::PFld(1, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), None], None);
+            s.term(
+                h,
+                TR::PFld(1, 1),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(d), None],
+                None,
+            );
             let params = s.val(E::Dcl(TR::PFld(1, 1), Part::X(7)));
             // fields = j + i + 1 and the count before the field is params + i.
             let fields = s.out(Col::MulC(G, gj, ix));
@@ -2789,7 +3259,13 @@ fn fact_spec(rule: &str) -> Spec {
             let m = s.out(Col::Mul(params, ix));
             s.prem(1, F_SPINE, [c(q), c(h), c(m), Some(Z)], r);
             // The index is a number: the count is at least the parameters.
-            s.ge(m, E::Prem(1, Part::X(2)), params, E::Dcl(TR::PFld(1, 1), Part::X(7)), 0);
+            s.ge(
+                m,
+                E::Prem(1, Part::X(2)),
+                params,
+                E::Dcl(TR::PFld(1, 1), Part::X(7)),
+                0,
+            );
             send(&mut s, F_EQ, [tc(g), tc(a), tc(b), Z]);
         }
         // rec ps ms mins idxs (c qs fs) es = rhs ps ms mins fs es, with
@@ -2800,25 +3276,53 @@ fn fact_spec(rule: &str) -> Spec {
             // a without the arguments after the major premise ends in it.
             let (a1, ge_) = (s.val(E::Prem(1, Part::X(1))), s.val(E::Prem(1, Part::X(2))));
             s.prem(1, F_PRE, [c(a), c(a1), c(ge_), Some(Z)], r);
-            let (a2, major) = (s.val(E::Tm(ch(pf(1, 1), 0), Part::Id)), s.val(E::Tm(ch(pf(1, 1), 1), Part::Id)));
+            let (a2, major) = (
+                s.val(E::Tm(ch(pf(1, 1), 0), Part::Id)),
+                s.val(E::Tm(ch(pf(1, 1), 1), Part::Id)),
+            );
             s.term(a1, pf(1, 1), k(K_APP), [c(a2), c(major), Some(Z)], None);
             // Before the indices: the recursor at its parameters, motives and minors.
             let (a3, gind) = (s.val(E::Prem(2, Part::X(1))), s.val(E::Prem(2, Part::X(2))));
             s.prem(2, F_PRE, [c(a2), c(a3), c(gind), Some(Z)], r);
             let (h, gbefore) = (s.val(E::Prem(3, Part::X(1))), s.val(E::Prem(3, Part::X(2))));
             s.prem(3, F_SPINE, [c(a3), c(h), c(gbefore), Some(Z)], r);
-            let (rd, ls) = (s.val(E::Tm(pf(3, 1), Part::X(1))), s.val(E::Tm(pf(3, 1), Part::X(2))));
-            s.term(h, pf(3, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(rd), c(ls)], None);
+            let (rd, ls) = (
+                s.val(E::Tm(pf(3, 1), Part::X(1))),
+                s.val(E::Tm(pf(3, 1), Part::X(2))),
+            );
+            s.term(
+                h,
+                pf(3, 1),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(rd), c(ls)],
+                None,
+            );
             s.recv([k(TAG_INFO), tc(rd), k(3), Z, tc(gbefore), tc(gind)]);
             // As many levels as the recursor has parameters.
-            let dcl: Vec<usize> = (0..4).map(|i| s.val(E::Dcl(pf(3, 1), Part::X(i)))).collect();
+            let dcl: Vec<usize> = (0..4)
+                .map(|i| s.val(E::Dcl(pf(3, 1), Part::X(i))))
+                .collect();
             let ord = s.val(E::Dcl(pf(3, 1), Part::R));
             s.list(ls, ch(pf(3, 1), 2), None, None, Some(tc(dcl[1])));
-            s.recv([k(TAG_DECL), tc(rd), tc(dcl[0]), tc(dcl[1]), tc(dcl[2]), tc(dcl[3]), tc(ord)]);
+            s.recv([
+                k(TAG_DECL),
+                tc(rd),
+                tc(dcl[0]),
+                tc(dcl[1]),
+                tc(dcl[2]),
+                tc(dcl[3]),
+                tc(ord),
+            ]);
             // The major premise: a constructor at its parameters and fields.
             let mh = s.val(E::Prem(4, Part::X(1)));
             let cd = s.val(E::Tm(pf(4, 1), Part::X(1)));
-            s.term(mh, pf(4, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(cd), None], None);
+            s.term(
+                mh,
+                pf(4, 1),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(cd), None],
+                None,
+            );
             let (ind, cp, gfields) = (
                 s.val(E::Dcl(pf(4, 1), Part::X(9))),
                 s.val(E::Dcl(pf(4, 1), Part::X(7))),
@@ -2844,7 +3348,10 @@ fn fact_spec(rule: &str) -> Spec {
         // constructor at the levels.
         "PTelNil" => {
             let (g, q, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
-            let (d, ls) = (s.val(E::Tm(f(1), Part::X(1))), s.val(E::Tm(f(1), Part::X(2))));
+            let (d, ls) = (
+                s.val(E::Tm(f(1), Part::X(1))),
+                s.val(E::Tm(f(1), Part::X(2))),
+            );
             s.term(q, f(1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
             let (cd, params, indices) = (
                 s.val(E::Dcl(f(1), Part::X(9))),
@@ -2856,7 +3363,15 @@ fn fact_spec(rule: &str) -> Spec {
             let dcl: Vec<usize> = (0..4).map(|i| s.val(E::Ctor(f(1), Part::X(i)))).collect();
             let ord = s.val(E::Ctor(f(1), Part::R));
             s.list(ls, ch(f(1), 2), None, None, Some(tc(dcl[1])));
-            s.recv([k(TAG_DECL), tc(cd), tc(dcl[0]), tc(dcl[1]), tc(dcl[2]), tc(dcl[3]), tc(ord)]);
+            s.recv([
+                k(TAG_DECL),
+                tc(cd),
+                tc(dcl[0]),
+                tc(dcl[1]),
+                tc(dcl[2]),
+                tc(dcl[3]),
+                tc(ord),
+            ]);
             s.ge(o, E::Own(Part::O), ord, E::Ctor(f(1), Part::R), 1);
             s.prem(0, F_LINST, [c(dcl[3]), c(ls), c(rr), Some(Z)], r);
             send(&mut s, F_PTEL, [tc(g), tc(q), tc(rr), Z]);
@@ -2864,7 +3379,10 @@ fn fact_spec(rule: &str) -> Spec {
         // One more parameter: the type so far is a pi, its body at the argument.
         "PTelApp" => {
             let (g, q, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
-            let (q1, a) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            let (q1, a) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+            );
             s.term(q, f(1), k(K_APP), [c(q1), c(a), Some(Z)], None);
             let (r1, w) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
             let body = s.val(E::Tm(ch(TR::PFld(1, 2), 1), Part::Id));
@@ -2880,7 +3398,10 @@ fn fact_spec(rule: &str) -> Spec {
         // successor, a maximum or an impredicative maximum).
         "FTelNilP" | "FTelNilS" | "FTelNilM" | "FTelNilI" => {
             let (g, pt, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
-            let (st, x) = (s.val(E::Tm(f(1), Part::X(0))), s.val(E::Tm(ch(f(1), 2), Part::Id)));
+            let (st, x) = (
+                s.val(E::Tm(f(1), Part::X(0))),
+                s.val(E::Tm(ch(f(1), 2), Part::Id)),
+            );
             s.term(pt, f(1), k(K_PROJ), [c(st), Some(one), c(x)], None);
             let (e_, ty) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
             s.prem(0, F_INFER, [c(g), c(x), c(e_), Some(Z)], r);
@@ -2889,7 +3410,13 @@ fn fact_spec(rule: &str) -> Spec {
             s.prem(2, F_PRE, [c(ty), c(q), c(gind), Some(Z)], r);
             let (h, gpar) = (s.val(E::Prem(3, Part::X(1))), s.val(E::Prem(3, Part::X(2))));
             s.prem(3, F_SPINE, [c(q), c(h), c(gpar), Some(Z)], r);
-            s.term(h, TR::PFld(3, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(st), None], None);
+            s.term(
+                h,
+                TR::PFld(3, 1),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(st), None],
+                None,
+            );
             let cd = s.val(E::Dcl(TR::PFld(3, 1), Part::X(9)));
             s.recv([k(TAG_INFO), tc(st), k(1), tc(cd), tc(gpar), tc(gind)]);
             s.prem(4, F_PTEL, [c(g), c(q), c(rr), Some(Z)], r);
@@ -2900,7 +3427,13 @@ fn fact_spec(rule: &str) -> Spec {
                 s.prem(5, F_INFER, [c(g), c(e_), c(se), Some(Z)], r);
                 s.prem(6, F_EQ, [c(g), c(se), c(so), Some(Z)], r);
                 let l = s.val(E::Tm(TR::PFld(6, 2), Part::X(1)));
-                s.term(so, TR::PFld(6, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(l), Some(Z)], None);
+                s.term(
+                    so,
+                    TR::PFld(6, 2),
+                    k(K_LEAF),
+                    [Some(k(SUB_SORT)), c(l), Some(Z)],
+                    None,
+                );
                 let kind = match rule {
                     "FTelNilS" => K_LSUCC,
                     "FTelNilM" => K_LMAX,
@@ -2920,15 +3453,20 @@ fn fact_spec(rule: &str) -> Spec {
         "FTelStep" | "FTelStepP0" | "FTelStepP1" => {
             let (g, pt, rr) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
             let flag = if rule == "FTelStep" { Z } else { k(1) };
-            let (st, x) = (s.val(E::Tm(f(1), Part::X(0))), s.val(E::Tm(ch(f(1), 2), Part::Id)));
+            let (st, x) = (
+                s.val(E::Tm(f(1), Part::X(0))),
+                s.val(E::Tm(ch(f(1), 2), Part::Id)),
+            );
             let pp = s.val(E::Prem(0, Part::X(1)));
             let ix = s.val(E::Tm(TR::PFld(0, 1), Part::X(1)));
             s.term(pp, TR::PFld(0, 1), k(K_PROJ), [c(st), c(ix), c(x)], None);
             let ix1 = s.out(Col::Lin(G, ix));
             s.term(pt, f(1), k(K_PROJ), [c(st), c(ix1), c(x)], None);
             let (r1, w) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
-            let (a, body) =
-                (s.val(E::Tm(ch(TR::PFld(1, 2), 0), Part::Id)), s.val(E::Tm(ch(TR::PFld(1, 2), 1), Part::Id)));
+            let (a, body) = (
+                s.val(E::Tm(ch(TR::PFld(1, 2), 0), Part::Id)),
+                s.val(E::Tm(ch(TR::PFld(1, 2), 1), Part::Id)),
+            );
             s.term(w, TR::PFld(1, 2), k(K_PI), [c(a), c(body), Some(Z)], None);
             s.prem(0, F_FTEL, [c(g), c(pp), c(r1), Some(flag)], r);
             s.prem(1, F_EQ, [c(g), c(r1), c(w), Some(Z)], r);
@@ -2971,7 +3509,11 @@ fn fact_spec(rule: &str) -> Spec {
                     let side = if rule == "NZMaxL" { 0 } else { 1 };
                     let x = s.val(E::Tm(ch(f(0), side), Part::Id));
                     let kind = if rule == "NZIMax" { K_LIMAX } else { K_LMAX };
-                    let (a, b) = if side == 0 { (c(x), None) } else { (None, c(x)) };
+                    let (a, b) = if side == 0 {
+                        (c(x), None)
+                    } else {
+                        (None, c(x))
+                    };
                     s.level(l, f(0), Some(k(kind)), a, b);
                     s.prem(0, F_NZ, [c(x), Some(Z), Some(Z), Some(Z)], r);
                 }
@@ -2985,10 +3527,16 @@ fn fact_spec(rule: &str) -> Spec {
             let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
             let sub = if rule == "LitNat" { SUB_LIT } else { SUB_STR };
             s.term(e, f(1), k(K_LEAF), [Some(k(sub)), None, None], None);
-            let (d, ls) = (s.val(E::Tm(f(2), Part::X(1))), s.val(E::Tm(f(2), Part::X(2))));
+            let (d, ls) = (
+                s.val(E::Tm(f(2), Part::X(1))),
+                s.val(E::Tm(f(2), Part::X(2))),
+            );
             s.term(t, f(2), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
             s.list(ls, ch(f(2), 2), Some(Z), Some(Z), Some(one));
-            let (k0, k1) = (s.val(E::Dcl(f(2), Part::X(4))), s.val(E::Dcl(f(2), Part::X(5))));
+            let (k0, k1) = (
+                s.val(E::Dcl(f(2), Part::X(4))),
+                s.val(E::Dcl(f(2), Part::X(5))),
+            );
             s.recv([k(TAG_KEY), tc(d), tc(k0), tc(k1)]);
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
@@ -3009,10 +3557,22 @@ fn fact_spec(rule: &str) -> Spec {
             };
             // A constant without levels: its key.
             let konst = |s: &mut Spec, id: usize, tr: TR| {
-                let (d, ls) = (s.val(E::Tm(tr.clone(), Part::X(1))), s.val(E::Tm(tr.clone(), Part::X(2))));
-                s.term(id, tr.clone(), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ls)], None);
+                let (d, ls) = (
+                    s.val(E::Tm(tr.clone(), Part::X(1))),
+                    s.val(E::Tm(tr.clone(), Part::X(2))),
+                );
+                s.term(
+                    id,
+                    tr.clone(),
+                    k(K_LEAF),
+                    [Some(k(SUB_CONST)), c(d), c(ls)],
+                    None,
+                );
                 s.list(ls, ch(tr.clone(), 2), Some(Z), Some(Z), Some(one));
-                let (k0, k1) = (s.val(E::Dcl(tr.clone(), Part::X(4))), s.val(E::Dcl(tr, Part::X(5))));
+                let (k0, k1) = (
+                    s.val(E::Dcl(tr.clone(), Part::X(4))),
+                    s.val(E::Dcl(tr, Part::X(5))),
+                );
                 s.recv([k(TAG_KEY), tc(d), tc(k0), tc(k1)]);
                 [tc(k0), tc(k1)]
             };
@@ -3020,13 +3580,19 @@ fn fact_spec(rule: &str) -> Spec {
             let (op, x, y) = match rule {
                 "NatZero" => (konst(&mut s, a, f(1)), Z, Z),
                 "NatSucc" => {
-                    let (fc, xa) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+                    let (fc, xa) = (
+                        s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                        s.val(E::Tm(ch(f(1), 1), Part::Id)),
+                    );
                     s.term(a, f(1), k(K_APP), [c(fc), c(xa), Some(Z)], None);
                     let op = konst(&mut s, fc, ch(f(1), 0));
                     (op, lit(&mut s, xa, ch(f(1), 1)), Z)
                 }
                 _ => {
-                    let (fx, ya) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+                    let (fx, ya) = (
+                        s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                        s.val(E::Tm(ch(f(1), 1), Part::Id)),
+                    );
                     s.term(a, f(1), k(K_APP), [c(fx), c(ya), Some(Z)], None);
                     let fx_tr = ch(f(1), 0);
                     let (fc, xa) = (
@@ -3059,12 +3625,21 @@ fn fact_spec(rule: &str) -> Spec {
             let pf = |j: usize, x: usize| TR::PFld(j, x);
             let (a1, ge_) = (s.val(E::Prem(0, Part::X(1))), s.val(E::Prem(0, Part::X(2))));
             s.prem(0, F_PRE, [c(a), c(a1), c(ge_), Some(Z)], r);
-            let (a0, q) = (s.val(E::Tm(ch(pf(0, 1), 0), Part::Id)), s.val(E::Tm(ch(pf(0, 1), 1), Part::Id)));
+            let (a0, q) = (
+                s.val(E::Tm(ch(pf(0, 1), 0), Part::Id)),
+                s.val(E::Tm(ch(pf(0, 1), 1), Part::Id)),
+            );
             s.term(a1, pf(0, 1), k(K_APP), [c(a0), c(q), Some(Z)], None);
             let h = s.val(E::Prem(1, Part::X(1)));
             s.prem(1, F_SPINE, [c(a0), c(h), Some(T::K(gp(at))), Some(Z)], r);
             let d = s.val(E::Tm(pf(1, 1), Part::X(1)));
-            s.term(h, pf(1, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(d), None], None);
+            s.term(
+                h,
+                pf(1, 1),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(d), None],
+                None,
+            );
             s.recv([k(TAG_INFO), tc(d), k(4), Z, T::K(gp(kind)), one]);
             let p = s.val(E::Prem(2, Part::X(1)));
             s.prem(2, F_PRE, [c(a0), c(p), Some(T::K(gp(at - 4))), Some(Z)], r);
@@ -3073,7 +3648,13 @@ fn fact_spec(rule: &str) -> Spec {
             let mh = s.val(E::Prem(3, Part::X(1)));
             s.prem(3, F_SPINE, [c(q), c(mh), Some(T::K(gp(3))), Some(Z)], r);
             let md = s.val(E::Tm(pf(3, 1), Part::X(1)));
-            s.term(mh, pf(3, 1), k(K_LEAF), [Some(k(SUB_CONST)), c(md), None], None);
+            s.term(
+                mh,
+                pf(3, 1),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(md), None],
+                None,
+            );
             s.recv([k(TAG_INFO), tc(md), k(4), Z, T::K(gp(1)), one]);
             let elem = s.val(E::Tm(ch(pf(3, 0), 1), Part::Id));
             s.term(q, pf(3, 0), k(K_APP), [None, c(elem), Some(Z)], None);
@@ -3086,13 +3667,27 @@ fn fact_spec(rule: &str) -> Spec {
         // constructor c of I at its parameters and field 0, which is
         // `proj I 0 a`; r = fields - 1 are to come.
         "EtaFirst" => {
-            let (g, t, rest, pj) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2), fld(&mut s, 3));
-            let (t0, f0) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            let (g, t, rest, pj) = (
+                fld(&mut s, 0),
+                fld(&mut s, 1),
+                fld(&mut s, 2),
+                fld(&mut s, 3),
+            );
+            let (t0, f0) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+            );
             s.term(t, f(1), k(K_APP), [c(t0), c(f0), Some(Z)], None);
             let h = s.val(E::Prem(0, Part::X(1)));
             let ct = TR::PFld(0, 1);
             let cd = s.val(E::Tm(ct.clone(), Part::X(1)));
-            s.term(h, ct.clone(), k(K_LEAF), [Some(k(SUB_CONST)), c(cd), None], None);
+            s.term(
+                h,
+                ct.clone(),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(cd), None],
+                None,
+            );
             let (ind, params, fields) = (
                 s.val(E::Dcl(ct.clone(), Part::X(9))),
                 s.val(E::Dcl(ct.clone(), Part::X(7))),
@@ -3100,7 +3695,10 @@ fn fact_spec(rule: &str) -> Spec {
             );
             s.recv([k(TAG_INFO), tc(cd), k(2), tc(ind), tc(params), tc(fields)]);
             // I names c as its one constructor.
-            let (ip, ii) = (s.val(E::Ctor(ct.clone(), Part::X(7))), s.val(E::Ctor(ct, Part::X(8))));
+            let (ip, ii) = (
+                s.val(E::Ctor(ct.clone(), Part::X(7))),
+                s.val(E::Ctor(ct, Part::X(8))),
+            );
             s.recv([k(TAG_INFO), tc(ind), k(1), tc(cd), tc(ip), tc(ii)]);
             s.prem(0, F_SPINE, [c(t0), c(h), c(params), Some(Z)], r);
             let a = s.val(E::Tm(ch(f(3), 2), Part::Id));
@@ -3113,8 +3711,16 @@ fn fact_spec(rule: &str) -> Spec {
         }
         // The next field: `proj I (k + 1) a`, one fewer to come.
         "EtaNext" => {
-            let (g, t, rest, pj) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2), fld(&mut s, 3));
-            let (tp, fk) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            let (g, t, rest, pj) = (
+                fld(&mut s, 0),
+                fld(&mut s, 1),
+                fld(&mut s, 2),
+                fld(&mut s, 3),
+            );
+            let (tp, fk) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+            );
             s.term(t, f(1), k(K_APP), [c(tp), c(fk), Some(Z)], None);
             let (rp, pp) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(0, Part::X(3))));
             s.prem(0, F_ETAW, [c(g), c(tp), c(rp), c(pp)], r);
@@ -3158,11 +3764,20 @@ fn fact_spec(rule: &str) -> Spec {
         // fun x : A => f x is f, for f closed of a type pi B _ with A = B.
         "Eta" => {
             let (g, a, b) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
-            let (dom, body) = (s.val(E::Tm(ch(f(1), 0), Part::Id)), s.val(E::Tm(ch(f(1), 1), Part::Id)));
+            let (dom, body) = (
+                s.val(E::Tm(ch(f(1), 0), Part::Id)),
+                s.val(E::Tm(ch(f(1), 1), Part::Id)),
+            );
             s.term(a, f(1), k(K_LAM), [c(dom), c(body), Some(Z)], None);
             let x = s.val(E::Tm(ch(ch(f(1), 1), 1), Part::Id));
             s.term(body, ch(f(1), 1), k(K_APP), [c(b), c(x), Some(Z)], None);
-            s.term(x, ch(ch(f(1), 1), 1), k(K_BVAR), [Some(one), Some(Z), Some(Z)], None);
+            s.term(
+                x,
+                ch(ch(f(1), 1), 1),
+                k(K_BVAR),
+                [Some(one), Some(Z), Some(Z)],
+                None,
+            );
             closed(&mut s, b);
             let (ft, pt) = (s.val(E::Prem(0, Part::X(2))), s.val(E::Prem(1, Part::X(2))));
             s.prem(0, F_INFER, [c(g), c(b), c(ft), Some(Z)], r);
@@ -3195,23 +3810,47 @@ fn fact_spec(rule: &str) -> Spec {
             );
             s.recv([k(TAG_CTX), tc(g), tc(gp_), tc(ga), tc(ng)]);
             let var = s.val(E::Prem(2, Part::X(2)));
-            s.term(var, TR::PFld(2, 2), k(K_FVAR), [c(ng), Some(Z), Some(Z)], None);
+            s.term(
+                var,
+                TR::PFld(2, 2),
+                k(K_FVAR),
+                [c(ng), Some(Z), Some(Z)],
+                None,
+            );
             let ext = s.val(E::Prem(3, Part::X(0)));
             let ng1 = s.out(Col::Lin(G, ng));
             s.recv([k(TAG_CTX), tc(ext), tc(g), tc(a), tc(ng1)]);
             // The body does not mention the variable already.
             s.term(b, ch(f(1), 1), T::Id, [None; 3], None);
             let fc = s.last_f;
-            s.ge(ng, E::Tm(f(0), Part::X(2)), fc, E::Tm(ch(f(1), 1), Part::F), 0);
+            s.ge(
+                ng,
+                E::Tm(f(0), Part::X(2)),
+                fc,
+                E::Tm(ch(f(1), 1), Part::F),
+                0,
+            );
             let sa = s.val(E::Prem(0, Part::X(2)));
             let su = s.val(E::Prem(1, Part::X(2)));
             let u = s.val(E::Tm(TR::PFld(1, 2), Part::X(1)));
-            s.term(su, TR::PFld(1, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(u), Some(Z)], None);
+            s.term(
+                su,
+                TR::PFld(1, 2),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), c(u), Some(Z)],
+                None,
+            );
             let bo = s.val(E::Prem(2, Part::X(3)));
             let sb = s.val(E::Prem(3, Part::X(2)));
             let sv = s.val(E::Prem(4, Part::X(2)));
             let v = s.val(E::Tm(TR::PFld(4, 2), Part::X(1)));
-            s.term(sv, TR::PFld(4, 2), k(K_LEAF), [Some(k(SUB_SORT)), c(v), Some(Z)], None);
+            s.term(
+                sv,
+                TR::PFld(4, 2),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), c(v), Some(Z)],
+                None,
+            );
             s.prem(0, F_INFER, [c(g), c(a), c(sa), Some(Z)], r);
             s.prem(1, F_EQ, [c(g), c(sa), c(su), Some(Z)], r);
             s.prem(2, F_INST, [c(b), Some(one), c(var), c(bo)], r);
@@ -3222,7 +3861,13 @@ fn fact_spec(rule: &str) -> Spec {
                 let one_ = s.val(E::Prem(j, Part::X(0)));
                 let zero = s.val(E::Tm(ch(TR::PFld(j, 0), 0), Part::Id));
                 s.level(one_, TR::PFld(j, 0), Some(k(K_LSUCC)), c(zero), Some(Z));
-                s.level(zero, ch(TR::PFld(j, 0), 0), Some(k(K_LLEAF)), Some(Z), Some(Z));
+                s.level(
+                    zero,
+                    ch(TR::PFld(j, 0), 0),
+                    Some(k(K_LLEAF)),
+                    Some(Z),
+                    Some(Z),
+                );
                 s.prem(j, F_LLE, [c(one_), c(v), Some(Z), Some(Z)], r);
             };
             let w = match rule {
@@ -3263,9 +3908,18 @@ fn fact_spec(rule: &str) -> Spec {
         "Sort" => {
             // sort l : sort (succ l).
             let (g, e, t) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
-            let (l, l2) = (s.val(E::Tm(f(1), Part::X(1))), s.val(E::Tm(f(2), Part::X(1))));
+            let (l, l2) = (
+                s.val(E::Tm(f(1), Part::X(1))),
+                s.val(E::Tm(f(2), Part::X(1))),
+            );
             s.term(e, f(1), k(K_LEAF), [Some(k(SUB_SORT)), c(l), Some(Z)], None);
-            s.term(t, f(2), k(K_LEAF), [Some(k(SUB_SORT)), c(l2), Some(Z)], None);
+            s.term(
+                t,
+                f(2),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), c(l2), Some(Z)],
+                None,
+            );
             s.level(l2, ch(f(2), 1), Some(k(K_LSUCC)), c(l), Some(Z));
             send(&mut s, F_INFER, [tc(g), tc(e), tc(t), Z]);
         }
@@ -3275,9 +3929,24 @@ fn fact_spec(rule: &str) -> Spec {
             let (x0, x1, x2) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
             let (ia, ib) = if cong { (1, 2) } else { (0, 2) };
             let (a, b) = if cong { (x1, x2) } else { (x0, x2) };
-            let (l, m) = (s.val(E::Tm(f(ia), Part::X(1))), s.val(E::Tm(f(ib), Part::X(1))));
-            s.term(a, f(ia), k(K_LEAF), [Some(k(SUB_SORT)), c(l), Some(Z)], None);
-            s.term(b, f(ib), k(K_LEAF), [Some(k(SUB_SORT)), c(m), Some(Z)], None);
+            let (l, m) = (
+                s.val(E::Tm(f(ia), Part::X(1))),
+                s.val(E::Tm(f(ib), Part::X(1))),
+            );
+            s.term(
+                a,
+                f(ia),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), c(l), Some(Z)],
+                None,
+            );
+            s.term(
+                b,
+                f(ib),
+                k(K_LEAF),
+                [Some(k(SUB_SORT)), c(m), Some(Z)],
+                None,
+            );
             if cong {
                 s.prem(0, F_LEQ, [c(l), c(m), Some(Z), Some(Z)], r);
                 send(&mut s, F_EQ, [tc(x0), tc(a), tc(b), Z]);
@@ -3286,7 +3955,8 @@ fn fact_spec(rule: &str) -> Spec {
                 send(&mut s, F_LINST, [tc(a), tc(x1), tc(b), Z]);
             }
         }
-        "CongConst1" | "CongConst2" | "CongConst3" | "LInstConst1" | "LInstConst2" | "LInstConst3" => {
+        "CongConst1" | "CongConst2" | "CongConst3" | "LInstConst1" | "LInstConst2"
+        | "LInstConst3" => {
             // The same constant over level lists of this length, level by
             // level equivalent or substituted.
             let cong = rule.starts_with("Cong");
@@ -3295,9 +3965,18 @@ fn fact_spec(rule: &str) -> Spec {
             let (ia, ib) = if cong { (1, 2) } else { (0, 2) };
             let (a, b) = if cong { (x1, x2) } else { (x0, x2) };
             let d = s.val(E::Tm(f(ia), Part::X(1)));
-            let (ms, ms2) = (s.val(E::Tm(f(ia), Part::X(2))), s.val(E::Tm(f(ib), Part::X(2))));
+            let (ms, ms2) = (
+                s.val(E::Tm(f(ia), Part::X(2))),
+                s.val(E::Tm(f(ib), Part::X(2))),
+            );
             s.term(a, f(ia), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ms)], None);
-            s.term(b, f(ib), k(K_LEAF), [Some(k(SUB_CONST)), c(d), c(ms2)], None);
+            s.term(
+                b,
+                f(ib),
+                k(K_LEAF),
+                [Some(k(SUB_CONST)), c(d), c(ms2)],
+                None,
+            );
             let (mut la, mut lb) = (ms, ms2);
             let (mut ta, mut tb) = (ch(f(ia), 2), ch(f(ib), 2));
             for j in 0..n {
@@ -3344,8 +4023,12 @@ fn fact_spec(rule: &str) -> Spec {
                 "LInstLMax" => (K_LMAX, 2),
                 _ => (K_LIMAX, 2),
             };
-            let p: Vec<usize> = (0..n).map(|i| s.val(E::Tm(ch(f(0), i), Part::Id))).collect();
-            let q: Vec<usize> = (0..n).map(|i| s.val(E::Tm(ch(f(2), i), Part::Id))).collect();
+            let p: Vec<usize> = (0..n)
+                .map(|i| s.val(E::Tm(ch(f(0), i), Part::Id)))
+                .collect();
+            let q: Vec<usize> = (0..n)
+                .map(|i| s.val(E::Tm(ch(f(2), i), Part::Id)))
+                .collect();
             let second = |v: &[usize]| if n == 2 { c(v[1]) } else { Some(Z) };
             s.level(l, f(0), Some(k(kind)), c(p[0]), second(&p));
             s.level(res, f(2), Some(k(kind)), c(q[0]), second(&q));
@@ -3354,8 +4037,8 @@ fn fact_spec(rule: &str) -> Spec {
             }
             send(&mut s, F_LINSTL, [tc(l), tc(ls), tc(res), Z]);
         }
-        "LInstLParam0" | "LInstLParam1" | "LInstLParam2" | "LInstLParam3" | "LInstLParam4" | "LInstLParam5"
-        | "LInstLParam6" | "LInstLParam7" => {
+        "LInstLParam0" | "LInstLParam1" | "LInstLParam2" | "LInstLParam3" | "LInstLParam4"
+        | "LInstLParam5" | "LInstLParam6" | "LInstLParam7" => {
             // Parameter i gives the list's entry i.
             let i = (rule.as_bytes()[rule.len() - 1] - b'0') as usize;
             let (l, ls, res) = (fld(&mut s, 0), fld(&mut s, 1), fld(&mut s, 2));
@@ -3466,7 +4149,11 @@ fn table_of(g: &Rows, rows: &Rows, i: usize) -> Of {
         // What an operation gives is a literal or a boolean.
         "NatBin" => {
             let b = &g.terms[f.raw[2] as usize];
-            if b.kind == K_LEAF && b.x[0].f.lo == SUB_LIT { "NatBinN" } else { "NatBinB" }
+            if b.kind == K_LEAF && b.x[0].f.lo == SUB_LIT {
+                "NatBinN"
+            } else {
+                "NatBinB"
+            }
         }
         "LitStr" => "LitStr",
         "NZSucc" => "NZSucc",
@@ -3739,7 +4426,12 @@ impl LeanCircuit {
     /// it on the bus: `f(table, send, tuple, count)` per row and port (a
     /// receive counts once per real row, a send its count bits). For
     /// balance checks without proving.
-    pub fn for_each_tuple(&self, s: usize, ch: usize, mut f: impl FnMut(usize, bool, &[F128], u64)) {
+    pub fn for_each_tuple(
+        &self,
+        s: usize,
+        ch: usize,
+        mut f: impl FnMut(usize, bool, &[F128], u64),
+    ) {
         let nu = self.nu;
         let sp = &self.specs[s];
         let cols: Vec<Col> = sp.cols.iter().map(|c| c.0).collect();
@@ -3762,9 +4454,10 @@ impl LeanCircuit {
                 let n = if p.mult.is_empty() {
                     1
                 } else {
-                    p.mult.iter().enumerate().fold(0u64, |a, (i, &c)| {
-                        a | (u64::from(z[c] == F128::ONE) << i)
-                    })
+                    p.mult
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |a, (i, &c)| a | (u64::from(z[c] == F128::ONE) << i))
                 };
                 f(s, p.send, &tup, n);
             }
@@ -3876,7 +4569,11 @@ impl LeanCircuit {
                 .facts
                 .iter()
                 .map(|f| f.rank.max(f.owner))
-                .chain(g.terms.iter().map(|t| (t.rank + t.lbr).max(t.fv + 1).max(t.x[2].e + 1)))
+                .chain(
+                    g.terms
+                        .iter()
+                        .map(|t| (t.rank + t.lbr).max(t.fv + 1).max(t.x[2].e + 1)),
+                )
                 .chain(g.decls.iter().map(|d| d.order + 1))
                 .max()
                 .unwrap_or(0);
@@ -3974,7 +4671,9 @@ impl LeanCircuit {
                 }
             } else if (f.tag == F_INST || f.tag == F_HAS) && x == 1 {
                 ve(f.raw[1] as i64)
-            } else if (matches!(f.tag, F_SPINE | F_PRE | F_ETAW) && x == 2) || (f.tag == F_EXT && x == 3) {
+            } else if (matches!(f.tag, F_SPINE | F_PRE | F_ETAW) && x == 2)
+                || (f.tag == F_EXT && x == 3)
+            {
                 ve(f.raw[x] as i64)
             } else {
                 vi(f.raw[x])
@@ -4012,14 +4711,28 @@ impl LeanCircuit {
                 Part::O => unreachable!(),
             }
         };
-        let decl_by_key: HashMap<(u64, u64), usize> = g.decls.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+        let decl_by_key: HashMap<(u64, u64), usize> = g
+            .decls
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.key, i))
+            .collect();
         let rule_part = |i: usize, p: Part| -> V {
             let r = &g.rules[i];
             match p {
-                Part::X(0) => V { f: decl_id(r.rec), e: 0 },
-                Part::X(1) => V { f: decl_id(decl_by_key[&r.ctor]), e: 0 },
+                Part::X(0) => V {
+                    f: decl_id(r.rec),
+                    e: 0,
+                },
+                Part::X(1) => V {
+                    f: decl_id(decl_by_key[&r.ctor]),
+                    e: 0,
+                },
                 Part::X(2) => ve(r.fields as i64),
-                Part::X(3) => V { f: term_id(r.rhs), e: 0 },
+                Part::X(3) => V {
+                    f: term_id(r.rhs),
+                    e: 0,
+                },
                 Part::X(4) => vi(g.decls[r.rec].key.0),
                 Part::X(5) => vi(g.decls[r.rec].key.1),
                 Part::X(6) => vi(r.ctor.0),
@@ -4052,8 +4765,14 @@ impl LeanCircuit {
                 // A constructor's inductive type; the one constructor
                 // of an inductive type that has one.
                 Part::X(9) => match (d.info.what, decl_by_key.get(&d.info.key)) {
-                    (2, Some(&t)) => V { f: decl_id(t), e: 0 },
-                    (1, Some(&t)) if d.info.key != (0, 0) => V { f: decl_id(t), e: 0 },
+                    (2, Some(&t)) => V {
+                        f: decl_id(t),
+                        e: 0,
+                    },
+                    (1, Some(&t)) if d.info.key != (0, 0) => V {
+                        f: decl_id(t),
+                        e: 0,
+                    },
                     _ => V::default(),
                 },
                 Part::R => ve(d.order),
@@ -4143,39 +4862,39 @@ impl LeanCircuit {
         let mut tables: Vec<Vec<Vec<F128>>> = Vec::new();
         // An input's value for the row `own` of kind `of`.
         let value = |src: &Src, of: &Of, own: usize, name: &str| -> Result<F128, String> {
-                    Ok(match src {
-                        Src::Val(e) | Src::Pub(e) => eval(e, *of, own).f,
-                        Src::Limb(e, l) => {
-                            let x = eval(e, *of, own).e;
-                            assert!(x >= 0 && x >> (2 * limb) == 0, "an index out of range");
-                            if *l == 0 {
-                                gp(x & lmask)
-                            } else {
-                                pow(h, (x >> limb) as u128)
-                            }
-                        }
-                        Src::GeA(ex, ey, cc) | Src::GeI(ex, ey, cc) => {
-                            let (x, y) = (eval(ex, *of, own), eval(ey, *of, own));
-                            let d = x.e - y.e - cc;
-                            if d < 0 || d >> (2 * limb) != 0 {
-                                return Err(format!("{name}: {} ≥ {} + {cc} fails", x.e, y.e));
-                            }
-                            let a0 = gp(d & lmask);
-                            if matches!(src, Src::GeA(..)) {
-                                a0
-                            } else {
-                                (gp(*cc) * y.f * a0).inv()
-                            }
-                        }
-                        Src::RangeV(l) => {
-                            if *l == 0 {
-                                gp(own as i64)
-                            } else {
-                                pow(h, own as u128)
-                            }
-                        }
-                        Src::Bit => F128::ZERO,
-                    })
+            Ok(match src {
+                Src::Val(e) | Src::Pub(e) => eval(e, *of, own).f,
+                Src::Limb(e, l) => {
+                    let x = eval(e, *of, own).e;
+                    assert!(x >= 0 && x >> (2 * limb) == 0, "an index out of range");
+                    if *l == 0 {
+                        gp(x & lmask)
+                    } else {
+                        pow(h, (x >> limb) as u128)
+                    }
+                }
+                Src::GeA(ex, ey, cc) | Src::GeI(ex, ey, cc) => {
+                    let (x, y) = (eval(ex, *of, own), eval(ey, *of, own));
+                    let d = x.e - y.e - cc;
+                    if d < 0 || d >> (2 * limb) != 0 {
+                        return Err(format!("{name}: {} ≥ {} + {cc} fails", x.e, y.e));
+                    }
+                    let a0 = gp(d & lmask);
+                    if matches!(src, Src::GeA(..)) {
+                        a0
+                    } else {
+                        (gp(*cc) * y.f * a0).inv()
+                    }
+                }
+                Src::RangeV(l) => {
+                    if *l == 0 {
+                        gp(own as i64)
+                    } else {
+                        pow(h, own as u128)
+                    }
+                }
+                Src::Bit => F128::ZERO,
+            })
         };
         for (s, of) in ofs.iter().enumerate() {
             let sp = &specs[s];
@@ -4247,8 +4966,7 @@ impl LeanCircuit {
                         None => {
                             return Err(format!(
                                 "{}: row {j} of rule {:?} does not derive its fact",
-                                sp.name,
-                                sp.groups[rule_of[s][j]].of
+                                sp.name, sp.groups[rule_of[s][j]].of
                             ));
                         }
                     }
@@ -4606,7 +5324,9 @@ pub fn leaf(
                 p.t.iter()
                     .enumerate()
                     .map(|(ti, t)| match *t {
-                        T::K(_) if ti == 0 && tag_col[pi].is_some() => BusTerm::word(io[tag_col[pi].unwrap()]),
+                        T::K(_) if ti == 0 && tag_col[pi].is_some() => {
+                            BusTerm::word(io[tag_col[pi].unwrap()])
+                        }
                         T::C(c) => BusTerm::word(io[c]),
                         T::K(v) => BusTerm {
                             word: None,
@@ -4649,7 +5369,11 @@ pub fn leaf(
                 .filter(|(_, c)| matches!(c.1, Some(Src::Pub(_))))
                 .map(|(y, _)| y)
                 .collect();
-            let recv = sp.ports.iter().position(|p| !p.send).expect("the CHECKED receive");
+            let recv = sp
+                .ports
+                .iter()
+                .position(|p| !p.send)
+                .expect("the CHECKED receive");
             let live = live_col[recv].expect("a receive has a live bit");
             let mut terms = vec![
                 BusTerm {
@@ -4660,27 +5384,61 @@ pub fn leaf(
                 BusTerm::word(io[pubs[0]]),
                 BusTerm::word(io[pubs[1]]),
             ];
-            terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
+            terms.resize(
+                W,
+                BusTerm {
+                    word: None,
+                    constant: F128::ZERO,
+                    row: None,
+                },
+            );
             sb.bus_port_counted(slot, BusDirection::Send, terms, vec![io[live]]);
         }
         // A literal's rule reads the key of its type from the verifier, who
         // sends the statement's key of `Nat` (`String`) once per such row.
         if let Some(number) = prim_of(&sp.name) {
             let keys = prim_key_cols(sp);
-            let live = live_col.iter().flatten().next().copied().expect("a rule has a live bit");
-            let konst = |v: u64| BusTerm { word: None, constant: int(v), row: None };
-            let mut terms = vec![konst(TAG_PRIM), konst(number), BusTerm::word(io[keys[0]]), BusTerm::word(io[keys[1]])];
-            terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
+            let live = live_col
+                .iter()
+                .flatten()
+                .next()
+                .copied()
+                .expect("a rule has a live bit");
+            let konst = |v: u64| BusTerm {
+                word: None,
+                constant: int(v),
+                row: None,
+            };
+            let mut terms = vec![
+                konst(TAG_PRIM),
+                konst(number),
+                BusTerm::word(io[keys[0]]),
+                BusTerm::word(io[keys[1]]),
+            ];
+            terms.resize(
+                W,
+                BusTerm {
+                    word: None,
+                    constant: F128::ZERO,
+                    row: None,
+                },
+            );
             sb.bus_port_counted(slot, BusDirection::Recv, terms, vec![io[live]]);
         }
         // A step of arithmetic reads what it gives from the verifier.
         for (t, own) in &sp.verifier {
-            let live = own.or_else(|| live_col.iter().flatten().next().copied()).expect("a rule has a live bit");
+            let live = own
+                .or_else(|| live_col.iter().flatten().next().copied())
+                .expect("a rule has a live bit");
             let terms: Vec<BusTerm> = t
                 .iter()
                 .map(|x| match *x {
                     T::C(c) => BusTerm::word(io[c]),
-                    T::K(v) => BusTerm { word: None, constant: v, row: None },
+                    T::K(v) => BusTerm {
+                        word: None,
+                        constant: v,
+                        row: None,
+                    },
                     T::Id => unreachable!("the verifier does not know a row's id"),
                 })
                 .collect();
@@ -4735,7 +5493,14 @@ pub fn leaf(
         },
         BusTerm::word(0),
     ];
-    terms.resize(W, BusTerm { word: None, constant: F128::ZERO, row: None });
+    terms.resize(
+        W,
+        BusTerm {
+            word: None,
+            constant: F128::ZERO,
+            row: None,
+        },
+    );
     sb.bus_port_counted(tslot, BusDirection::Send, terms, Vec::new());
     for &w in &word_ws {
         sb.gate(tslot, &[w]);
@@ -4766,7 +5531,12 @@ pub fn rule_table() -> usize {
 }
 
 pub fn rare_table() -> usize {
-    2 + TERM_TABLES.len() + 4 + FACT_TABLES.iter().filter(|r| **r != "Assumed" && rare_place(r).is_none()).count()
+    2 + TERM_TABLES.len()
+        + 4
+        + FACT_TABLES
+            .iter()
+            .filter(|r| **r != "Assumed" && rare_place(r).is_none())
+            .count()
 }
 
 /// The constant a table's rule reads from the verifier, if it reads one.
@@ -4793,7 +5563,11 @@ fn prim_key_cols(sp: &Spec) -> Vec<usize> {
 
 /// The constants a leaf's rows read from the verifier: per row, the number
 /// and the key the row holds for it ([`prims_product`]).
-pub fn leaf_prims(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> Vec<(u64, [F128; 2])> {
+pub fn leaf_prims(
+    proto: &LeanCircuit,
+    profile: &Profile,
+    slots: &[LeafSlot<'_>],
+) -> Vec<(u64, [F128; 2])> {
     let mut out = Vec::new();
     for (k, &s) in profile.slots.iter().enumerate() {
         let sp = &proto.specs[s];
@@ -4817,7 +5591,10 @@ pub fn prims_product(ch: &SharedChallenges, prims: &[(u64, [F128; 2])]) -> Resul
             return Err(format!("two keys for the constant {number}"));
         }
         let mut acc = ch.beta;
-        for (x, &g) in [int(TAG_PRIM), int(number), key[0], key[1]].iter().zip(&ch.gamma) {
+        for (x, &g) in [int(TAG_PRIM), int(number), key[0], key[1]]
+            .iter()
+            .zip(&ch.gamma)
+        {
             acc += g * *x;
         }
         p *= acc;
@@ -4862,7 +5639,10 @@ fn arith_eval(op: u64, x: u64, y: u64) -> Option<Result<u64, bool>> {
         4 => n(x.checked_add(y)),
         5 => n(Some(x.saturating_sub(y))),
         6 => n(x.checked_mul(y)),
-        7 => n(u32::try_from(y).ok().filter(|e| *e <= 1 << 24).and_then(|e| x.checked_pow(e))),
+        7 => n(u32::try_from(y)
+            .ok()
+            .filter(|e| *e <= 1 << 24)
+            .and_then(|e| x.checked_pow(e))),
         8 => {
             let (mut a, mut b) = (x, y);
             while b != 0 {
@@ -4887,7 +5667,8 @@ fn arith_eval(op: u64, x: u64, y: u64) -> Option<Result<u64, bool>> {
 /// comparison the number of the boolean its `out` key is the key of.
 pub fn arith_tuple(a: &Arith) -> Result<([F128; 7], Option<u64>), String> {
     let zero = F128::ZERO;
-    let r = arith_eval(a.op, a.x, a.y).ok_or(format!("no arithmetic for {} on {} and {}", a.op, a.x, a.y))?;
+    let r = arith_eval(a.op, a.x, a.y)
+        .ok_or(format!("no arithmetic for {} on {} and {}", a.op, a.x, a.y))?;
     let (hx, hy) = match a.op {
         2 => (zero, zero),
         3 => (int(lit_hash(a.x)), zero),
@@ -4898,7 +5679,10 @@ pub fn arith_tuple(a: &Arith) -> Result<([F128; 7], Option<u64>), String> {
             if a.out != [zero; 2] {
                 return Err("a number is not named by a key".into());
             }
-            ([a.key[0], a.key[1], hx, hy, int(lit_hash(v)), zero, zero], None)
+            (
+                [a.key[0], a.key[1], hx, hy, int(lit_hash(v)), zero, zero],
+                None,
+            )
         }
         Err(v) => (
             [a.key[0], a.key[1], hx, hy, a.out[0], a.out[1], F128::ONE],
@@ -4909,14 +5693,21 @@ pub fn arith_tuple(a: &Arith) -> Result<([F128; 7], Option<u64>), String> {
 
 /// The steps of arithmetic a leaf's rows read from the verifier, as the
 /// rows hold them: the tuple after its tag ([`arith_entry`] names each).
-pub fn leaf_arith(proto: &LeanCircuit, profile: &Profile, slots: &[LeafSlot<'_>]) -> Vec<[F128; 7]> {
+pub fn leaf_arith(
+    proto: &LeanCircuit,
+    profile: &Profile,
+    slots: &[LeafSlot<'_>],
+) -> Vec<[F128; 7]> {
     let mut out = Vec::new();
     for (k, &s) in profile.slots.iter().enumerate() {
         let sp = &proto.specs[s];
         let Some(c) = slots[k] else { continue };
         for (t, own) in &sp.verifier {
             // In a table of several rules, only the rule's own rows.
-            let rows = c.rows.iter().filter(|z| own.is_none_or(|l| z[l] == F128::ONE));
+            let rows = c
+                .rows
+                .iter()
+                .filter(|z| own.is_none_or(|l| z[l] == F128::ONE));
             out.extend(rows.map(|z| {
                 std::array::from_fn(|i| match t[i + 1] {
                     T::C(col) => z[col],
@@ -4937,17 +5728,35 @@ pub fn arith_entry(
     numbers: &HashMap<[u64; 2], u64>,
     lits: &HashMap<u64, u64>,
 ) -> Result<Arith, String> {
-    let op = *numbers.get(&[raw[0].lo, raw[1].lo]).ok_or("a step by a constant the kernel does not know")?;
-    let lit = |h: F128| lits.get(&h.lo).copied().ok_or(format!("a literal without a value: {:016x}", h.lo));
+    let op = *numbers
+        .get(&[raw[0].lo, raw[1].lo])
+        .ok_or("a step by a constant the kernel does not know")?;
+    let lit = |h: F128| {
+        lits.get(&h.lo)
+            .copied()
+            .ok_or(format!("a literal without a value: {:016x}", h.lo))
+    };
     let (x, y) = match op {
         2 => (0, 0),
         3 => (lit(raw[2])?, 0),
         _ => (lit(raw[2])?, lit(raw[3])?),
     };
-    let out = if raw[6] == F128::ONE { [raw[4], raw[5]] } else { [F128::ZERO; 2] };
-    let a = Arith { op, key: [raw[0], raw[1]], x, y, out };
+    let out = if raw[6] == F128::ONE {
+        [raw[4], raw[5]]
+    } else {
+        [F128::ZERO; 2]
+    };
+    let a = Arith {
+        op,
+        key: [raw[0], raw[1]],
+        x,
+        y,
+        out,
+    };
     if arith_tuple(&a)?.0 != *raw {
-        return Err(format!("the row does not hold what {op} gives on {x} and {y}"));
+        return Err(format!(
+            "the row does not hold what {op} gives on {x} and {y}"
+        ));
     }
     Ok(a)
 }
@@ -4955,7 +5764,10 @@ pub fn arith_entry(
 /// The verifier's sends for the arithmetic: per reading row, the step
 /// with what it gives, computed here. One key per operation and per
 /// boolean; whoever reads the statement compares them with the store's.
-pub fn arith_product(ch: &SharedChallenges, arith: &[Arith]) -> Result<(F128, Vec<(u64, [F128; 2])>), String> {
+pub fn arith_product(
+    ch: &SharedChallenges,
+    arith: &[Arith],
+) -> Result<(F128, Vec<(u64, [F128; 2])>), String> {
     let mut named: HashMap<u64, [F128; 2]> = HashMap::new();
     let mut name = |number: u64, key: [F128; 2]| {
         if *named.entry(number).or_insert(key) != key {
@@ -5431,12 +6243,22 @@ mod tests {
     #[test]
     fn a_false_level_step_is_refused() {
         for (was, bad) in [
-            ("F 12 LInstNone linst 0 1 0 0 :", "F 12 LInstNone linst 6 1 6 0 :"),
-            ("F 13 LInstLParam linstl 2 1 1 0 :", "F 13 LInstLParam linstl 2 1 0 0 :"),
+            (
+                "F 12 LInstNone linst 0 1 0 0 :",
+                "F 12 LInstNone linst 6 1 6 0 :",
+            ),
+            (
+                "F 13 LInstLParam linstl 2 1 1 0 :",
+                "F 13 LInstLParam linstl 2 1 0 0 :",
+            ),
             ("F 15 Sort infer 1 7 0 0 :", "F 15 Sort infer 1 0 0 0 :"),
         ] {
             assert!(SMALL.contains(was));
-            let rows = Rows::parse(&SMALL.replace(was, bad).replace("F 14 LInstSort linst 6 1 0 0 : 13", "F 14 Given linst 6 1 0 0 :")).unwrap();
+            let rows = Rows::parse(&SMALL.replace(was, bad).replace(
+                "F 14 LInstSort linst 6 1 0 0 : 13",
+                "F 14 Given linst 6 1 0 0 :",
+            ))
+            .unwrap();
             assert!(LeanCircuit::build(&rows).is_err(), "{bad}");
             let c = LeanCircuit::build_with(&rows, false).unwrap();
             assert!(c.prove_and_verify(false).is_err(), "{bad}");
@@ -5450,7 +6272,12 @@ mod tests {
             ("F 6 HasLast has 1 0 0 0 :", "F 6 HasLast has 1 1 0 0 :"),
         ] {
             assert!(SMALL.contains(was));
-            let rows = Rows::parse(&SMALL.replace(was, bad).replace("F 7 FVar infer 1 4 0 0 : 6", "F 7 Given infer 1 4 0 0 :")).unwrap();
+            let rows = Rows::parse(
+                &SMALL
+                    .replace(was, bad)
+                    .replace("F 7 FVar infer 1 4 0 0 : 6", "F 7 Given infer 1 4 0 0 :"),
+            )
+            .unwrap();
             assert!(LeanCircuit::build(&rows).is_err());
             let c = LeanCircuit::build_with(&rows, false).unwrap();
             assert!(c.prove_and_verify(false).is_err());
@@ -5474,7 +6301,10 @@ mod tests {
         for (text, rules) in [
             (LINEAR_CONST, &["PTelNil", "FTelNilS", "ProjTy"][..]),
             (LINEAR_COEFFS, &["FTelStep"][..]),
-            (AND_RIGHT, &["PTelApp", "FTelNilP", "FTelStepP0", "ProjTyP"][..]),
+            (
+                AND_RIGHT,
+                &["PTelApp", "FTelNilP", "FTelStepP0", "ProjTyP"][..],
+            ),
             (INHABITED_DEFAULT, &["FTelNilM", "NZMaxL"][..]),
             (HUGE_FUEL, &["LitNat"][..]),
         ] {
@@ -5482,7 +6312,10 @@ mod tests {
             for rule in rules {
                 assert!(rows.facts.iter().any(|f| f.rule == *rule), "missing {rule}");
             }
-            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+            LeanCircuit::build(&rows)
+                .unwrap()
+                .prove_and_verify(false)
+                .unwrap();
         }
     }
 
@@ -5506,11 +6339,19 @@ mod tests {
             .unwrap()
             .prove_and_verify(false)
             .is_err();
-        assert!(build_refused && proof_refused, "build refused: {build_refused}, proof refused: {proof_refused}");
+        assert!(
+            build_refused && proof_refused,
+            "build refused: {build_refused}, proof refused: {proof_refused}"
+        );
     }
 
     fn dump_term(rows: &Rows, id: usize) -> u64 {
-        (rows.terms.iter().position(|t| matches!(t.kind, K_BVAR..=K_PROJ | K_FVAR)).unwrap() + id) as u64
+        (rows
+            .terms
+            .iter()
+            .position(|t| matches!(t.kind, K_BVAR..=K_PROJ | K_FVAR))
+            .unwrap()
+            + id) as u64
     }
 
     // Supply an alternative premise with the same tag, owner and rank.
@@ -5528,11 +6369,16 @@ mod tests {
         let (mut rows, target) = focus_rule(&text, "PTelNil");
         let premise = rows.facts[target].premises[0];
         let original = rows.facts[premise].raw[1] as usize;
-        let other = rows.terms.iter().position(|t| {
-            t.kind == K_CONS && t.child[0].is_some_and(|i| {
-                rows.terms[i].kind == K_LLEAF && rows.terms[i].x[0].f.lo == 0
+        let other = rows
+            .terms
+            .iter()
+            .position(|t| {
+                t.kind == K_CONS
+                    && t.child[0].is_some_and(|i| {
+                        rows.terms[i].kind == K_LLEAF && rows.terms[i].x[0].f.lo == 0
+                    })
             })
-        }).unwrap();
+            .unwrap();
         assert_ne!(original, other);
         assert_eq!(rows.terms[original].x[2].e, rows.terms[other].x[2].e);
         rows.facts[premise].raw[1] = other as u64;
@@ -5579,7 +6425,12 @@ mod tests {
         let body = dump_term(&rows, 6);
         assert_eq!(rows.terms[body as usize].lbr, 1);
         let eq = alternative_premise(&mut rows, target, 1, [g, telescope, pi, 0]);
-        let inst = alternative_premise(&mut rows, target, 2, [body, 0, previous_projection, previous_projection]);
+        let inst = alternative_premise(
+            &mut rows,
+            target,
+            2,
+            [body, 0, previous_projection, previous_projection],
+        );
         rows.facts[target].raw[2] = previous_projection;
         rows.facts[target].premises[1..].copy_from_slice(&[eq, inst]);
         assert_rule_refused(&rows);
@@ -5603,7 +6454,10 @@ mod tests {
     }
 
     fn inhabited_with_max_zero() -> String {
-        format!("{}L 7 max 1 1\n", INHABITED_DEFAULT.replace("C 0 empty", "T 25 leaf sort 7 0\nC 0 empty"))
+        format!(
+            "{}L 7 max 1 1\n",
+            INHABITED_DEFAULT.replace("C 0 empty", "T 25 leaf sort 7 0\nC 0 empty")
+        )
     }
 
     #[test]
@@ -5645,17 +6499,26 @@ mod tests {
 
     #[test]
     fn arithmetic_derivations_prove() {
-        for (text, rules) in [(CHAR_OF_NAT, &["NatSucc", "NatBin"][..]), (NEG_OF_NAT, &["NatZero"][..])] {
+        for (text, rules) in [
+            (CHAR_OF_NAT, &["NatSucc", "NatBin"][..]),
+            (NEG_OF_NAT, &["NatZero"][..]),
+        ] {
             let rows = certified_rows(text);
             for rule in rules {
                 assert!(rows.facts.iter().any(|f| f.rule == *rule), "missing {rule}");
             }
             for i in 0..rows.facts.len() {
-                if matches!(rows.facts[i].rule.as_str(), "NatZero" | "NatSucc" | "NatBin") {
+                if matches!(
+                    rows.facts[i].rule.as_str(),
+                    "NatZero" | "NatSucc" | "NatBin"
+                ) {
                     assert_ne!(table_of(&rows, &rows, i), Of::Assumed);
                 }
             }
-            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+            LeanCircuit::build(&rows)
+                .unwrap()
+                .prove_and_verify(false)
+                .unwrap();
         }
     }
 
@@ -5699,27 +6562,60 @@ mod tests {
     }
 
     fn step(op: u64, x: u64, y: u64) -> Arith {
-        Arith { op, key: [int(100 + op), int(7)], x, y, out: [F128::ZERO; 2] }
+        Arith {
+            op,
+            key: [int(100 + op), int(7)],
+            x,
+            y,
+            out: [F128::ZERO; 2],
+        }
     }
 
     #[test]
     fn the_verifier_computes_what_a_step_gives() {
         let (t, b) = arith_tuple(&step(4, 2, 3)).unwrap();
-        assert_eq!((t[2], t[3], t[4], t[6], b), (int(lit_hash(2)), int(lit_hash(3)), int(lit_hash(5)), F128::ZERO, None));
+        assert_eq!(
+            (t[2], t[3], t[4], t[6], b),
+            (
+                int(lit_hash(2)),
+                int(lit_hash(3)),
+                int(lit_hash(5)),
+                F128::ZERO,
+                None
+            )
+        );
         assert_eq!(arith_tuple(&step(5, 2, 3)).unwrap().0[4], int(lit_hash(0)));
         assert_eq!(arith_tuple(&step(10, 7, 0)).unwrap().0[4], int(lit_hash(0)));
         assert_eq!(arith_tuple(&step(9, 7, 0)).unwrap().0[4], int(lit_hash(7)));
-        assert_eq!(arith_tuple(&step(3, 41, 0)).unwrap().0[4], int(lit_hash(42)));
+        assert_eq!(
+            arith_tuple(&step(3, 41, 0)).unwrap().0[4],
+            int(lit_hash(42))
+        );
         // A comparison gives a boolean, named by the key the rows hold.
-        let le = Arith { out: [int(5), int(6)], ..step(12, 2, 3) };
+        let le = Arith {
+            out: [int(5), int(6)],
+            ..step(12, 2, 3)
+        };
         let (t, b) = arith_tuple(&le).unwrap();
-        assert_eq!((t[4], t[5], t[6], b), (int(5), int(6), F128::ONE, Some(PRIM_BOOL_TRUE)));
-        assert_eq!(arith_tuple(&Arith { op: 11, ..le }).unwrap().1, Some(PRIM_BOOL_FALSE));
+        assert_eq!(
+            (t[4], t[5], t[6], b),
+            (int(5), int(6), F128::ONE, Some(PRIM_BOOL_TRUE))
+        );
+        assert_eq!(
+            arith_tuple(&Arith { op: 11, ..le }).unwrap().1,
+            Some(PRIM_BOOL_FALSE)
+        );
         // What does not fit, and what the kernel does not evaluate.
         assert!(arith_tuple(&step(6, u64::MAX, 2)).is_err());
         assert!(arith_tuple(&step(3, 1, 1)).is_err());
         assert!(arith_tuple(&step(1, 1, 1)).is_err());
-        assert!(arith_tuple(&Arith { out: [int(1), F128::ZERO], ..step(4, 2, 3) }).is_err());
+        assert!(
+            arith_tuple(&Arith {
+                out: [int(1), F128::ZERO],
+                ..step(4, 2, 3)
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -5743,18 +6639,34 @@ mod tests {
 
     #[test]
     fn a_statement_names_one_key_for_each_operation() {
-        let ch = SharedChallenges { beta: int(3), gamma: (0..W as u64).map(|i| int(5 + i)).collect() };
-        let (p, named) = arith_product(&ch, &[step(4, 2, 3), step(4, 1, 1), step(5, 1, 1)]).unwrap();
+        let ch = SharedChallenges {
+            beta: int(3),
+            gamma: (0..W as u64).map(|i| int(5 + i)).collect(),
+        };
+        let (p, named) =
+            arith_product(&ch, &[step(4, 2, 3), step(4, 1, 1), step(5, 1, 1)]).unwrap();
         assert_ne!(p, F128::ONE);
         assert_eq!(named.iter().map(|x| x.0).collect::<Vec<_>>(), [4, 5]);
-        let other = Arith { key: [int(1), int(1)], ..step(4, 1, 1) };
+        let other = Arith {
+            key: [int(1), int(1)],
+            ..step(4, 1, 1)
+        };
         assert!(arith_product(&ch, &[step(4, 2, 3), other]).is_err());
         // The two booleans are constants of their own.
-        let t = Arith { out: [int(5), int(6)], ..step(12, 2, 3) };
-        let f = Arith { out: [int(5), int(6)], ..step(12, 3, 2) };
+        let t = Arith {
+            out: [int(5), int(6)],
+            ..step(12, 2, 3)
+        };
+        let f = Arith {
+            out: [int(5), int(6)],
+            ..step(12, 3, 2)
+        };
         assert!(arith_product(&ch, &[t, t]).is_ok());
         assert!(arith_product(&ch, &[t, f]).is_ok());
-        let t2 = Arith { out: [int(8), int(6)], ..step(11, 2, 2) };
+        let t2 = Arith {
+            out: [int(8), int(6)],
+            ..step(11, 2, 2)
+        };
         assert!(arith_product(&ch, &[t, t2]).is_err());
     }
 
@@ -5776,7 +6688,10 @@ mod tests {
             let rows = certified_rows(text);
             assert!(rows.facts.iter().any(|f| f.rule == rule), "missing {rule}");
             assert!(rows.rule_census(&rows)[rule].1, "{rule} is taken as given");
-            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+            LeanCircuit::build(&rows)
+                .unwrap()
+                .prove_and_verify(false)
+                .unwrap();
         }
     }
 
@@ -5841,9 +6756,15 @@ mod tests {
         ] {
             let rows = certified_rows(text);
             for rule in rules {
-                assert!(rows.rule_census(&rows).get(*rule).is_some_and(|x| x.1), "{rule} is missing or taken as given");
+                assert!(
+                    rows.rule_census(&rows).get(*rule).is_some_and(|x| x.1),
+                    "{rule} is missing or taken as given"
+                );
             }
-            LeanCircuit::build(&rows).unwrap().prove_and_verify(false).unwrap();
+            LeanCircuit::build(&rows)
+                .unwrap()
+                .prove_and_verify(false)
+                .unwrap();
         }
     }
 
@@ -5943,7 +6864,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, d)| {
-                let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
+                let slots: Vec<LeafSlot<'_>> = d
+                    .iter()
+                    .zip(&profile.slots)
+                    .map(|(x, &s)| x.map(|ch| c.slot(s, ch)))
+                    .collect();
                 leaf(&c, &profile, &slots, i).unwrap()
             })
             .collect();
@@ -5965,24 +6890,40 @@ mod tests {
         }
         let (mut words, mut keys) = (Vec::new(), Vec::new());
         for (i, d) in dealt.iter().enumerate() {
-            let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = d
+                .iter()
+                .zip(&profile.slots)
+                .map(|(x, &s)| x.map(|ch| c.slot(s, ch)))
+                .collect();
             let (w, k) = leaf_statement(&c, &profile, &slots, i);
             words.extend(w);
             keys.extend(k);
         }
         let st = statement_product(&ch, &words, &keys).unwrap();
-        assert!(!shared_balance(&proofs), "the statement is part of the balance");
-        assert!(shared_balance_with(&proofs, st), "the leaves balance with the statement");
+        assert!(
+            !shared_balance(&proofs),
+            "the statement is part of the balance"
+        );
+        assert!(
+            shared_balance_with(&proofs, st),
+            "the leaves balance with the statement"
+        );
         if let Some(k) = keys.first().copied() {
             let mut more = keys.clone();
             more.push(k);
             let st2 = statement_product(&ch, &words, &more).unwrap();
-            assert!(!shared_balance_with(&proofs, st2), "a key claimed twice unbalances the bus");
+            assert!(
+                !shared_balance_with(&proofs, st2),
+                "a key claimed twice unbalances the bus"
+            );
         }
         let mut other = words.clone();
         other[0] = (PAD_CHUNK + (1 << 30)) << 32;
         let st3 = statement_product(&ch, &other, &keys).unwrap();
-        assert!(!shared_balance_with(&proofs, st3), "another chunk word unbalances the bus");
+        assert!(
+            !shared_balance_with(&proofs, st3),
+            "another chunk word unbalances the bus"
+        );
         proofs.pop();
         assert!(
             !shared_balance_with(&proofs, st),
@@ -6009,7 +6950,11 @@ mod tests {
         let leaves: Vec<Piece> = dealt
             .iter()
             .map(|d| {
-                let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
+                let slots: Vec<LeafSlot<'_>> = d
+                    .iter()
+                    .zip(&profile.slots)
+                    .map(|(x, &s)| x.map(|ch| c.slot(s, ch)))
+                    .collect();
                 leaf(&c, &profile, &slots, 0).unwrap()
             })
             .collect();
@@ -6023,7 +6968,11 @@ mod tests {
             .collect();
         let (mut words, mut keys) = (Vec::new(), Vec::new());
         for d in &dealt {
-            let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = d
+                .iter()
+                .zip(&profile.slots)
+                .map(|(x, &s)| x.map(|ch| c.slot(s, ch)))
+                .collect();
             let (w, k) = leaf_statement(&c, &profile, &slots, 0);
             words.extend(w);
             keys.extend(k);
@@ -6159,7 +7108,11 @@ impl Cone {
                 Some(&i) => i,
                 None => {
                     let i = self.shared.terms.len();
-                    self.span = self.span.max(t.rank + t.lbr).max(t.fv + 1).max(t.x[2].e + 1);
+                    self.span = self
+                        .span
+                        .max(t.rank + t.lbr)
+                        .max(t.fv + 1)
+                        .max(t.x[2].e + 1);
                     self.shared.terms.push(t);
                     self.terms.insert(key, i);
                     i
@@ -6184,7 +7137,12 @@ impl Cone {
             }
         }
         for r in &r.rules {
-            self.shared.rules.push(RuleRec { rec: decl[r.rec], ctor: r.ctor, fields: r.fields, rhs: tm[r.rhs] });
+            self.shared.rules.push(RuleRec {
+                rec: decl[r.rec],
+                ctor: r.ctor,
+                fields: r.fields,
+                rhs: tm[r.rhs],
+            });
         }
         // Judgements and the goal.
         let base = batch.facts.len();

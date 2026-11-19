@@ -64,7 +64,13 @@ impl StructureShape {
         let cell_cols = 1usize << (c.cells().mu() - nu);
         let live = c.live_mask();
         let heights: Vec<u64> = (0..base)
-            .map(|y| if y < cell_cols { live.counts[y] as u64 } else { 0 })
+            .map(|y| {
+                if y < cell_cols {
+                    live.counts[y] as u64
+                } else {
+                    0
+                }
+            })
             .collect();
         let area: u64 = heights.iter().sum();
         let m = log2_ceil(area as usize).max(1);
@@ -149,10 +155,17 @@ fn split(circuit: &Circuit, shape: &StructureShape, c: &MatrixClaim) -> Option<S
     cw[SIGMA_PLANE * base..(SIGMA_PLANE + 1) * base].fill(F128::ZERO);
     let g = m.row_marginal(&cw, rw.len());
     let rest = rw.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
-    let plane_eq = c.col.point[shape.slots_log..]
-        .iter()
-        .enumerate()
-        .fold(F128::ONE, |a, (j, &p)| a * if (SIGMA_PLANE >> j) & 1 == 1 { p } else { F128::ONE + p });
+    let plane_eq =
+        c.col.point[shape.slots_log..]
+            .iter()
+            .enumerate()
+            .fold(F128::ONE, |a, (j, &p)| {
+                a * if (SIGMA_PLANE >> j) & 1 == 1 {
+                    p
+                } else {
+                    F128::ONE + p
+                }
+            });
     Some(Split {
         rest,
         scale: c.row.low[0] * c.col.low[0] * plane_eq,
@@ -181,7 +194,15 @@ impl RootKey {
         let bl = self.blocks_log();
         if bl > 0 {
             f.push(Factor::Eq(
-                (0..bl).map(|j| if (b >> j) & 1 == 1 { F128::ONE } else { F128::ZERO }).collect(),
+                (0..bl)
+                    .map(|j| {
+                        if (b >> j) & 1 == 1 {
+                            F128::ONE
+                        } else {
+                            F128::ZERO
+                        }
+                    })
+                    .collect(),
             ));
         }
         let used = self.block_log + bl;
@@ -194,7 +215,12 @@ impl RootKey {
     /// Check every `(table index, claim)`. `circuits[i]` is table `i`'s
     /// circuit, whose counts and constants give the non-sigma planes; its
     /// sigma is never read.
-    pub fn verify(&self, circuits: &[&Circuit], claims: &[(usize, MatrixClaim)], proof: &RootKeyProof) -> bool {
+    pub fn verify(
+        &self,
+        circuits: &[&Circuit],
+        claims: &[(usize, MatrixClaim)],
+        proof: &RootKeyProof,
+    ) -> bool {
         let t_all = std::time::Instant::now();
         let n = self.tables.len();
         if circuits.len() != n
@@ -218,13 +244,20 @@ impl RootKey {
             }
         }
         if std::env::var_os("ROOT_KEY_TRACE").is_some() {
-            eprintln!("root key: shape checks {:.1} ms", t_all.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "root key: shape checks {:.1} ms",
+                t_all.elapsed().as_secs_f64() * 1e3
+            );
         }
         let mut ch = FsChallenger::new(DOMAIN);
         bind(&mut ch, self, claims);
         let mut items = Vec::new();
         for i in 0..n {
-            let group: Vec<MatrixClaim> = claims.iter().filter(|(t, _)| *t == i).map(|(_, c)| c.clone()).collect();
+            let group: Vec<MatrixClaim> = claims
+                .iter()
+                .filter(|(t, _)| *t == i)
+                .map(|(_, c)| c.clone())
+                .collect();
             let one = match (group.len(), &proof.folds[i]) {
                 (0, None) => None,
                 (1, None) => Some(group[0].clone()),
@@ -249,10 +282,21 @@ impl RootKey {
                         None if s.scale.is_zero() && sig.is_zero() => {}
                         Some(jp) if !s.scale.is_zero() => {
                             let v = sig * s.scale.inv();
-                            match jagged::verify_with_assist(&shape.params(), &s.z_row, &s.z_col, v, &jp.0, &jp.1, &mut ch) {
+                            match jagged::verify_with_assist(
+                                &shape.params(),
+                                &s.z_row,
+                                &s.z_col,
+                                v,
+                                &jp.0,
+                                &jp.1,
+                                &mut ch,
+                            ) {
                                 Some(d) => {
                                     if std::env::var_os("ROOT_KEY_TRACE").is_some() {
-                                        eprintln!("root key table {i}: split {split_ms:.1} ms, jagged {:.1} ms", t_j.elapsed().as_secs_f64() * 1e3);
+                                        eprintln!(
+                                            "root key table {i}: split {split_ms:.1} ms, jagged {:.1} ms",
+                                            t_j.elapsed().as_secs_f64() * 1e3
+                                        );
                                     }
                                     items.push((self.basis(i, shape.m, &d.point), d.alpha))
                                 }
@@ -272,7 +316,10 @@ impl RootKey {
             _ => false,
         };
         if std::env::var_os("ROOT_KEY_TRACE").is_some() {
-            eprintln!("root key: dense opening {:.1} ms", t_d.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "root key: dense opening {:.1} ms",
+                t_d.elapsed().as_secs_f64() * 1e3
+            );
         }
         out
     }
@@ -288,7 +335,8 @@ impl<'a> RootKeyTables<'a> {
                 uniq.push(c);
             }
         }
-        let (tables, q): (Vec<StructureShape>, Vec<Vec<F128>>) = uniq.iter().map(|c| StructureShape::of(c)).unzip();
+        let (tables, q): (Vec<StructureShape>, Vec<Vec<F128>>) =
+            uniq.iter().map(|c| StructureShape::of(c)).unzip();
         let block_log = tables.iter().map(|t| t.m).max()?;
         let blocks = tables.len().next_power_of_two();
         let mut vals = vec![F128::ZERO; blocks << block_log];
@@ -328,14 +376,20 @@ impl<'a> RootKeyTables<'a> {
         let mut jag = vec![None; n];
         let mut items = Vec::new();
         for i in 0..n {
-            let group: Vec<MatrixClaim> = claims.iter().filter(|(t, _)| *t == i).map(|(_, c)| c.clone()).collect();
+            let group: Vec<MatrixClaim> = claims
+                .iter()
+                .filter(|(t, _)| *t == i)
+                .map(|(_, c)| c.clone())
+                .collect();
             let m = SigmaAssertion::matrix(self.circuits[i]);
             let one = match group.len() {
                 0 => continue,
                 1 => group[0].clone(),
                 _ => {
-                    let combs: Vec<Vec<F128>> =
-                        group.iter().map(|c| m.col_marginal(&c.row.materialize(), m.n_cols())).collect();
+                    let combs: Vec<Vec<F128>> = group
+                        .iter()
+                        .map(|c| m.col_marginal(&c.row.materialize(), m.n_cols()))
+                        .collect();
                     let (p, c) = prove_fold(&m, &combs, &group, &mut ch);
                     folds[i] = Some(p);
                     c
@@ -353,11 +407,13 @@ impl<'a> RootKeyTables<'a> {
             let v = sig * s.scale.inv();
             let params = shape.params();
             let mut replay = ch.clone();
-            let (jp, ja, honest) = jagged::prove_with_assist(&params, &self.q[i], &s.z_row, &s.z_col, &mut ch);
+            let (jp, ja, honest) =
+                jagged::prove_with_assist(&params, &self.q[i], &s.z_row, &s.z_col, &mut ch);
             if honest != v {
                 return None;
             }
-            let d = jagged::verify_with_assist(&params, &s.z_row, &s.z_col, v, &jp, &ja, &mut replay)?;
+            let d =
+                jagged::verify_with_assist(&params, &s.z_row, &s.z_col, v, &jp, &ja, &mut replay)?;
             items.push((self.key.basis(i, shape.m, &d.point), d.alpha));
             jag[i] = Some((jp, ja));
         }

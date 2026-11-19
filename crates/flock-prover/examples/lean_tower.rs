@@ -20,10 +20,13 @@ use std::{collections::HashMap, fs, path::Path, time::Instant};
 use flock_field::F128;
 
 use flock_prover::{
-    lean_rows::{Arith, arith_entry, lit_hash, LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, SlotRows, Tuple, leaf, leaf_arith, leaf_prims, leaf_statement},
+    lean_rows::{
+        Arith, LeafSlot, LeanCircuit, Profile, Rows, SHARED_BASE, Side, SlotRows, Tuple,
+        arith_entry, leaf, leaf_arith, leaf_prims, leaf_statement, lit_hash,
+    },
     tower::{
-        LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root, lean_segments_root,
-        prove_lean_segment, prove_lean_tower_streaming, segments_balanced,
+        LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root,
+        lean_segments_root, prove_lean_segment, prove_lean_tower_streaming, segments_balanced,
     },
 };
 
@@ -35,7 +38,12 @@ fn read<T: serde::de::DeserializeOwned>(p: impl AsRef<Path>) -> T {
 type P2 = (u64, u64);
 /// A statement on disk: chunk words, checked keys, the constants read and
 /// the steps of arithmetic.
-type StmtS = (Vec<u64>, Vec<[P2; 2]>, Vec<(u64, [P2; 2])>, Vec<(u64, [P2; 2], u64, u64, [P2; 2])>);
+type StmtS = (
+    Vec<u64>,
+    Vec<[P2; 2]>,
+    Vec<(u64, [P2; 2])>,
+    Vec<(u64, [P2; 2], u64, u64, [P2; 2])>,
+);
 
 fn stmt_ser(s: &LeanStatement) -> StmtS {
     let p = |k: &[F128; 2]| [(k[0].lo, k[0].hi), (k[1].lo, k[1].hi)];
@@ -43,7 +51,10 @@ fn stmt_ser(s: &LeanStatement) -> StmtS {
         s.chunk_words.clone(),
         s.keys.iter().map(p).collect(),
         s.prims.iter().map(|(n, k)| (*n, p(k))).collect(),
-        s.arith.iter().map(|a| (a.op, p(&a.key), a.x, a.y, p(&a.out))).collect(),
+        s.arith
+            .iter()
+            .map(|a| (a.op, p(&a.key), a.x, a.y, p(&a.out)))
+            .collect(),
     )
 }
 
@@ -53,7 +64,16 @@ fn stmt_de((chunk_words, keys, prims, arith): StmtS) -> LeanStatement {
         chunk_words,
         keys: keys.into_iter().map(f).collect(),
         prims: prims.into_iter().map(|(n, k)| (n, f(k))).collect(),
-        arith: arith.into_iter().map(|(op, key, x, y, out)| Arith { op, key: f(key), x, y, out: f(out) }).collect(),
+        arith: arith
+            .into_iter()
+            .map(|(op, key, x, y, out)| Arith {
+                op,
+                key: f(key),
+                x,
+                y,
+                out: f(out),
+            })
+            .collect(),
     }
 }
 
@@ -64,7 +84,10 @@ fn nat_file(path: &str) -> (HashMap<[u64; 2], u64>, HashMap<u64, u64>) {
     let (mut numbers, mut lits) = (HashMap::new(), HashMap::new());
     for line in fs::read_to_string(path).unwrap_or_default().lines() {
         let w: Vec<&str> = line.split_whitespace().collect();
-        let n = |i: usize| w[i].parse::<u64>().unwrap_or_else(|_| panic!("{path}: {line}"));
+        let n = |i: usize| {
+            w[i].parse::<u64>()
+                .unwrap_or_else(|_| panic!("{path}: {line}"))
+        };
         match w[0] {
             "P" => drop(numbers.insert([n(2), n(3)], n(1))),
             "N" => drop(lits.insert(lit_hash(n(1)), n(1))),
@@ -124,11 +147,16 @@ fn write_chunk(path: &str, chunk: u64, rows: &[Vec<F128>]) {
 }
 
 fn read_chunk(path: &str) -> (u64, Vec<Vec<F128>>) {
-    let b = fs::read(path).unwrap_or_else(|e| panic!("{path}: {e} (run `lean_tower shared` first)"));
+    let b =
+        fs::read(path).unwrap_or_else(|e| panic!("{path}: {e} (run `lean_tower shared` first)"));
     let u = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
     let (chunk, n, cols) = (u(0), u(1) as usize, u(2) as usize);
     let rows = (0..n)
-        .map(|r| (0..cols).map(|c| F128::new(u(3 + 2 * (r * cols + c)), u(4 + 2 * (r * cols + c)))).collect())
+        .map(|r| {
+            (0..cols)
+                .map(|c| F128::new(u(3 + 2 * (r * cols + c)), u(4 + 2 * (r * cols + c))))
+                .collect()
+        })
         .collect();
     (chunk, rows)
 }
@@ -150,29 +178,55 @@ type Plan = [Vec<Option<(usize, usize)>>];
 impl Sources {
     fn new(out: &str) -> Sources {
         let g: Rows = read(format!("{out}/cone.bin"));
-        let (proto, _) = LeanCircuit::build_side(&g, &Rows::default(), Side::Batch, batch_base(0), &HashMap::new())
-            .unwrap_or_else(|e| panic!("an empty batch: {e}"));
-        let around = std::env::var("LEAN_AROUND").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
-        Sources { out: out.into(), g, proto, chunks: HashMap::new(), around }
+        let (proto, _) = LeanCircuit::build_side(
+            &g,
+            &Rows::default(),
+            Side::Batch,
+            batch_base(0),
+            &HashMap::new(),
+        )
+        .unwrap_or_else(|e| panic!("an empty batch: {e}"));
+        let around = std::env::var("LEAN_AROUND")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        Sources {
+            out: out.into(),
+            g,
+            proto,
+            chunks: HashMap::new(),
+            around,
+        }
     }
 
-    fn keys(profile: &Profile, slots: &[Option<(usize, usize)>]) -> impl Iterator<Item = (usize, usize, usize)> {
-        slots.iter().zip(&profile.slots).filter_map(|(x, &s)| x.map(|(side, ch)| (side, s, ch)))
+    fn keys(
+        profile: &Profile,
+        slots: &[Option<(usize, usize)>],
+    ) -> impl Iterator<Item = (usize, usize, usize)> {
+        slots
+            .iter()
+            .zip(&profile.slots)
+            .filter_map(|(x, &s)| x.map(|(side, ch)| (side, s, ch)))
     }
 
     /// Makes leaf i's chunks present; keeps only those of the leaves within
     /// `around` of it.
     fn load(&mut self, profiles: &[Profile], plan: &Plan, i: usize) {
         let profile = &profiles[i];
-        let (lo, hi) = (i.saturating_sub(self.around), (i + self.around + 1).min(plan.len()));
+        let (lo, hi) = (
+            i.saturating_sub(self.around),
+            (i + self.around + 1).min(plan.len()),
+        );
         let near: std::collections::HashSet<(usize, usize, usize)> = (lo..hi)
             .flat_map(|j| Self::keys(&profiles[j], &plan[j]))
             .filter(|k| k.0 > 0)
             .chain(Self::keys(profile, &plan[i]).filter(|k| k.0 == 0))
             .collect();
         self.chunks.retain(|k, _| near.contains(k));
-        let mut sides: Vec<usize> =
-            Self::keys(profile, &plan[i]).filter(|k| !self.chunks.contains_key(k)).map(|k| k.0).collect();
+        let mut sides: Vec<usize> = Self::keys(profile, &plan[i])
+            .filter(|k| !self.chunks.contains_key(k))
+            .map(|k| k.0)
+            .collect();
         sides.sort_unstable();
         sides.dedup();
         for side in sides {
@@ -185,8 +239,9 @@ impl Sources {
             }
             let k = side - 1;
             let b: Rows = read(format!("{}/b{k}.bin", self.out));
-            let (c, _) = LeanCircuit::build_side(&self.g, &b, Side::Batch, batch_base(k), &HashMap::new())
-                .unwrap_or_else(|e| panic!("batch {k}: {e}"));
+            let (c, _) =
+                LeanCircuit::build_side(&self.g, &b, Side::Batch, batch_base(k), &HashMap::new())
+                    .unwrap_or_else(|e| panic!("batch {k}: {e}"));
             assert_eq!(c.nu, profile.nu, "the census's nu");
             for key in near.iter().filter(|x| x.0 == side) {
                 if !self.chunks.contains_key(key) {
@@ -202,7 +257,11 @@ impl Sources {
         self.chunks.retain(|k, _| k.0 > 0);
     }
 
-    fn slots<'a>(&'a self, profile: &Profile, slots: &[Option<(usize, usize)>]) -> Vec<LeafSlot<'a>> {
+    fn slots<'a>(
+        &'a self,
+        profile: &Profile,
+        slots: &[Option<(usize, usize)>],
+    ) -> Vec<LeafSlot<'a>> {
         let nu = profile.nu;
         slots
             .iter()
@@ -210,17 +269,31 @@ impl Sources {
             .map(|(x, &s)| {
                 x.map(|(side, ch)| {
                     let (chunk, rows) = &self.chunks[&(side, s, ch)];
-                    SlotRows { rows, chunk: *chunk, nu }
+                    SlotRows {
+                        rows,
+                        chunk: *chunk,
+                        nu,
+                    }
                 })
             })
             .collect()
     }
 
-    fn piece(&self, profile: &Profile, slots: &[Option<(usize, usize)>], i: usize) -> flock_prover::lean_rows::Piece {
+    fn piece(
+        &self,
+        profile: &Profile,
+        slots: &[Option<(usize, usize)>],
+        i: usize,
+    ) -> flock_prover::lean_rows::Piece {
         leaf(&self.proto, profile, &self.slots(profile, slots), i).unwrap()
     }
 
-    fn statement(&self, profile: &Profile, slots: &[Option<(usize, usize)>], i: usize) -> (Vec<u64>, Vec<[F128; 2]>) {
+    fn statement(
+        &self,
+        profile: &Profile,
+        slots: &[Option<(usize, usize)>],
+        i: usize,
+    ) -> (Vec<u64>, Vec<[F128; 2]>) {
         leaf_statement(&self.proto, profile, &self.slots(profile, slots), i)
     }
 
@@ -380,16 +453,27 @@ fn main() {
                     LeanCircuit::build_side(&g, &b, Side::Batch, batch_base(k), &HashMap::new())
                         .unwrap_or_else(|e| panic!("batch {k}: {e}"));
                 let v: Vec<(Tuple, u64)> = asks.into_iter().collect();
-                fs::write(format!("{out}/{k}.asks.new"), bincode::serialize(&v).unwrap()).unwrap();
-                eprintln!("batch {k}: {} asks ({:.0} s)", v.len(), t0.elapsed().as_secs_f64());
+                fs::write(
+                    format!("{out}/{k}.asks.new"),
+                    bincode::serialize(&v).unwrap(),
+                )
+                .unwrap();
+                eprintln!(
+                    "batch {k}: {} asks ({:.0} s)",
+                    v.len(),
+                    t0.elapsed().as_secs_f64()
+                );
             }
         }
         "cmpasks" => {
             for k in 0..n {
-                let old: HashMap<Tuple, u64> =
-                    read::<Vec<(Tuple, u64)>>(format!("{out}/{k}.asks")).into_iter().collect();
+                let old: HashMap<Tuple, u64> = read::<Vec<(Tuple, u64)>>(format!("{out}/{k}.asks"))
+                    .into_iter()
+                    .collect();
                 let new: HashMap<Tuple, u64> =
-                    read::<Vec<(Tuple, u64)>>(format!("{out}/{k}.asks.new")).into_iter().collect();
+                    read::<Vec<(Tuple, u64)>>(format!("{out}/{k}.asks.new"))
+                        .into_iter()
+                        .collect();
                 let diff = new.iter().filter(|(t, c)| old.get(*t) != Some(*c)).count()
                     + old.keys().filter(|t| !new.contains_key(*t)).count();
                 if diff > 0 {
@@ -409,7 +493,7 @@ fn main() {
                 }
             }
             let mut v: Vec<_> = tot.into_iter().collect();
-            v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            v.sort_by(|a, b| b.1.0.cmp(&a.1.0));
             for (r, (c, ok)) in v {
                 println!("{r}\t{c}\t{}", if ok { "checked" } else { "assumed" });
             }
@@ -456,7 +540,11 @@ fn main() {
                 write_chunk(&chunk_file(&out, s, ch), x.chunk, x.rows);
                 k += 1;
             }
-            eprintln!("{k} chunks written ({:.0} s, {})", t0.elapsed().as_secs_f64(), rss());
+            eprintln!(
+                "{k} chunks written ({:.0} s, {})",
+                t0.elapsed().as_secs_f64(),
+                rss()
+            );
         }
         "run" | "probe" | "sizes" => {
             let slots = num(3);
@@ -475,17 +563,32 @@ fn main() {
             // each), in a segment of their own: the leaf's verifier grows
             // with the leaf's ports, and that table has as many as all the
             // others together.
-            let rare_k: usize = std::env::var("LEAN_RARE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let rare_k: usize = std::env::var("LEAN_RARE_SLOTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let rare = flock_prover::lean_rows::rare_table();
             // The table of the spine rules follows it and shares its leaves
             // (LEAN_SPINE_SLOTS slots each, 2 unless said).
-            let spine_k: usize = std::env::var("LEAN_SPINE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            let spine_k: usize = std::env::var("LEAN_SPINE_SLOTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2);
             // And the table of the rules that type a projection (LEAN_TEL_SLOTS, 1 unless said).
-            let tel_k: usize = std::env::var("LEAN_TEL_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-            let late: Vec<(usize, usize)> =
-                vec![(rare, rare_k), (rare + 1, spine_k), (rare + 2, tel_k), (flock_prover::lean_rows::rule_table(), 1)];
-            let late_census: Vec<Vec<usize>> =
-                late.iter().map(|&(t, _)| census.iter().map(|r| r[t]).collect()).collect();
+            let tel_k: usize = std::env::var("LEAN_TEL_SLOTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let late: Vec<(usize, usize)> = vec![
+                (rare, rare_k),
+                (rare + 1, spine_k),
+                (rare + 2, tel_k),
+                (flock_prover::lean_rows::rule_table(), 1),
+            ];
+            let late_census: Vec<Vec<usize>> = late
+                .iter()
+                .map(|&(t, _)| census.iter().map(|r| r[t]).collect())
+                .collect();
             if rare_k > 0 {
                 for r in &mut census {
                     for &(t, _) in &late {
@@ -502,9 +605,13 @@ fn main() {
             // chunks), so a table whose chunks run out leaves its slots
             // empty until the oldest batch is used up. The shared side's
             // chunks fill their own slots at an even rate.
-            let window = std::env::var("LEAN_WINDOW").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
-            let k_of: Vec<usize> =
-                (0..n_tables).map(|s| profile.slots.iter().filter(|&&x| x == s).count()).collect();
+            let window = std::env::var("LEAN_WINDOW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4usize);
+            let k_of: Vec<usize> = (0..n_tables)
+                .map(|s| profile.slots.iter().filter(|&&x| x == s).count())
+                .collect();
             let mut queues: Vec<std::collections::VecDeque<(usize, usize)>> =
                 vec![std::collections::VecDeque::new(); n_tables];
             for (s, &c) in census[0].iter().enumerate() {
@@ -515,8 +622,15 @@ fn main() {
             loop {
                 // Bring batches in while some table is short and the window allows.
                 loop {
-                    let oldest = queues.iter().flatten().map(|x| x.0).filter(|&x| x > 0).min().unwrap_or(next);
-                    let short = (0..n_tables).any(|s| census[1..].iter().any(|c| c[s] > 0) && queues[s].len() < k_of[s]);
+                    let oldest = queues
+                        .iter()
+                        .flatten()
+                        .map(|x| x.0)
+                        .filter(|&x| x > 0)
+                        .min()
+                        .unwrap_or(next);
+                    let short = (0..n_tables)
+                        .any(|s| census[1..].iter().any(|c| c[s] > 0) && queues[s].len() < k_of[s]);
                     if next > n || !short || next - oldest >= window {
                         break;
                     }
@@ -545,14 +659,25 @@ fn main() {
             let n_common = plan.len();
             let mut profiles: Vec<Profile> = vec![profile.clone(); n_common];
             if rare_k > 0 {
-                let rare_profile =
-                    Profile { nu, slots: late.iter().flat_map(|&(t, k)| vec![t; k]).collect() };
+                let rare_profile = Profile {
+                    nu,
+                    slots: late.iter().flat_map(|&(t, k)| vec![t; k]).collect(),
+                };
                 let all: Vec<Vec<(usize, usize)>> = late_census
                     .iter()
-                    .map(|c| c.iter().enumerate().flat_map(|(side, &c)| (0..c).map(move |ch| (side, ch))).collect())
+                    .map(|c| {
+                        c.iter()
+                            .enumerate()
+                            .flat_map(|(side, &c)| (0..c).map(move |ch| (side, ch)))
+                            .collect()
+                    })
                     .collect();
-                let n_late =
-                    late.iter().zip(&all).map(|(&(_, k), a)| a.len().div_ceil(k.max(1))).max().unwrap_or(0);
+                let n_late = late
+                    .iter()
+                    .zip(&all)
+                    .map(|(&(_, k), a)| a.len().div_ceil(k.max(1)))
+                    .max()
+                    .unwrap_or(0);
                 let width: usize = late.iter().map(|x| x.1).sum();
                 for l in 0..n_late {
                     let mut leaf: Vec<Option<(usize, usize)>> = Vec::with_capacity(width);
@@ -595,7 +720,10 @@ fn main() {
                     let mut sides: Vec<usize> = p.iter().flatten().map(|x| x.0).collect();
                     sides.sort_unstable();
                     sides.dedup();
-                    println!("leaf {i}: {} chunks from sides {sides:?}", p.iter().flatten().count());
+                    println!(
+                        "leaf {i}: {} chunks from sides {sides:?}",
+                        p.iter().flatten().count()
+                    );
                 }
                 return;
             }
@@ -605,7 +733,11 @@ fn main() {
                 let mut net: HashMap<[u8; 16], (i64, usize, bool)> = HashMap::new();
                 for side in 0..=n {
                     let c = build(side, n, &out);
-                    eprintln!("side {side} ({:.0} s, {} tuples)", t0.elapsed().as_secs_f64(), net.len());
+                    eprintln!(
+                        "side {side} ({:.0} s, {} tuples)",
+                        t0.elapsed().as_secs_f64(),
+                        net.len()
+                    );
                     for (s0, ch, _) in c.chunks() {
                         c.for_each_tuple(s0, ch, |s, send, t, m| {
                             if m == 0 {
@@ -633,7 +765,10 @@ fn main() {
                 let mut by: Vec<_> = by.into_iter().collect();
                 by.sort();
                 for ((s, send), (k, sum)) in by {
-                    println!("  first seen in table {s} ({}): {k} tuples, net {sum}", if send { "send" } else { "recv" });
+                    println!(
+                        "  first seen in table {s} ({}): {k} tuples, net {sum}",
+                        if send { "send" } else { "recv" }
+                    );
                 }
                 return;
             }
@@ -686,7 +821,9 @@ fn main() {
             let stmt_file = format!("{out}/statement-{}-{slots}-{}.bin", a[0], index.len());
             let mut statement: LeanStatement = fs::read(&stmt_file)
                 .ok()
-                .map(|b| stmt_de(bincode::deserialize(&b).expect("a statement file of this version")))
+                .map(|b| {
+                    stmt_de(bincode::deserialize(&b).expect("a statement file of this version"))
+                })
                 .unwrap_or_default();
             if words.len() != index.len() || statement.chunk_words.is_empty() {
                 words.clear();
@@ -698,7 +835,10 @@ fn main() {
                 // checkpoint: the words and the statement of the leaves done.
                 type Part = (Vec<[u8; 32]>, StmtS);
                 let part_file = format!("{words_file}.part");
-                if let Some((w, s)) = fs::read(&part_file).ok().and_then(|b| bincode::deserialize::<Part>(&b).ok()) {
+                if let Some((w, s)) = fs::read(&part_file)
+                    .ok()
+                    .and_then(|b| bincode::deserialize::<Part>(&b).ok())
+                {
                     eprintln!("first pass: {} leaves from the checkpoint", w.len());
                     words = w;
                     statement = stmt_de(s);
@@ -707,7 +847,11 @@ fn main() {
                 for (i, p) in plan.iter().enumerate().skip(done) {
                     if i > done && i % 8 == 0 {
                         let part: Part = (words.clone(), stmt_ser(&statement));
-                        fs::write(format!("{part_file}.new"), bincode::serialize(&part).unwrap()).unwrap();
+                        fs::write(
+                            format!("{part_file}.new"),
+                            bincode::serialize(&part).unwrap(),
+                        )
+                        .unwrap();
                         fs::rename(format!("{part_file}.new"), &part_file).unwrap();
                     }
                     src.load(&profiles, &plan, i);
@@ -717,20 +861,29 @@ fn main() {
                     statement.keys.extend(k);
                     statement.prims.extend(src.prims(&profiles[i], p));
                     for raw in src.arith(&profiles[i], p) {
-                        statement
-                            .arith
-                            .push(arith_entry(&raw, &numbers, &lits).unwrap_or_else(|e| panic!("leaf {i}: {e}")));
+                        statement.arith.push(
+                            arith_entry(&raw, &numbers, &lits)
+                                .unwrap_or_else(|e| panic!("leaf {i}: {e}")),
+                        );
                     }
                     if std::env::var_os("LEAN_DIGESTS").is_some() {
                         println!("leaf {i}: circuit blake3:{:02x?}", &piece.digest()[..6]);
                     }
                     words.push(leaf_word(&piece));
                     if i % 8 == 0 {
-                        eprintln!("leaf {i} committed ({:.0} s, {})", t0.elapsed().as_secs_f64(), rss());
+                        eprintln!(
+                            "leaf {i} committed ({:.0} s, {})",
+                            t0.elapsed().as_secs_f64(),
+                            rss()
+                        );
                     }
                 }
                 fs::write(&words_file, words.concat()).unwrap();
-                fs::write(&stmt_file, bincode::serialize(&stmt_ser(&statement)).unwrap()).unwrap();
+                fs::write(
+                    &stmt_file,
+                    bincode::serialize(&stmt_ser(&statement)).unwrap(),
+                )
+                .unwrap();
                 let _ = fs::remove_file(&part_file);
             }
             println!(
@@ -778,23 +931,46 @@ fn main() {
             // its own, kept on disk, so a run that is cut off resumes at
             // the first segment not yet proved; LEAN_SEGMENT=i proves only
             // segment i. The segments' claims are then joined. ----
-            if let Some(s_n) = std::env::var("LEAN_SEGMENTS").ok().and_then(|v| v.parse::<usize>().ok()) {
-                type Kept = ([u8; 32], [u8; 32], [u8; 32], (u64, u64), (u64, u64), usize, f64, f64, f64);
+            if let Some(s_n) = std::env::var("LEAN_SEGMENTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                type Kept = (
+                    [u8; 32],
+                    [u8; 32],
+                    [u8; 32],
+                    (u64, u64),
+                    (u64, u64),
+                    usize,
+                    f64,
+                    f64,
+                    f64,
+                );
                 // The common leaves in s_n segments, then the rare rules'
                 // leaves (another leaf circuit) in one of their own.
                 let n_common = if a[0] == "run" { n_common } else { words.len() };
                 let k = n_common / 2;
-                let mut bounds: Vec<(usize, usize)> =
-                    (0..s_n).map(|s| (2 * (s * k / s_n), 2 * ((s + 1) * k / s_n))).collect();
+                let mut bounds: Vec<(usize, usize)> = (0..s_n)
+                    .map(|s| (2 * (s * k / s_n), 2 * ((s + 1) * k / s_n)))
+                    .collect();
                 if n_common < words.len() {
                     bounds.push((n_common, words.len()));
                 }
                 let s_n = bounds.len();
-                assert!(bounds.iter().all(|(a, b)| b - a >= 4), "at least four leaves a segment");
-                let roots: Vec<[u8; 32]> = bounds.iter().map(|(a, b)| lean_segment_root(&words[*a..*b])).collect();
+                assert!(
+                    bounds.iter().all(|(a, b)| b - a >= 4),
+                    "at least four leaves a segment"
+                );
+                let roots: Vec<[u8; 32]> = bounds
+                    .iter()
+                    .map(|(a, b)| lean_segment_root(&words[*a..*b]))
+                    .collect();
                 let all = lean_segments_root(&roots);
-                let only = std::env::var("LEAN_SEGMENT").ok().and_then(|v| v.parse::<usize>().ok());
-                let file = |s: usize| format!("{out}/segment-{slots}-{}-{s_n}-{s}.bin", index.len());
+                let only = std::env::var("LEAN_SEGMENT")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok());
+                let file =
+                    |s: usize| format!("{out}/segment-{slots}-{}-{s_n}-{s}.bin", index.len());
                 let kept = |s: usize| -> Option<Kept> {
                     let k: Kept = bincode::deserialize(&fs::read(file(s)).ok()?).ok()?;
                     (k.0 == all && k.1 == roots[s]).then_some(k)
@@ -812,7 +988,13 @@ fn main() {
                         Some(all),
                         &mut make_piece,
                         env,
-                        |line| println!("segment {s}: {line} ({:.0} s, {})", t1.elapsed().as_secs_f64(), rss()),
+                        |line| {
+                            println!(
+                                "segment {s}: {line} ({:.0} s, {})",
+                                t1.elapsed().as_secs_f64(),
+                                rss()
+                            )
+                        },
                     );
                     let r = &o.report;
                     let k: Kept = (
@@ -853,7 +1035,11 @@ fn main() {
                     .collect();
                 let balanced = segments_balanced(&all, &claims, &statement);
                 println!("the segments joined: {balanced:?}");
-                assert_eq!(balanced, Ok(true), "the shared bus balances over the whole cone");
+                assert_eq!(
+                    balanced,
+                    Ok(true),
+                    "the shared bus balances over the whole cone"
+                );
                 println!(
                     "THE CONE in {s_n} proofs: {} leaves; proofs {} KiB together; verify {:.1} ms (proofs) + {:.1} ms (root-side checks); proving {:.0} s",
                     words.len(),

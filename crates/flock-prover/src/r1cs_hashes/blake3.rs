@@ -794,6 +794,225 @@ fn shared_matrices() -> &'static (SparseBinaryMatrix, SparseBinaryMatrix) {
     MATRICES.get_or_init(build_matrices)
 }
 
+// ---------------------------------------------------------------------------
+// Succinct matrix-vector products: `A_0·w` and `B_0·w` in O(K) field adds.
+//
+// Every row of `A_0`/`B_0` is an XOR of symbolic `Word` bits, and the cascaded
+// lanes make those lists long (44M nonzeros in all). Over F128 (characteristic
+// 2) an XOR list evaluated at a weight vector is the SUM of the weights, and
+// duplicate cancellation is automatic, so the same construction run on value
+// words (one F128 per bit) yields every row's inner product with `w` without
+// expanding the lists. Carry prefixes become running sums.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct VWord([F128; WORD_BITS]);
+
+impl VWord {
+    fn zero() -> Self {
+        Self([F128::ZERO; WORD_BITS])
+    }
+    fn slot(w: &[F128], base: usize) -> Self {
+        Self(from_fn(|i| w[base + i]))
+    }
+    fn constant(w: &[F128], val: u32) -> Self {
+        Self(from_fn(|i| {
+            if (val >> i) & 1 == 1 {
+                w[Z_CONST_POS]
+            } else {
+                F128::ZERO
+            }
+        }))
+    }
+    fn xor(&self, o: &VWord) -> Self {
+        Self(from_fn(|i| self.0[i] + o.0[i]))
+    }
+    fn rotr(&self, n: usize) -> Self {
+        Self(from_fn(|i| self.0[(i + n) % WORD_BITS]))
+    }
+}
+
+struct VRows<'a> {
+    w: &'a [F128],
+    a: Vec<F128>,
+    b: Vec<F128>,
+}
+
+impl VRows<'_> {
+    fn add_carry(&mut self, x: &VWord, y: &VWord, cb: usize) -> VWord {
+        let mut out = VWord::zero();
+        let mut p = F128::ZERO; // ⊕_{j<i} carry_aux[j]
+        for i in 0..WORD_BITS {
+            if i < CARRY_BITS_PER_ADD {
+                self.a[cb + i] = x.0[i] + p;
+                self.b[cb + i] = y.0[i] + p;
+            }
+            out.0[i] = x.0[i] + y.0[i] + p;
+            if i < CARRY_BITS_PER_ADD {
+                p += self.w[cb + i];
+            }
+        }
+        out
+    }
+    fn fused_add(&mut self, x: &VWord, y: &VWord, m: &VWord, maj: usize, rip: usize) -> VWord {
+        for i in 0..CARRY_BITS_PER_ADD {
+            self.a[maj + i] = x.0[i] + m.0[i];
+            self.b[maj + i] = y.0[i] + m.0[i];
+        }
+        let mut g = F128::ZERO; // ⊕_{1≤l<j} v[l]
+        for j in 1..=RIPPLE_BITS_PER_FADD {
+            self.a[rip + j - 1] = x.0[j] + y.0[j] + m.0[j] + g;
+            self.b[rip + j - 1] = self.w[maj + j - 1] + m.0[j - 1] + g;
+            g += self.w[rip + j - 1];
+        }
+        let mut out = VWord::zero();
+        let mut g = F128::ZERO;
+        for i in 0..WORD_BITS {
+            let mut v = x.0[i] + y.0[i] + m.0[i];
+            if i >= 1 {
+                v += self.w[maj + i - 1] + m.0[i - 1] + g;
+                if i <= RIPPLE_BITS_PER_FADD {
+                    g += self.w[rip + i - 1];
+                }
+            }
+            out.0[i] = v;
+        }
+        out
+    }
+    fn const_add(&mut self, k: u32, y: &VWord, base: usize, n_rows: usize) -> VWord {
+        let t = CARRY_BITS_PER_ADD - n_rows;
+        let zc = self.w[Z_CONST_POS];
+        let kb = |i: usize| if (k >> i) & 1 == 1 { zc } else { F128::ZERO };
+        let mut carry = y.0[t - 1];
+        let mut out = VWord::zero();
+        for i in 0..WORD_BITS {
+            let mut v = y.0[i] + kb(i);
+            if i >= t {
+                if i < WORD_BITS - 1 {
+                    self.a[base + i - t] = carry + kb(i);
+                    self.b[base + i - t] = y.0[i] + carry;
+                }
+                v += carry;
+                if i < WORD_BITS - 1 {
+                    carry += self.w[base + i - t];
+                }
+            }
+            out.0[i] = v;
+        }
+        out
+    }
+}
+
+/// `(A_0·w, B_0·w)` without the nonzeros: one pass over the compression's
+/// structure, `O(K)` additions. Agrees with [`build_matrices`] exactly
+/// (tested); `w.len() ≥ K`, outputs have length `K`.
+pub fn apply_matrices_f128(w: &[F128]) -> (Vec<F128>, Vec<F128>) {
+    assert!(w.len() >= K, "weight shorter than the block");
+    let mut r = VRows {
+        w,
+        a: vec![F128::ZERO; K],
+        b: vec![F128::ZERO; K],
+    };
+    let zc = w[Z_CONST_POS];
+    r.a[Z_CONST_POS] = zc;
+    r.b[Z_CONST_POS] = zc;
+    for (base, len) in [
+        (CV_BASE, 8 * WORD_BITS),
+        (M_BASE, 16 * WORD_BITS),
+        (T_LO_BASE, WORD_BITS),
+        (T_HI_BASE, WORD_BITS),
+        (BLEN_BASE, WORD_BITS),
+        (FLAGS_BASE, WORD_BITS),
+    ] {
+        for s in base..base + len {
+            r.a[s] = w[s];
+            r.b[s] = zc;
+        }
+    }
+    let mut state: [VWord; 16] = from_fn(|_| VWord::zero());
+    for (j, s) in state.iter_mut().enumerate().take(8) {
+        *s = VWord::slot(w, chaining_value_bit(j, 0));
+    }
+    for i in 0..4 {
+        state[8 + i] = VWord::constant(w, BLAKE3_IV[i]);
+    }
+    state[12] = VWord::slot(w, T_LO_BASE);
+    state[13] = VWord::slot(w, T_HI_BASE);
+    state[14] = VWord::slot(w, BLEN_BASE);
+    state[15] = VWord::slot(w, FLAGS_BASE);
+    let msg_idx = per_round_msg_idx();
+    for (rd, msg_round) in msg_idx.iter().enumerate() {
+        for (gi, &[mx_idx, my_idx]) in msg_round.iter().enumerate() {
+            let g = rd * N_G_PER_ROUND + gi;
+            let [la, lb, lc, ld] = G_LANES[gi];
+            let (a, b, c, d) = (state[la], state[lb], state[lc], state[ld]);
+            let mx = VWord::slot(w, m_bit(mx_idx, 0));
+            let my = VWord::slot(w, m_bit(my_idx, 0));
+            let a_1 = r.fused_add(&a, &b, &mx, g_bit(g, OFF_MAJ1), g_bit(g, OFF_RIP1));
+            let d_1 = d.xor(&a_1).rotr(16);
+            let c_1 = if g < 4 {
+                r.const_add(BLAKE3_IV[g], &d_1, g_bit(g, OFF_C1), g_c1_rows(g))
+            } else {
+                r.add_carry(&c, &d_1, g_bit(g, OFF_C1))
+            };
+            let b_1 = b.xor(&c_1).rotr(12);
+            let a_2 = r.fused_add(
+                &a_1,
+                &b_1,
+                &my,
+                g_bit(g, off_maj2(g)),
+                g_bit(g, off_rip2(g)),
+            );
+            let d_2 = d_1.xor(&a_2).rotr(8);
+            let c_2 = r.add_carry(&c_1, &d_2, g_bit(g, off_c2(g)));
+            state[lb] = b_1.xor(&c_2).rotr(7);
+            state[la] = a_2;
+            state[lc] = c_2;
+            state[ld] = d_2;
+        }
+    }
+    for j in 0..8 {
+        let lo = state[j].xor(&state[j + 8]);
+        let hi = state[j + 8].xor(&VWord::slot(w, chaining_value_bit(j, 0)));
+        for i in 0..WORD_BITS {
+            r.a[out_lo_bit(j, i)] = lo.0[i];
+            r.b[out_lo_bit(j, i)] = zc;
+            r.a[out_hi_bit(j, i)] = hi.0[i];
+            r.b[out_hi_bit(j, i)] = zc;
+        }
+    }
+    (r.a, r.b)
+}
+
+/// `A_0` (`B == false`) or `B_0` (`B == true`) as a [`FoldMatrix`] whose
+/// `row_marginal` is [`apply_matrices_f128`]: the root check
+/// `⟨row, M·col⟩` costs `O(K)` instead of `O(nnz)`. The column marginal
+/// (prover side) falls back to the shared sparse matrices.
+pub struct SuccinctBlake3<const B: bool>;
+
+impl<const B: bool> flock_core::matrix_fold::FoldMatrix for SuccinctBlake3<B> {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        let (a, b) = apply_matrices_f128(w);
+        let mut out = if B { b } else { a };
+        out.resize(n_rows, F128::ZERO);
+        out
+    }
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        let (a, b) = shared_matrices();
+        flock_core::matrix_fold::FoldMatrix::col_marginal(if B { b } else { a }, w, n_cols)
+    }
+    fn n_rows(&self) -> usize {
+        K
+    }
+    fn n_cols(&self) -> usize {
+        K
+    }
+}
+
+/// The succinct pair for [`flock_core::aggregate::Accumulator::discharge_dyn`].
+pub static SUCCINCT_A: SuccinctBlake3<false> = SuccinctBlake3;
+pub static SUCCINCT_B: SuccinctBlake3<true> = SuccinctBlake3;
+
 /// Build a [`BlockR1cs`] batching `2^n_blocks_log` independent BLAKE3
 /// compressions. `n_blocks_log ≥ 3` is required (lincheck needs `n_outer ≥ 8`).
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
@@ -2355,6 +2574,33 @@ impl flock_core::circuit::builder::GateType for Blake3Gate {
         _nu: usize,
     ) -> flock_core::circuit::builder::SlotWitness {
         flock_core::circuit::builder::SlotWitness::DeferredToRows
+    }
+}
+
+#[cfg(test)]
+mod succinct_tests {
+    use flock_core::{matrix_fold::FoldMatrix, test_rng::Rng};
+    use flock_field::F128;
+
+    use super::{K, apply_matrices_f128, shared_matrices};
+
+    #[test]
+    fn succinct_products_match_the_sparse_matrices() {
+        let mut rng = Rng::new(7);
+        let w: Vec<F128> = (0..K)
+            .map(|_| F128::new(rng.next_u64(), rng.next_u64()))
+            .collect();
+        let t = std::time::Instant::now();
+        let (a, b) = apply_matrices_f128(&w);
+        let fast = t.elapsed();
+        let (ma, mb) = shared_matrices();
+        let t = std::time::Instant::now();
+        let (sa, sb) = (ma.row_marginal(&w, K), mb.row_marginal(&w, K));
+        eprintln!("succinct {fast:?}, sparse {:?}", t.elapsed());
+        for r in 0..K {
+            assert_eq!(a[r], sa[r], "A row {r}");
+            assert_eq!(b[r], sb[r], "B row {r}");
+        }
     }
 }
 

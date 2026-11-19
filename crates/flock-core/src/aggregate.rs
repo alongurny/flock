@@ -134,6 +134,23 @@ impl Accumulator {
                 .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
     }
 
+    /// [`Self::discharge`] over any [`FoldMatrix`] pairs — for types whose
+    /// matrices have a succinct `row_marginal` (BLAKE3: `O(K)`, not `O(nnz)`).
+    pub fn discharge_dyn(
+        &self,
+        mats: &[(
+            &dyn crate::matrix_fold::FoldMatrix,
+            &dyn crate::matrix_fold::FoldMatrix,
+        )],
+    ) -> bool {
+        self.per_type.len() == mats.len()
+            && self
+                .per_type
+                .iter()
+                .zip(mats)
+                .all(|((ca, cb), (a, b))| ca.check_direct(*a) && cb.check_direct(*b))
+    }
+
     /// Discharge the linear-identity groups against their matrices
     /// ([`SharedTables::linear`]).
     pub fn discharge_linear(&self, mats: &[&SparseBinaryMatrix]) -> bool {

@@ -29,7 +29,9 @@ use crate::{
     challenger::Challenger,
     field::F128,
     matrix_fold::{MatrixClaim, Weight},
-    product_gkr::{BatchedGrinding, ProductGkrLeavesProof, ProductLeaves, prove_leaves, verify_leaves},
+    product_gkr::{
+        BatchedGrinding, ProductGkrLeavesProof, ProductLeaves, prove_leaves, verify_leaves,
+    },
     table_key::{DenseKey, DenseOpening, DenseTable, TensorBasis, verify_dense_many},
 };
 
@@ -90,7 +92,11 @@ fn enc(i: usize) -> F128 {
 /// The `s_id` tag's MLE at `z`: `Σ_i 2^i·z_i` as a field element.
 fn enc_eval(z: &[F128]) -> F128 {
     z.iter().enumerate().fold(F128::ZERO, |a, (i, &r)| {
-        let b = if i < 64 { F128::new(1u64 << i, 0) } else { F128::new(0, 1u64 << (i - 64)) };
+        let b = if i < 64 {
+            F128::new(1u64 << i, 0)
+        } else {
+            F128::new(0, 1u64 << (i - 64))
+        };
         a + b * r
     })
 }
@@ -134,7 +140,17 @@ fn weight_basis(w: &Weight, bits: usize) -> Option<TensorBasis> {
 }
 
 fn slot_weight(slot: usize, bits: usize) -> Weight {
-    Weight::eq((0..bits).map(|j| if (slot >> j) & 1 == 1 { F128::ONE } else { F128::ZERO }).collect())
+    Weight::eq(
+        (0..bits)
+            .map(|j| {
+                if (slot >> j) & 1 == 1 {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            })
+            .collect(),
+    )
 }
 
 /// The key-vector claims at `rho` (eight) and `z` (the values).
@@ -154,7 +170,12 @@ fn key_claims(rho: &[F128], z: &[F128], at_rho: &[F128; 10], at_z: &[F128; 3]) -
     v
 }
 
-fn fresh_claims(rho: &[F128], z: &[F128], at_rho: &[F128; 10], at_z: &[F128; 3]) -> Vec<MatrixClaim> {
+fn fresh_claims(
+    rho: &[F128],
+    z: &[F128],
+    at_rho: &[F128; 10],
+    at_z: &[F128; 3],
+) -> Vec<MatrixClaim> {
     let mut v = Vec::new();
     for s in 0..2 {
         v.push(MatrixClaim {
@@ -175,7 +196,13 @@ fn fresh_claims(rho: &[F128], z: &[F128], at_rho: &[F128; 10], at_z: &[F128; 3])
 /// claims into one (`Σ ρ^m·v_m`).
 fn bind<Ch: Challenger>(ch: &mut Ch, key: &SparseKey, claims: &[MatrixClaim]) -> F128 {
     ch.observe_label(b"flock-table-key-sparse-v0");
-    for x in [key.rows_log, key.cols_log, key.mats_log, key.n_mats, key.size_log] {
+    for x in [
+        key.rows_log,
+        key.cols_log,
+        key.mats_log,
+        key.n_mats,
+        key.size_log,
+    ] {
         ch.observe_bytes(&(x as u64).to_le_bytes());
     }
     for h in &key.dense.cap {
@@ -212,7 +239,11 @@ fn claim_bases(key: &SparseKey, claims: &[MatrixClaim]) -> Option<Vec<(TensorBas
 
 /// The two memories' contents: `T_R[(m << rows_log) | r] = R_m(r)`,
 /// `T_C[(m << cols_log) | c] = ρ^m·C_m(c)`, zero elsewhere.
-fn memories(key: &SparseKey, bases: &[(TensorBasis, TensorBasis)], rho: F128) -> (Vec<F128>, Vec<F128>) {
+fn memories(
+    key: &SparseKey,
+    bases: &[(TensorBasis, TensorBasis)],
+    rho: F128,
+) -> (Vec<F128>, Vec<F128>) {
     let size = 1usize << key.size_log;
     let mut t_r = vec![F128::ZERO; size];
     let mut t_c = vec![F128::ZERO; size];
@@ -230,13 +261,22 @@ fn memories(key: &SparseKey, bases: &[(TensorBasis, TensorBasis)], rho: F128) ->
 }
 
 /// The verifier's MLEs of the two memories at `p`.
-fn memories_at(key: &SparseKey, bases: &[(TensorBasis, TensorBasis)], rho: F128, p: &[F128]) -> (F128, F128) {
+fn memories_at(
+    key: &SparseKey,
+    bases: &[(TensorBasis, TensorBasis)],
+    rho: F128,
+    p: &[F128],
+) -> (F128, F128) {
     let part = |bits: usize, m: usize| {
         let sel = p[bits..bits + key.mats_log]
             .iter()
             .enumerate()
-            .fold(F128::ONE, |a, (j, &x)| a * if (m >> j) & 1 == 1 { x } else { F128::ONE + x });
-        let rest = p[bits + key.mats_log..].iter().fold(F128::ONE, |a, &x| a * (F128::ONE + x));
+            .fold(F128::ONE, |a, (j, &x)| {
+                a * if (m >> j) & 1 == 1 { x } else { F128::ONE + x }
+            });
+        let rest = p[bits + key.mats_log..]
+            .iter()
+            .fold(F128::ONE, |a, &x| a * (F128::ONE + x));
         sel * rest
     };
     let (mut r_hat, mut c_hat) = (F128::ZERO, F128::ZERO);
@@ -311,10 +351,19 @@ impl SparseTable {
 
     /// Commit to several matrices at once (each at most `2^rows_log ×
     /// 2^cols_log`), opened together by one claim per matrix.
-    pub fn new_many(mats: &[&[(usize, usize, F128)]], rows_log: usize, cols_log: usize) -> Option<Self> {
+    pub fn new_many(
+        mats: &[&[(usize, usize, F128)]],
+        rows_log: usize,
+        cols_log: usize,
+    ) -> Option<Self> {
         let n_rows = 1usize << rows_log;
         let n_cols = 1usize << cols_log;
-        if mats.is_empty() || mats.iter().flat_map(|e| e.iter()).any(|&(r, c, _)| r >= n_rows || c >= n_cols) {
+        if mats.is_empty()
+            || mats
+                .iter()
+                .flat_map(|e| e.iter())
+                .any(|&(r, c, _)| r >= n_rows || c >= n_cols)
+        {
             return None;
         }
         let mats_log = mats.len().next_power_of_two().trailing_zeros() as usize;
@@ -331,7 +380,8 @@ impl SparseTable {
         let mut reads_c = vec![0usize; size];
         let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
         let addressed = mats.iter().enumerate().flat_map(|(m, e)| {
-            e.iter().map(move |&(r, c, v)| ((m << rows_log) | r, (m << cols_log) | c, v))
+            e.iter()
+                .map(move |&(r, c, v)| ((m << rows_log) | r, (m << cols_log) | c, v))
         });
         for (k, (r, c, v)) in addressed.enumerate() {
             col(ROW, k, enc(r));
@@ -376,14 +426,20 @@ impl SparseTable {
 
     /// Prove one claim per matrix with one opening. `None` if a claim does
     /// not fit or is false.
-    pub fn open_many<Ch: Challenger>(&self, claims: &[MatrixClaim], ch: &mut Ch) -> Option<SparseOpening> {
+    pub fn open_many<Ch: Challenger>(
+        &self,
+        claims: &[MatrixClaim],
+        ch: &mut Ch,
+    ) -> Option<SparseOpening> {
         let k = &self.key;
         let size = 1usize << k.size_log;
         let bases = claim_bases(k, claims)?;
         // Every claim must hold on its own: the honest prover refuses a
         // false one outright.
-        let tabs: Vec<(Vec<F128>, Vec<F128>)> =
-            bases.iter().map(|(rb, cb)| (rb.materialize(), cb.materialize())).collect();
+        let tabs: Vec<(Vec<F128>, Vec<F128>)> = bases
+            .iter()
+            .map(|(rb, cb)| (rb.materialize(), cb.materialize()))
+            .collect();
         let (rmask, cmask) = ((1usize << k.rows_log) - 1, (1usize << k.cols_log) - 1);
         let mut per = vec![F128::ZERO; claims.len()];
         for ((&r, &c), &v) in self.rows.iter().zip(&self.cols).zip(&self.vals) {
@@ -475,7 +531,9 @@ impl SparseTable {
         ch.observe_f128_slice(&at_rho);
 
         // ---- the openings ----
-        let key_open = self.dense.open_many(&key_claims(p, &z, &at_rho, &at_z), ch)?;
+        let key_open = self
+            .dense
+            .open_many(&key_claims(p, &z, &at_rho, &at_z), ch)?;
         let fresh_open = fresh.open_many(&fresh_claims(p, &z, &at_rho, &at_z), ch)?;
         Some(SparseOpening {
             fresh: fresh.key.clone(),
@@ -554,8 +612,17 @@ pub fn verify_sparse_many<Ch: Challenger>(
         return false;
     }
     ch.observe_f128_slice(&o.at_rho);
-    verify_dense_many(&key.dense, &key_claims(p, &z, &o.at_rho, &o.at_z), &o.key_open, ch)
-        && verify_dense_many(&o.fresh, &fresh_claims(p, &z, &o.at_rho, &o.at_z), &o.fresh_open, ch)
+    verify_dense_many(
+        &key.dense,
+        &key_claims(p, &z, &o.at_rho, &o.at_z),
+        &o.key_open,
+        ch,
+    ) && verify_dense_many(
+        &o.fresh,
+        &fresh_claims(p, &z, &o.at_rho, &o.at_z),
+        &o.fresh_open,
+        ch,
+    )
 }
 
 #[cfg(test)]
@@ -569,7 +636,11 @@ mod tests {
         for i in 0..900usize {
             let r = (i * 37 + 11) % 256;
             let c = (i * 101 + 5) % 128;
-            let v = if i % 3 == 0 { F128::ONE } else { rng.sample_f128() };
+            let v = if i % 3 == 0 {
+                F128::ONE
+            } else {
+                rng.sample_f128()
+            };
             entries.push((r, c, v));
         }
         (rng, entries)
@@ -577,7 +648,9 @@ mod tests {
 
     fn honest(entries: &[(usize, usize, F128)], row: &Weight, col: &Weight) -> F128 {
         let (rw, cw) = (row.materialize(), col.materialize());
-        entries.iter().fold(F128::ZERO, |a, &(r, c, v)| a + v * rw[r] * cw[c])
+        entries
+            .iter()
+            .fold(F128::ZERO, |a, &(r, c, v)| a + v * rw[r] * cw[c])
     }
 
     #[test]
@@ -595,12 +668,22 @@ mod tests {
             );
             let value = honest(&entries, &row, &col);
             let c = MatrixClaim { row, col, value };
-            let o = t.open(&c, &mut FsChallenger::new(b"s")).expect("an honest claim opens");
-            assert!(verify_sparse(&t.key, &c, &o, &mut FsChallenger::new(b"s")), "honest at {lr} {lc}");
+            let o = t
+                .open(&c, &mut FsChallenger::new(b"s"))
+                .expect("an honest claim opens");
+            assert!(
+                verify_sparse(&t.key, &c, &o, &mut FsChallenger::new(b"s")),
+                "honest at {lr} {lc}"
+            );
 
             let mut bad = c.clone();
             bad.value += F128::ONE;
-            assert!(!verify_sparse(&t.key, &bad, &o, &mut FsChallenger::new(b"s")));
+            assert!(!verify_sparse(
+                &t.key,
+                &bad,
+                &o,
+                &mut FsChallenger::new(b"s")
+            ));
             assert!(t.open(&bad, &mut FsChallenger::new(b"s")).is_none());
         }
     }
@@ -609,7 +692,11 @@ mod tests {
     fn sparse_key_opens_several_matrices_at_once() {
         let (mut rng, a) = setup(0x3A75_0001);
         let (_, b) = setup(0x3A75_0002);
-        let c: Vec<(usize, usize, F128)> = a.iter().take(300).map(|&(r, c, v)| (c, r % 128, v + F128::ONE)).collect();
+        let c: Vec<(usize, usize, F128)> = a
+            .iter()
+            .take(300)
+            .map(|&(r, c, v)| (c, r % 128, v + F128::ONE))
+            .collect();
         let mats: [&[(usize, usize, F128)]; 3] = [&a, &b[..500], &c];
         let t = SparseTable::new_many(&mats, 8, 7).unwrap();
         assert_eq!((t.key.mats_log, t.key.n_mats), (2, 3));
@@ -617,23 +704,44 @@ mod tests {
             .iter()
             .map(|e| {
                 let row = Weight::eq((0..8).map(|_| rng.sample_f128()).collect());
-                let col = Weight::low_eq(vec![rng.sample_f128(), rng.sample_f128()], (0..6).map(|_| rng.sample_f128()).collect());
+                let col = Weight::low_eq(
+                    vec![rng.sample_f128(), rng.sample_f128()],
+                    (0..6).map(|_| rng.sample_f128()).collect(),
+                );
                 let value = honest(e, &row, &col);
                 MatrixClaim { row, col, value }
             })
             .collect();
         let o = t.open_many(&claims, &mut FsChallenger::new(b"u")).unwrap();
-        assert!(verify_sparse_many(&t.key, &claims, &o, &mut FsChallenger::new(b"u")));
+        assert!(verify_sparse_many(
+            &t.key,
+            &claims,
+            &o,
+            &mut FsChallenger::new(b"u")
+        ));
         for i in 0..3 {
             let mut bad = claims.clone();
             bad[i].value += F128::ONE;
-            assert!(!verify_sparse_many(&t.key, &bad, &o, &mut FsChallenger::new(b"u")), "claim {i} changed");
+            assert!(
+                !verify_sparse_many(&t.key, &bad, &o, &mut FsChallenger::new(b"u")),
+                "claim {i} changed"
+            );
             assert!(t.open_many(&bad, &mut FsChallenger::new(b"u")).is_none());
         }
         let mut swapped = claims.clone();
         swapped.swap(0, 2);
-        assert!(!verify_sparse_many(&t.key, &swapped, &o, &mut FsChallenger::new(b"u")));
-        assert!(!verify_sparse_many(&t.key, &claims[..2], &o, &mut FsChallenger::new(b"u")));
+        assert!(!verify_sparse_many(
+            &t.key,
+            &swapped,
+            &o,
+            &mut FsChallenger::new(b"u")
+        ));
+        assert!(!verify_sparse_many(
+            &t.key,
+            &claims[..2],
+            &o,
+            &mut FsChallenger::new(b"u")
+        ));
     }
 
     #[test]
@@ -682,7 +790,13 @@ mod bench {
         for nnz_log in [16usize, 20] {
             let (rl, cl) = (nnz_log - 2, nnz_log - 3);
             let entries: Vec<(usize, usize, F128)> = (0..1usize << nnz_log)
-                .map(|i| ((i * 2654435761) % (1 << rl), (i * 40503 + 7) % (1 << cl), F128::ONE))
+                .map(|i| {
+                    (
+                        (i * 2654435761) % (1 << rl),
+                        (i * 40503 + 7) % (1 << cl),
+                        F128::ONE,
+                    )
+                })
                 .collect();
             let t0 = std::time::Instant::now();
             let t = SparseTable::new(&entries, rl, cl).unwrap();
@@ -690,7 +804,9 @@ mod bench {
             let row = Weight::eq((0..rl).map(|_| rng.sample_f128()).collect());
             let col = Weight::eq((0..cl).map(|_| rng.sample_f128()).collect());
             let (rw, cw) = (row.materialize(), col.materialize());
-            let value = entries.iter().fold(F128::ZERO, |a, &(r, c, v)| a + v * rw[r] * cw[c]);
+            let value = entries
+                .iter()
+                .fold(F128::ZERO, |a, &(r, c, v)| a + v * rw[r] * cw[c]);
             let c = MatrixClaim { row, col, value };
             let t1 = std::time::Instant::now();
             let o = t.open(&c, &mut FsChallenger::new(b"b")).unwrap();
@@ -700,7 +816,9 @@ mod bench {
             assert!(verify_sparse(&t.key, &c, &o, &mut FsChallenger::new(b"b")));
             let verify_ms = t2.elapsed().as_secs_f64() * 1e3;
             let t3 = std::time::Instant::now();
-            let direct = entries.iter().fold(F128::ZERO, |a, &(r, cc, v)| a + v * rw[r] * cw[cc]);
+            let direct = entries
+                .iter()
+                .fold(F128::ZERO, |a, &(r, cc, v)| a + v * rw[r] * cw[cc]);
             assert_eq!(direct, value);
             let direct_ms = t3.elapsed().as_secs_f64() * 1e3;
             println!(

@@ -1453,14 +1453,20 @@ impl<'a> CircuitStructureMatrix<'a> {
     /// layout of [`crate::matrix_fold::DenseMatrix`]): what a verification
     /// key commits to once.
     pub fn materialize(&self) -> crate::matrix_fold::DenseMatrix {
-        let (n_rows, n_cols) = (crate::matrix_fold::FoldMatrix::n_rows(self), crate::matrix_fold::FoldMatrix::n_cols(self));
+        let (n_rows, n_cols) = (
+            crate::matrix_fold::FoldMatrix::n_rows(self),
+            crate::matrix_fold::FoldMatrix::n_cols(self),
+        );
         let mut vals = Vec::with_capacity(n_rows * n_cols);
         for c in 0..n_cols {
             for r in 0..n_rows {
                 vals.push(self.entry(r, c));
             }
         }
-        crate::matrix_fold::DenseMatrix { vals, n_rows_log: n_rows.trailing_zeros() as usize }
+        crate::matrix_fold::DenseMatrix {
+            vals,
+            n_rows_log: n_rows.trailing_zeros() as usize,
+        }
     }
 
     fn new(circuit: &'a Circuit) -> Self {
@@ -1666,7 +1672,8 @@ impl FoldMatrix for CircuitStructureMatrix<'_> {
         // The sigma plane, every live cell (skipped when its weight is zero,
         // as for a verification key, which evaluates the other planes).
         let sigma = self.circuit.sigma();
-        let any_sigma = (0..cell_cols).any(|slot| !plane(SigmaAssertion::SIGMA_PLANE, slot).is_zero());
+        let any_sigma =
+            (0..cell_cols).any(|slot| !plane(SigmaAssertion::SIGMA_PLANE, slot).is_zero());
         let sig = (0..if any_sigma { cell_cols } else { 0 })
             .into_par_iter()
             .fold(
@@ -2573,10 +2580,21 @@ mod tests {
         );
         // The materialized table and a verification key over it agree.
         let dense = m.materialize();
-        assert_eq!(bilinear(&mc.row, &mc.col, &dense), mc.value, "the materialized table");
+        assert_eq!(
+            bilinear(&mc.row, &mc.col, &dense),
+            mc.value,
+            "the materialized table"
+        );
         let t = crate::table_key::DenseTable::new(&dense.vals, dense.n_rows_log).expect("a key");
-        let o = t.open(&mc, &mut FsChallenger::new(b"k")).expect("the claim opens");
-        assert!(crate::table_key::verify_dense(&t.key, &mc, &o, &mut FsChallenger::new(b"k")));
+        let o = t
+            .open(&mc, &mut FsChallenger::new(b"k"))
+            .expect("the claim opens");
+        assert!(crate::table_key::verify_dense(
+            &t.key,
+            &mc,
+            &o,
+            &mut FsChallenger::new(b"k")
+        ));
 
         let mut bad = assertion.clone();
         bad.value += F128::ONE;

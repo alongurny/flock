@@ -1321,3 +1321,36 @@ pub(super) fn leaf_boolean_mats(lo: &LeafOuter) -> Vec<(&SparseBinaryMatrix, &Sp
     ordered.sort_by_key(|(slot, _)| *slot);
     ordered.into_iter().map(|(_, matrices)| matrices).collect()
 }
+
+/// [`leaf_boolean_mats`] for the root check: the BLAKE3 slots use the
+/// succinct `O(K)` evaluator instead of the 44M-nonzero matrices (the leaf's
+/// `b3_r1cs` is always [`build_block_r1cs`], the shared BLAKE3 matrices).
+pub(super) fn leaf_boolean_fold_mats(
+    lo: &LeafOuter,
+) -> Vec<(
+    &dyn flock_core::matrix_fold::FoldMatrix,
+    &dyn flock_core::matrix_fold::FoldMatrix,
+)> {
+    use crate::r1cs_hashes::blake3::{SUCCINCT_A, SUCCINCT_B};
+    use flock_core::matrix_fold::FoldMatrix;
+    fn pair(r: &BlockR1cs) -> (&dyn FoldMatrix, &dyn FoldMatrix) {
+        (&r.a_0, &r.b_0)
+    }
+    let mut ordered = vec![
+        (lo.swap_slot, pair(&lo.swap_r1cs)),
+        (lo.spread_slot, pair(&lo.spread_r1cs)),
+        (lo.pow_slot, pair(&lo.pow_r1cs)),
+        (lo.family_slot, pair(&lo.family_r1cs)),
+    ];
+    ordered.extend(lo.b3_slots.iter().map(|&slot| {
+        (
+            slot,
+            (
+                &SUCCINCT_A as &dyn FoldMatrix,
+                &SUCCINCT_B as &dyn FoldMatrix,
+            ),
+        )
+    }));
+    ordered.sort_by_key(|(slot, _)| *slot);
+    ordered.into_iter().map(|(_, matrices)| matrices).collect()
+}

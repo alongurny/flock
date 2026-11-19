@@ -47,7 +47,10 @@ fn build_batch(k: usize, out: &str) -> (LeanCircuit, HashMap<Tuple, u64>) {
     let (c, left) = LeanCircuit::build_side(&g, &b, Side::Batch, batch_base(k), &HashMap::new())
         .unwrap_or_else(|e| panic!("batch {k}: {e}"));
     // What is left is asked of the shared side: terms and declarations.
-    let bad: Vec<_> = left.keys().filter(|t| ![1, 3, 9, 10, 11, 13, 15].contains(&tag(t))).collect();
+    let bad: Vec<_> = left
+        .keys()
+        .filter(|t| ![1, 3, 9, 10, 11, 13, 15].contains(&tag(t)))
+        .collect();
     assert!(
         bad.is_empty(),
         "batch {k} asks for {} tuples no one gives, e.g. {:?}",
@@ -148,10 +151,13 @@ fn main() {
             // The cone's declaration rows (`lean_dump --info`), when given:
             // they join the shared side first, and the rules that read a
             // constructor or a recursor get their certificates.
-            let info = a.get(4).map(|f| Rows::parse(&fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}")));
+            let info = a.get(4).map(|f| {
+                Rows::parse(&fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: {e}"))
+            });
             if let Some(f) = a.get(4) {
                 let r = Rows::parse(&fs::read_to_string(f).unwrap()).unwrap();
-                cone.add(r, &mut Rows::default()).unwrap_or_else(|e| panic!("{f}: {e}"));
+                cone.add(r, &mut Rows::default())
+                    .unwrap_or_else(|e| panic!("{f}: {e}"));
             }
             let (mut facts, mut goals) = (0, 0);
             let mut census: std::collections::BTreeMap<String, (usize, bool)> = Default::default();
@@ -159,7 +165,8 @@ fn main() {
                 let mut batch = Rows::default();
                 for f in files {
                     let text = fs::read_to_string(Path::new(dir).join(f)).unwrap();
-                    let r = Rows::parse_with(&text, info.as_ref()).unwrap_or_else(|e| panic!("{f}: {e}"));
+                    let r = Rows::parse_with(&text, info.as_ref())
+                        .unwrap_or_else(|e| panic!("{f}: {e}"));
                     cone.add(r, &mut batch)
                         .unwrap_or_else(|e| panic!("{f}: {e}"));
                 }

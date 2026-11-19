@@ -129,7 +129,11 @@ impl DenseTable {
     /// Prove every claim with ONE opening: a random combination
     /// `Σ ρ^i·b_i` of their bases against `Σ ρ^i·value_i`, `ρ` drawn after
     /// all claims are bound. `None` if any claim does not fit or is false.
-    pub fn open_many<Ch: Challenger>(&self, claims: &[MatrixClaim], ch: &mut Ch) -> Option<DenseOpening> {
+    pub fn open_many<Ch: Challenger>(
+        &self,
+        claims: &[MatrixClaim],
+        ch: &mut Ch,
+    ) -> Option<DenseOpening> {
         let items: Vec<(TensorBasis, F128)> = claims
             .iter()
             .map(|c| Some((TensorBasis::of(&self.key, c)?, c.value)))
@@ -139,14 +143,22 @@ impl DenseTable {
 
     /// [`Self::open_many`] over explicit bases on the committed vector:
     /// `⟨vals, b_i⟩ = value_i` for each `(b_i, value_i)`.
-    pub fn open_bases<Ch: Challenger>(&self, items: &[(TensorBasis, F128)], ch: &mut Ch) -> Option<DenseOpening> {
+    pub fn open_bases<Ch: Challenger>(
+        &self,
+        items: &[(TensorBasis, F128)],
+        ch: &mut Ch,
+    ) -> Option<DenseOpening> {
         if items.is_empty() || items.iter().any(|(b, _)| b.bits() != self.key.log_n) {
             return None;
         }
         let mut mats = Vec::with_capacity(items.len());
         for (basis, value) in items {
             let m = basis.materialize();
-            let honest = self.vals.iter().zip(&m).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
+            let honest = self
+                .vals
+                .iter()
+                .zip(&m)
+                .fold(F128::ZERO, |a, (x, y)| a + *x * *y);
             if honest != *value {
                 return None;
             }
@@ -235,7 +247,10 @@ pub fn verify_dense_bases<Ch: Challenger>(
         |prefix, residual_log| {
             let mut acc = vec![F256::ZERO; 1usize << residual_log];
             for ((basis, _), &q) in items.iter().zip(&powers) {
-                for (a, x) in acc.iter_mut().zip(basis.fold_residual(prefix, residual_log)) {
+                for (a, x) in acc
+                    .iter_mut()
+                    .zip(basis.fold_residual(prefix, residual_log))
+                {
                     *a += q * x;
                 }
             }
@@ -394,7 +409,11 @@ impl TensorBasis {
 
     pub fn fold_residual(&self, prefix: &[F256], residual_log: usize) -> Vec<F256> {
         let total: usize = self.factors.iter().map(Factor::bits).sum();
-        assert_eq!(prefix.len() + residual_log, total, "prefix and residual cover b");
+        assert_eq!(
+            prefix.len() + residual_log,
+            total,
+            "prefix and residual cover b"
+        );
         let mut scale = F256::from(self.scale);
         let mut residual: Vec<F256> = vec![F256::ONE];
         let mut at = 0usize;
@@ -473,7 +492,12 @@ mod tests {
         (0..n).map(|_| rng.sample_f128()).collect()
     }
 
-    fn claim(rng: &mut RandomChallenger, m: &DenseMatrix, row: (usize, usize), col: (usize, usize)) -> MatrixClaim {
+    fn claim(
+        rng: &mut RandomChallenger,
+        m: &DenseMatrix,
+        row: (usize, usize),
+        col: (usize, usize),
+    ) -> MatrixClaim {
         let row = Weight::low_eq(rand_vec(rng, 1 << row.0), rand_vec(rng, row.1));
         let col = Weight::low_eq(rand_vec(rng, 1 << col.0), rand_vec(rng, col.1));
         let (rw, cw) = (row.materialize(), col.materialize());
@@ -509,7 +533,10 @@ mod tests {
             let mut pc = FsChallenger::new(b"table-key-test");
             let o = t.open(&c, &mut pc).expect("an honest claim opens");
             let mut vc = FsChallenger::new(b"table-key-test");
-            assert!(verify_dense(&t.key, &c, &o, &mut vc), "honest opening at {row:?} {col:?}");
+            assert!(
+                verify_dense(&t.key, &c, &o, &mut vc),
+                "honest opening at {row:?} {col:?}"
+            );
 
             // A wrong value is rejected.
             let mut bad = c.clone();
@@ -525,19 +552,44 @@ mod tests {
         let mut rng = RandomChallenger::new(0x3A11_C1A1);
         let rows_log = 7;
         let vals = rand_vec(&mut rng, 1 << 15);
-        let m = DenseMatrix { vals: vals.clone(), n_rows_log: rows_log };
+        let m = DenseMatrix {
+            vals: vals.clone(),
+            n_rows_log: rows_log,
+        };
         let t = DenseTable::new(&vals, rows_log).unwrap();
-        let cs: Vec<MatrixClaim> = (0..5).map(|i| claim(&mut rng, &m, (i % 2, 7 - i % 2), (0, 8))).collect();
+        let cs: Vec<MatrixClaim> = (0..5)
+            .map(|i| claim(&mut rng, &m, (i % 2, 7 - i % 2), (0, 8)))
+            .collect();
         let o = t.open_many(&cs, &mut FsChallenger::new(b"m")).unwrap();
-        assert!(verify_dense_many(&t.key, &cs, &o, &mut FsChallenger::new(b"m")));
+        assert!(verify_dense_many(
+            &t.key,
+            &cs,
+            &o,
+            &mut FsChallenger::new(b"m")
+        ));
         // Any one claim changed, dropped or reordered is rejected.
         let mut bad = cs.clone();
         bad[3].value += F128::ONE;
-        assert!(!verify_dense_many(&t.key, &bad, &o, &mut FsChallenger::new(b"m")));
-        assert!(!verify_dense_many(&t.key, &cs[..4], &o, &mut FsChallenger::new(b"m")));
+        assert!(!verify_dense_many(
+            &t.key,
+            &bad,
+            &o,
+            &mut FsChallenger::new(b"m")
+        ));
+        assert!(!verify_dense_many(
+            &t.key,
+            &cs[..4],
+            &o,
+            &mut FsChallenger::new(b"m")
+        ));
         let mut swapped = cs.clone();
         swapped.swap(0, 1);
-        assert!(!verify_dense_many(&t.key, &swapped, &o, &mut FsChallenger::new(b"m")));
+        assert!(!verify_dense_many(
+            &t.key,
+            &swapped,
+            &o,
+            &mut FsChallenger::new(b"m")
+        ));
     }
 
     #[test]
@@ -580,10 +632,21 @@ mod bench {
             let key_ms = t0.elapsed().as_secs_f64() * 1e3;
             let row = Weight::eq((0..rows_log).map(|_| rng.sample_f128()).collect());
             let col = Weight::eq((0..log_n - rows_log).map(|_| rng.sample_f128()).collect());
-            let b = TensorBasis::of(&t.key, &MatrixClaim { row: row.clone(), col: col.clone(), value: F128::ZERO })
-                .unwrap()
-                .materialize();
-            let value = t.vals.iter().zip(&b).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
+            let b = TensorBasis::of(
+                &t.key,
+                &MatrixClaim {
+                    row: row.clone(),
+                    col: col.clone(),
+                    value: F128::ZERO,
+                },
+            )
+            .unwrap()
+            .materialize();
+            let value = t
+                .vals
+                .iter()
+                .zip(&b)
+                .fold(F128::ZERO, |a, (x, y)| a + *x * *y);
             let c = MatrixClaim { row, col, value };
             let t1 = std::time::Instant::now();
             let o = t.open(&c, &mut FsChallenger::new(b"b")).unwrap();

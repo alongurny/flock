@@ -75,7 +75,9 @@ pub fn prove_lean_tower(
     env: LeanEnvelope,
 ) -> LeanTowerReport {
     let words: Vec<[u8; 32]> = (0..n).map(|i| leaf_word(&piece(i))).collect();
-    prove_lean_tower_streaming(cfg, &words, piece, statement, env, |line| eprintln!("{line}"))
+    prove_lean_tower_streaming(cfg, &words, piece, statement, env, |line| {
+        eprintln!("{line}")
+    })
 }
 
 /// What the root's statement names besides the commitment root: every
@@ -121,7 +123,10 @@ pub fn prove_lean_tower_streaming(
             false
         }
     };
-    LeanTowerReport { balanced, ..s.report }
+    LeanTowerReport {
+        balanced,
+        ..s.report
+    }
 }
 
 /// What one segment's root proof states: the commitment root of its own
@@ -148,7 +153,12 @@ pub struct LeanSegmentOut {
 
 impl LeanSegmentOut {
     pub fn claim(&self) -> SegmentClaim {
-        SegmentClaim { root: self.root, seed: self.seed, send: self.send, recv: self.recv }
+        SegmentClaim {
+            root: self.root,
+            seed: self.seed,
+            send: self.send,
+            recv: self.recv,
+        }
     }
 }
 
@@ -433,6 +443,17 @@ pub fn prove_lean_segment(
     let tm = Instant::now();
     assert!(lane_acc.discharge(&family.mats), "the lane's boolean class");
     let t_bool = tm.elapsed().as_secs_f64() * 1e3;
+    if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+        let tm = Instant::now();
+        let _ = lane_acc.discharge(&family.mats);
+        let t2 = tm.elapsed().as_secs_f64() * 1e3;
+        let w = &lane_acc.per_type[0].0;
+        eprintln!(
+            "lane boolean again {t2:.2} ms; row weight low {} point {}",
+            w.row.low.len(),
+            w.row.point.len()
+        );
+    }
     let tm = Instant::now();
     assert!(
         lane_acc.discharge_element(&el_mats),
@@ -472,11 +493,36 @@ pub fn prove_lean_segment(
     if std::env::var_os("LEAN_ROOT_KEY").is_some() {
         use super::root_key::{RootKeyTables, describe};
         use flock_core::circuit::Circuit;
-        let mut circs: Vec<&Circuit> = vec![leaf_circuit, &fl0.lo.shape.circuit, &root.lo.shape.circuit];
+        let mut circs: Vec<&Circuit> =
+            vec![leaf_circuit, &fl0.lo.shape.circuit, &root.lo.shape.circuit];
         if let Some(b) = base.as_ref() {
             circs.push(&b.lo.shape.circuit);
         }
         print!("{}", describe(&circs));
+        if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+            let nnz = |m: &flock_core::r1cs::SparseBinaryMatrix| {
+                m.rows.iter().map(|r| r.len()).sum::<usize>()
+            };
+            for (a, b) in family.mats.iter() {
+                eprintln!(
+                    "lane boolean: {}x{} nnz {} + {}",
+                    a.num_rows,
+                    a.num_cols,
+                    nnz(a),
+                    nnz(b)
+                );
+            }
+            for (a, b) in super::query::leaf_boolean_mats(&fl0.lo) {
+                eprintln!(
+                    "main boolean: {}x{} nnz {} + {} at {:p}",
+                    a.num_rows,
+                    a.num_cols,
+                    nnz(a),
+                    nnz(b),
+                    a
+                );
+            }
+        }
         let tk = Instant::now();
         let keys = RootKeyTables::new(&circs).expect("the root key");
         let key_ms = tk.elapsed().as_secs_f64() * 1e3;
@@ -495,14 +541,22 @@ pub fn prove_lean_segment(
         let tp = Instant::now();
         let proof = keys.prove(&claims).expect("the root key proves");
         let prove_ms = tp.elapsed().as_secs_f64() * 1e3;
-        let bytes = bincode::serialize(&proof).expect("a proof serializes").len();
+        let bytes = bincode::serialize(&proof)
+            .expect("a proof serializes")
+            .len();
         let tv = Instant::now();
-        assert!(keys.key.verify(keys.circuits(), &claims, &proof), "the root key verifies");
+        assert!(
+            keys.key.verify(keys.circuits(), &claims, &proof),
+            "the root key verifies"
+        );
         let verify_ms = tv.elapsed().as_secs_f64() * 1e3;
         // A wrong claim value is refused.
         let mut bad = claims.clone();
         bad[0].1.value += F128::ONE;
-        assert!(!keys.key.verify(keys.circuits(), &bad, &proof), "a tampered claim fails");
+        assert!(
+            !keys.key.verify(keys.circuits(), &bad, &proof),
+            "a tampered claim fails"
+        );
         progress(&format!(
             "root key: {} tables, {} sigma claims; key {key_ms:.0} ms, prove {prove_ms:.0} ms, proof {} KiB, verify {verify_ms:.1} ms",
             keys.key.tables.len(),
@@ -536,7 +590,9 @@ pub fn prove_lean_segment(
 #[ignore] // Heavier — run alone with `-- --ignored`.
 #[cfg(not(target_arch = "aarch64"))]
 fn lean_tower_spine() {
-    use crate::lean_rows::{LeafSlot, LeanCircuit, Profile, Rows, leaf, leaf_prims, leaf_statement};
+    use crate::lean_rows::{
+        LeafSlot, LeanCircuit, Profile, Rows, leaf, leaf_prims, leaf_statement,
+    };
     let small = include_str!("../../tests/data/lean_small.rows");
     let rows = Rows::merge((0..9000).map(|_| Rows::parse(small).unwrap()).collect());
     let c = LeanCircuit::build(&rows).unwrap();
@@ -550,7 +606,11 @@ fn lean_tower_spine() {
     let deal = profile.deal(&per_table, 8);
     let mut st = LeanStatement::default();
     for (i, d) in deal.iter().enumerate() {
-        let slots: Vec<LeafSlot<'_>> = d.iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
+        let slots: Vec<LeafSlot<'_>> = d
+            .iter()
+            .zip(&profile.slots)
+            .map(|(x, &s)| x.map(|ch| c.slot(s, ch)))
+            .collect();
         let (w, k) = leaf_statement(&c, &profile, &slots, i);
         st.chunk_words.extend(w);
         st.keys.extend(k);
@@ -560,7 +620,11 @@ fn lean_tower_spine() {
         super::test_config(),
         8,
         |i| {
-            let slots: Vec<LeafSlot<'_>> = deal[i].iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
+            let slots: Vec<LeafSlot<'_>> = deal[i]
+                .iter()
+                .zip(&profile.slots)
+                .map(|(x, &s)| x.map(|ch| c.slot(s, ch)))
+                .collect();
             leaf(&c, &profile, &slots, i).unwrap()
         },
         &st,
@@ -577,13 +641,24 @@ fn lean_tower_spine() {
     // own: together they balance, and not with a claim changed or the
     // challenges of another root.
     let mut piece = |i: usize| {
-        let slots: Vec<LeafSlot<'_>> = deal[i].iter().zip(&profile.slots).map(|(x, &s)| x.map(|ch| c.slot(s, ch))).collect();
+        let slots: Vec<LeafSlot<'_>> = deal[i]
+            .iter()
+            .zip(&profile.slots)
+            .map(|(x, &s)| x.map(|ch| c.slot(s, ch)))
+            .collect();
         leaf(&c, &profile, &slots, i).unwrap()
     };
     let words: Vec<[u8; 32]> = (0..8).map(|i| leaf_word(&piece(i))).collect();
-    let roots = [lean_segment_root(&words[..4]), lean_segment_root(&words[4..])];
+    let roots = [
+        lean_segment_root(&words[..4]),
+        lean_segment_root(&words[4..]),
+    ];
     let all = lean_segments_root(&roots);
-    let env = LeanEnvelope { nu: 15, lanes: 40, m: 30 };
+    let env = LeanEnvelope {
+        nu: 15,
+        lanes: 40,
+        m: 30,
+    };
     let claims: Vec<SegmentClaim> = (0..2)
         .map(|s| {
             let o = prove_lean_segment(
@@ -600,7 +675,11 @@ fn lean_tower_spine() {
         })
         .collect();
     assert_eq!(segments_balanced(&all, &claims, &st), Ok(true));
-    assert_eq!(segments_balanced(&all, &claims[..1], &st).ok(), None, "a segment missing");
+    assert_eq!(
+        segments_balanced(&all, &claims[..1], &st).ok(),
+        None,
+        "a segment missing"
+    );
     let mut swapped = claims.clone();
     swapped.swap(0, 1);
     assert!(segments_balanced(&all, &swapped, &st).is_err());

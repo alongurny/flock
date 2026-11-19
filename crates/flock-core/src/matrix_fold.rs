@@ -139,6 +139,36 @@ impl Weight {
         out
     }
 
+    /// The first `n` entries of [`Self::materialize`] (`n` a power of two,
+    /// at most the full length) in `O(n)`: entries past a matrix's edge
+    /// meet zeros, so the root check never builds the rest.
+    pub fn materialize_prefix(&self, n: usize) -> Vec<F128> {
+        let full = 1usize << self.n_vars();
+        assert!(n.is_power_of_two() && n <= full);
+        let t = n.trailing_zeros() as usize;
+        let s = self.low.len().trailing_zeros() as usize;
+        // Index (hi << s) | lo < 2^t: the point coords past t − s sit at 0.
+        let used = t.saturating_sub(s);
+        let tail = self.point[used..]
+            .iter()
+            .fold(F128::ONE, |a, &p| a * (F128::ONE + p));
+        let mut eq = vec![tail];
+        for &p in &self.point[..used] {
+            let mut next = vec![F128::ZERO; eq.len() * 2];
+            for (i, &e) in eq.iter().enumerate() {
+                next[i] = e * (F128::ONE + p);
+                next[i + eq.len()] = e * p;
+            }
+            eq = next;
+        }
+        let lows = &self.low[..self.low.len().min(n)];
+        let mut out = Vec::with_capacity(n);
+        for &e in &eq {
+            out.extend(lows.iter().map(|&l| e * l));
+        }
+        out
+    }
+
     /// The full `2^k` vector — prover side only.
     pub fn materialize(&self) -> Vec<F128> {
         let s = self.low.len().trailing_zeros() as usize;
@@ -173,12 +203,16 @@ pub struct MatrixClaim {
 /// `Σ_{r,c} row(r)·col(c)·M[r,c]` — one pass over the nonzeros, `O(nnz)`.
 /// The honest value of a claim, and the root discharge.
 pub fn bilinear(row: &Weight, col: &Weight, m: &dyn FoldMatrix) -> F128 {
-    let rw = row.materialize();
-    let cw = col.materialize();
     assert!(
-        rw.len() >= m.n_rows() && cw.len() >= m.n_cols(),
+        (1usize << row.n_vars()) >= m.n_rows() && (1usize << col.n_vars()) >= m.n_cols(),
         "weights are too small for the matrix"
     );
+    // Only the prefix that meets the matrix matters.
+    let cap = |w: &Weight, n: usize| {
+        w.materialize_prefix(n.next_power_of_two().max(1).min(1usize << w.n_vars()))
+    };
+    let rw = cap(row, m.n_rows());
+    let cw = cap(col, m.n_cols());
     // ⟨row ⊗ col, M⟩ = ⟨row, M·col⟩ — one marginal, then a dot product.
     let g = m.row_marginal(&cw, rw.len());
     rw.iter().zip(&g).fold(F128::ZERO, |a, (x, y)| a + *x * *y)
@@ -1462,6 +1496,33 @@ pub fn verify_fold_jagged_with_grinding<Ch: Challenger>(
         col: Weight::eq(rho_col),
         value: proof.value,
     })
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::Weight;
+    use crate::test_rng::Rng;
+    use flock_field::F128;
+
+    #[test]
+    fn prefix_matches_the_full_weight() {
+        let mut rng = Rng::new(3);
+        let mut f = || F128::new(rng.next_u64(), rng.next_u64());
+        for (s, k) in [(0usize, 5usize), (2, 4), (3, 0), (1, 6)] {
+            let w = Weight::low_eq(
+                (0..1 << s).map(|_| f()).collect(),
+                (0..k).map(|_| f()).collect(),
+            );
+            let full = w.materialize();
+            for t in 0..=s + k {
+                assert_eq!(
+                    w.materialize_prefix(1 << t),
+                    full[..1 << t],
+                    "s {s} k {k} t {t}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

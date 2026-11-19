@@ -36,7 +36,7 @@ use crate::tower::{
         node_jagged_params,
     },
     online::census_kib,
-    query::{LeafOuter, leaf_boolean_mats},
+    query::LeafOuter,
     span_count_word,
     verify::RootBundle,
 };
@@ -352,10 +352,17 @@ impl Tower {
             return Err(Statement);
         }
         // (2) the chain lane vs the chain tables (leaf 0's shape).
-        let blake = chain_blake_r1cs(self.chain.inner.nu);
-        let chain_mats = [(&blake.a_0, &blake.b_0)];
+        // The chain tables are the shared BLAKE3 matrices; check them
+        // through the succinct O(K) evaluator.
+        let chain_mats: [(
+            &dyn flock_core::matrix_fold::FoldMatrix,
+            &dyn flock_core::matrix_fold::FoldMatrix,
+        ); 1] = [(
+            &crate::r1cs_hashes::blake3::SUCCINCT_A,
+            &crate::r1cs_hashes::blake3::SUCCINCT_B,
+        )];
         let chain_circuit = &self.chain.inner.built.shape.circuit;
-        if !lane.discharge(&chain_mats) {
+        if !lane.discharge_dyn(&chain_mats) {
             return Err(ChainLaneBoolean);
         }
         if !lane.per_element.is_empty() {
@@ -396,9 +403,17 @@ pub(super) fn discharge_outer(
 ) -> Result<(), RootDischargeFailure> {
     use RootDischargeFailure::*;
     // (3) the main fold vs the outer tables.
-    if !main.discharge(&leaf_boolean_mats(fl_lo)) {
+    let tr = std::time::Instant::now();
+    if !main.discharge_dyn(&super::query::leaf_boolean_fold_mats(fl_lo)) {
         return Err(Boolean);
     }
+    if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+        eprintln!(
+            "discharge_outer: boolean {:.1} ms",
+            tr.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let tr = std::time::Instant::now();
     let el_mats: Vec<_> = fl_lo
         .shape
         .registry
@@ -424,8 +439,21 @@ pub(super) fn discharge_outer(
         circuits.push(&b.lo.shape.circuit);
         layouts.push((b.lo.shape.circuit.digest(), jp));
     }
+    if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+        eprintln!(
+            "discharge_outer: element {:.1} ms",
+            tr.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let tr = std::time::Instant::now();
     if !main.discharge_sigma(&circuits) {
         return Err(Sigma);
+    }
+    if std::env::var_os("ROOT_KEY_TRACE").is_some() {
+        eprintln!(
+            "discharge_outer: sigma {:.1} ms",
+            tr.elapsed().as_secs_f64() * 1e3
+        );
     }
     if !main.discharge_jagged(&layouts) {
         return Err(Jagged);

@@ -42,8 +42,9 @@ use {
 
 #[cfg(not(target_arch = "aarch64"))]
 pub use crate::tower::lean_tower::{
-    LeanEnvelope, LeanSegmentOut, LeanStatement, LeanTowerReport, SegmentClaim, leaf_word, lean_segment_root,
-    lean_segments_root, prove_lean_segment, prove_lean_tower, prove_lean_tower_streaming, segments_balanced,
+    LeanEnvelope, LeanSegmentOut, LeanStatement, LeanTowerReport, SegmentClaim, leaf_word,
+    lean_segment_root, lean_segments_root, prove_lean_segment, prove_lean_tower,
+    prove_lean_tower_streaming, segments_balanced,
 };
 pub use crate::tower::{
     chain::{ChainOnlineMs, ChainProof, build_chain_proof},
@@ -164,8 +165,8 @@ mod lean_tower;
 mod node;
 mod online;
 mod query;
-mod root_key;
 mod real_walker;
+mod root_key;
 mod tape;
 mod verify;
 mod walker_common;
