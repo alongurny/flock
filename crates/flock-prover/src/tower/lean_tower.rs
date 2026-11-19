@@ -349,7 +349,7 @@ pub fn prove_lean_segment(
     // ---- THE BASE over the last two first-level nodes, then the SPINE,
     // one first-level node at a time ----
     let base_priors = [&fl_prev.acc, &fl_last.acc];
-    let base: NodeOut = build_node_outer_app(
+    let mut base: NodeOut = build_node_outer_app(
         cfg,
         &[&fl_prev.lo, &fl_last.lo],
         Some(app_base),
@@ -357,6 +357,8 @@ pub fn prove_lean_segment(
         None,
     );
     release_pool();
+    // Held to the root for the discharge; its program is spent.
+    base.lo.shape.drop_program();
     node_prove_ms += base.online.prove_ms;
     progress(&format!("base node: prove {:.0} ms", base.online.prove_ms));
     let (fl0, base, root) = if k == 2 {
