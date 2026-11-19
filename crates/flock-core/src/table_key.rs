@@ -83,6 +83,11 @@ impl DenseTable {
     /// Commit to a column-major table with `2^rows_log` rows. `vals.len()`
     /// must be a multiple of `2^rows_log` and a power of two.
     pub fn new(vals: &[F128], rows_log: usize) -> Option<Self> {
+        Self::new_owned(vals.to_vec(), rows_log)
+    }
+
+    /// [`Self::new`], taking the table (no copy).
+    pub fn new_owned(vals: Vec<F128>, rows_log: usize) -> Option<Self> {
         let n = vals.len();
         if !n.is_power_of_two() || n < (1usize << rows_log) {
             return None;
@@ -94,12 +99,12 @@ impl DenseTable {
             return None;
         }
         let (config, vconfig) = configs(log_n)?;
-        let mut padded = vals.to_vec();
+        let mut padded = vals;
         padded.resize(1usize << log_n, F128::ZERO);
         let k = config.initial_k;
         let rate = config.log_inv_rates[0];
         let ntt = AdditiveNttF128::standard(log_n - k + rate);
-        let w = ligero_commit(&padded, log_n - k, k, rate, &ntt, config.merkle_hash);
+        let mut w = ligero_commit(&padded, log_n - k, k, rate, &ntt, config.merkle_hash);
         let cap = w.cap(vconfig.level_zero_cap_depth()).to_vec();
         Some(Self {
             key: DenseKey {
@@ -109,8 +114,8 @@ impl DenseTable {
                 cap,
             },
             vals: padded,
-            mat: w.mat.clone(),
-            tree: w.tree.clone(),
+            mat: std::mem::take(&mut w.mat),
+            tree: std::mem::take(&mut w.tree),
             config,
         })
     }
@@ -151,7 +156,8 @@ impl DenseTable {
         if items.is_empty() || items.iter().any(|(b, _)| b.bits() != self.key.log_n) {
             return None;
         }
-        let mut mats = Vec::with_capacity(items.len());
+        // One basis materialized at a time (each is as long as the table):
+        // check every claim, then combine them after `rho` is drawn.
         for (basis, value) in items {
             let m = basis.materialize();
             let honest = self
@@ -162,16 +168,17 @@ impl DenseTable {
             if honest != *value {
                 return None;
             }
-            mats.push(m);
         }
         let rho = bind(ch, &self.key, items);
         let mut b = vec![F128::ZERO; self.vals.len()];
         let mut target = F128::ZERO;
         let mut p = F128::ONE;
-        for (m, (_, value)) in mats.iter().zip(items) {
-            for (x, y) in b.iter_mut().zip(m) {
+        for (basis, value) in items {
+            let m = basis.materialize();
+            for (x, y) in b.iter_mut().zip(&m) {
                 *x += p * *y;
             }
+            drop(m);
             target += p * *value;
             p *= rho;
         }

@@ -101,7 +101,6 @@ pub struct RootKey {
 pub struct RootKeyTables {
     pub key: RootKey,
     structures: Vec<StructureTable>,
-    q: Vec<Vec<F128>>,
     dense: DenseTable,
 }
 
@@ -331,8 +330,7 @@ impl RootKeyTables {
                 uniq.push(t);
             }
         }
-        let (tables, q): (Vec<StructureShape>, Vec<Vec<F128>>) =
-            uniq.iter().map(|c| StructureShape::of(c)).unzip();
+        let tables: Vec<StructureShape> = uniq.iter().map(|c| StructureShape::of(c).0).collect();
         let max_m = tables.iter().map(|t| t.m).max()?;
         let mut order: Vec<usize> = (0..tables.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(tables[i].m));
@@ -344,11 +342,11 @@ impl RootKeyTables {
         }
         let total_log = log2_ceil(at);
         let mut vals = vec![F128::ZERO; 1 << total_log];
-        for (b, qb) in q.iter().enumerate() {
-            vals[offsets[b]..][..qb.len()].copy_from_slice(qb);
+        for (b, t) in uniq.iter().enumerate() {
+            let qb = StructureShape::of(t).1;
+            vals[offsets[b]..][..qb.len()].copy_from_slice(&qb);
         }
-        let dense = DenseTable::new(&vals, max_m)?;
-        drop(vals);
+        let dense = DenseTable::new_owned(vals, max_m)?;
         Some(Self {
             key: RootKey {
                 tables,
@@ -357,7 +355,6 @@ impl RootKeyTables {
                 dense: dense.key.clone(),
             },
             structures: uniq,
-            q,
             dense,
         })
     }
@@ -416,8 +413,13 @@ impl RootKeyTables {
             let v = sig * s.scale.inv();
             let params = shape.params();
             let mut replay = ch.clone();
-            let (jp, ja, honest) =
-                jagged::prove_with_assist(&params, &self.q[i], &s.z_row, &s.z_col, &mut ch);
+            let (jp, ja, honest) = jagged::prove_with_assist(
+                &params,
+                &StructureShape::of(m).1,
+                &s.z_row,
+                &s.z_col,
+                &mut ch,
+            );
             if honest != v {
                 return None;
             }
