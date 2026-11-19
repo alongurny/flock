@@ -130,26 +130,37 @@ impl DenseTable {
     /// `Σ ρ^i·b_i` of their bases against `Σ ρ^i·value_i`, `ρ` drawn after
     /// all claims are bound. `None` if any claim does not fit or is false.
     pub fn open_many<Ch: Challenger>(&self, claims: &[MatrixClaim], ch: &mut Ch) -> Option<DenseOpening> {
-        let bases: Vec<TensorBasis> =
-            claims.iter().map(|c| TensorBasis::of(&self.key, c)).collect::<Option<_>>()?;
-        let mut b = vec![F128::ZERO; self.vals.len()];
-        let mut mats = Vec::with_capacity(bases.len());
-        for (basis, c) in bases.iter().zip(claims) {
+        let items: Vec<(TensorBasis, F128)> = claims
+            .iter()
+            .map(|c| Some((TensorBasis::of(&self.key, c)?, c.value)))
+            .collect::<Option<_>>()?;
+        self.open_bases(&items, ch)
+    }
+
+    /// [`Self::open_many`] over explicit bases on the committed vector:
+    /// `⟨vals, b_i⟩ = value_i` for each `(b_i, value_i)`.
+    pub fn open_bases<Ch: Challenger>(&self, items: &[(TensorBasis, F128)], ch: &mut Ch) -> Option<DenseOpening> {
+        if items.is_empty() || items.iter().any(|(b, _)| b.bits() != self.key.log_n) {
+            return None;
+        }
+        let mut mats = Vec::with_capacity(items.len());
+        for (basis, value) in items {
             let m = basis.materialize();
             let honest = self.vals.iter().zip(&m).fold(F128::ZERO, |a, (x, y)| a + *x * *y);
-            if honest != c.value {
+            if honest != *value {
                 return None;
             }
             mats.push(m);
         }
-        let rho = bind(ch, &self.key, claims);
+        let rho = bind(ch, &self.key, items);
+        let mut b = vec![F128::ZERO; self.vals.len()];
         let mut target = F128::ZERO;
         let mut p = F128::ONE;
-        for (m, c) in mats.iter().zip(claims) {
+        for (m, (_, value)) in mats.iter().zip(items) {
             for (x, y) in b.iter_mut().zip(m) {
                 *x += p * *y;
             }
-            target += p * c.value;
+            target += p * *value;
             p *= rho;
         }
         let proof = recursive_prover_with_basis(
@@ -182,21 +193,35 @@ pub fn verify_dense_many<Ch: Challenger>(
     opening: &DenseOpening,
     ch: &mut Ch,
 ) -> bool {
-    if claims.is_empty() {
-        return false;
-    }
-    let Some(bases) = claims.iter().map(|c| TensorBasis::of(key, c)).collect::<Option<Vec<_>>>() else {
+    let Some(items) = claims
+        .iter()
+        .map(|c| Some((TensorBasis::of(key, c)?, c.value)))
+        .collect::<Option<Vec<_>>>()
+    else {
         return false;
     };
+    verify_dense_bases(key, &items, opening, ch)
+}
+
+/// Check one opening of explicit bases ([`DenseTable::open_bases`]).
+pub fn verify_dense_bases<Ch: Challenger>(
+    key: &DenseKey,
+    items: &[(TensorBasis, F128)],
+    opening: &DenseOpening,
+    ch: &mut Ch,
+) -> bool {
+    if items.is_empty() || items.iter().any(|(b, _)| b.bits() != key.log_n) {
+        return false;
+    }
     let Some((_, vconfig)) = configs(key.log_n) else {
         return false;
     };
-    let rho = bind(ch, key, claims);
+    let rho = bind(ch, key, items);
     let mut target = F128::ZERO;
     let mut p = F128::ONE;
-    let mut powers = Vec::with_capacity(claims.len());
-    for c in claims {
-        target += p * c.value;
+    let mut powers = Vec::with_capacity(items.len());
+    for (_, value) in items {
+        target += p * *value;
         powers.push(F256::from(p));
         p *= rho;
     }
@@ -209,7 +234,7 @@ pub fn verify_dense_many<Ch: Challenger>(
         None,
         |prefix, residual_log| {
             let mut acc = vec![F256::ZERO; 1usize << residual_log];
-            for (basis, &q) in bases.iter().zip(&powers) {
+            for ((basis, _), &q) in items.iter().zip(&powers) {
                 for (a, x) in acc.iter_mut().zip(basis.fold_residual(prefix, residual_log)) {
                     *a += q * x;
                 }
@@ -220,27 +245,23 @@ pub fn verify_dense_many<Ch: Challenger>(
     )
 }
 
-fn bind<Ch: Challenger>(ch: &mut Ch, key: &DenseKey, claims: &[MatrixClaim]) -> F128 {
-    ch.observe_label(b"flock-table-key-dense-v0");
+fn bind<Ch: Challenger>(ch: &mut Ch, key: &DenseKey, items: &[(TensorBasis, F128)]) -> F128 {
+    ch.observe_label(b"flock-table-key-dense-v1");
+    ch.observe_bytes(&(key.log_n as u64).to_le_bytes());
     for h in &key.cap {
         ch.observe_bytes(h.as_ref());
     }
-    ch.observe_bytes(&(claims.len() as u64).to_le_bytes());
-    for claim in claims {
-        for w in [&claim.row, &claim.col] {
-            ch.observe_bytes(&(w.low.len() as u64).to_le_bytes());
-            ch.observe_f128_slice(&w.low);
-            ch.observe_bytes(&(w.point.len() as u64).to_le_bytes());
-            ch.observe_f128_slice(&w.point);
-        }
-        ch.observe_f128(claim.value);
+    ch.observe_bytes(&(items.len() as u64).to_le_bytes());
+    for (basis, value) in items {
+        basis.observe(ch);
+        ch.observe_f128(*value);
     }
     ch.sample_f128()
 }
 
 /// One factor of a tensor weight, over consecutive index bits.
 #[derive(Clone, Debug)]
-pub(crate) enum Factor {
+pub enum Factor {
     /// An explicit table over `log2(len)` bits.
     Explicit(Vec<F128>),
     /// `eq(point, ·)` over `point.len()` bits.
@@ -258,14 +279,55 @@ impl Factor {
 
 /// The basis `b` on the committed vector: `scale · ⊗ factors`, LSB first.
 #[derive(Clone, Debug)]
-pub(crate) struct TensorBasis {
+pub struct TensorBasis {
     scale: F128,
     factors: Vec<Factor>,
 }
 
 impl TensorBasis {
+    /// `scale · ⊗ factors`, the first factor on the lowest bits.
+    pub fn new(scale: F128, factors: Vec<Factor>) -> Self {
+        Self { scale, factors }
+    }
+
+    /// The index bits the basis spans.
+    pub fn bits(&self) -> usize {
+        self.factors.iter().map(Factor::bits).sum()
+    }
+
+    /// Bind the basis to a transcript (its shape and every coefficient).
+    pub fn observe<Ch: Challenger>(&self, ch: &mut Ch) {
+        ch.observe_f128(self.scale);
+        ch.observe_bytes(&(self.factors.len() as u64).to_le_bytes());
+        for f in &self.factors {
+            let (tag, v) = match f {
+                Factor::Explicit(v) => (0u8, v),
+                Factor::Eq(p) => (1u8, p),
+            };
+            ch.observe_bytes(&[tag]);
+            ch.observe_bytes(&(v.len() as u64).to_le_bytes());
+            ch.observe_f128_slice(v);
+        }
+    }
+
+    /// A weight as factors over exactly `bits` index bits: restricted to
+    /// its first `2^bits` entries, or (with `pad`) extended by zeros when it
+    /// spans fewer, for a table whose entries there are zero.
+    pub fn weight_factors(w: &Weight, bits: usize, pad: bool) -> Option<(F128, Vec<Factor>)> {
+        let n = w.low.len().trailing_zeros() as usize + w.point.len();
+        if n >= bits {
+            return restrict(w, bits);
+        }
+        if !pad {
+            return None;
+        }
+        let (s, mut f) = restrict(w, n)?;
+        f.push(Factor::Eq(vec![F128::ZERO; bits - n]));
+        Some((s, f))
+    }
+
     /// The weight `row ⊗ col` restricted to the table, zero on padding.
-    pub(crate) fn of(key: &DenseKey, claim: &MatrixClaim) -> Option<Self> {
+    pub fn of(key: &DenseKey, claim: &MatrixClaim) -> Option<Self> {
         let mut scale = F128::ONE;
         let mut factors = Vec::new();
         for (w, bits) in [(&claim.row, key.rows_log), (&claim.col, key.cols_log)] {
@@ -283,7 +345,7 @@ impl TensorBasis {
         Some(Self { scale, factors })
     }
 
-    pub(crate) fn materialize(&self) -> Vec<F128> {
+    pub fn materialize(&self) -> Vec<F128> {
         let mut out = vec![self.scale];
         for f in &self.factors {
             let t = match f {
@@ -303,7 +365,7 @@ impl TensorBasis {
 
     /// `b(prefix, y)` for every `y` over the last `residual_log` bits.
     /// The basis MLE at a full point `z` (LSB first).
-    pub(crate) fn eval_at(&self, z: &[F128]) -> F128 {
+    pub fn eval_at(&self, z: &[F128]) -> F128 {
         let mut acc = self.scale;
         let mut at = 0usize;
         for f in &self.factors {
@@ -330,7 +392,7 @@ impl TensorBasis {
         acc
     }
 
-    pub(crate) fn fold_residual(&self, prefix: &[F256], residual_log: usize) -> Vec<F256> {
+    pub fn fold_residual(&self, prefix: &[F256], residual_log: usize) -> Vec<F256> {
         let total: usize = self.factors.iter().map(Factor::bits).sum();
         assert_eq!(prefix.len() + residual_log, total, "prefix and residual cover b");
         let mut scale = F256::from(self.scale);

@@ -126,23 +126,11 @@ fn fold(v: &mut Vec<F128>, r: F128) {
         .collect();
 }
 
-/// A weight restricted to `bits` and padded with zeros to `size_log`, as a
-/// basis over `size_log` bits.
-fn weight_basis(w: &Weight, bits: usize, size_log: usize) -> Option<TensorBasis> {
-    let key = DenseKey {
-        rows_log: bits,
-        cols_log: 0,
-        log_n: size_log,
-        cap: Vec::new(),
-    };
-    TensorBasis::of(
-        &key,
-        &MatrixClaim {
-            row: w.clone(),
-            col: Weight::eq(Vec::new()),
-            value: F128::ZERO,
-        },
-    )
+/// A weight as a basis over exactly `bits` bits (a narrower matrix pads
+/// with zeros: its entries there are zero).
+fn weight_basis(w: &Weight, bits: usize) -> Option<TensorBasis> {
+    let (s, f) = TensorBasis::weight_factors(w, bits, true)?;
+    Some(TensorBasis::new(s, f))
 }
 
 fn slot_weight(slot: usize, bits: usize) -> Weight {
@@ -215,8 +203,8 @@ fn claim_bases(key: &SparseKey, claims: &[MatrixClaim]) -> Option<Vec<(TensorBas
         .iter()
         .map(|c| {
             Some((
-                weight_basis(&c.row, key.rows_log, key.rows_log)?,
-                weight_basis(&c.col, key.cols_log, key.cols_log)?,
+                weight_basis(&c.row, key.rows_log)?,
+                weight_basis(&c.col, key.cols_log)?,
             ))
         })
         .collect()
