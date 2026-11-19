@@ -88,8 +88,12 @@ impl StructureShape {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootKey {
     pub tables: Vec<StructureShape>,
-    /// Bits of one block (the largest `m`).
-    pub block_log: usize,
+    /// Where each table's sigma entries start in the dense vector: tables
+    /// sit largest first, so every offset is a multiple of its table's
+    /// `2^m` (no block padding beyond each table's own).
+    pub offsets: Vec<usize>,
+    /// Bits of the dense vector.
+    pub total_log: usize,
     pub dense: DenseKey,
 }
 
@@ -164,22 +168,16 @@ fn bind<Ch: Challenger>(ch: &mut Ch, key: &RootKey, claims: &[(usize, MatrixClai
 }
 
 impl RootKey {
-    fn blocks_log(&self) -> usize {
-        log2_ceil(self.tables.len())
-    }
-
-    /// The dense basis that reads block `b` at `point` (`m` bits).
+    /// The dense basis that reads table `b` at `point` (`m` bits).
     fn basis(&self, b: usize, m: usize, point: &[F128]) -> TensorBasis {
         let mut f = vec![Factor::Eq(point.to_vec())];
-        if self.block_log > m {
-            f.push(Factor::Eq(vec![F128::ZERO; self.block_log - m]));
-        }
-        let bl = self.blocks_log();
-        if bl > 0 {
+        let hi = self.offsets[b] >> m;
+        let bits = self.total_log - m;
+        if bits > 0 {
             f.push(Factor::Eq(
-                (0..bl)
+                (0..bits)
                     .map(|j| {
-                        if (b >> j) & 1 == 1 {
+                        if (hi >> j) & 1 == 1 {
                             F128::ONE
                         } else {
                             F128::ZERO
@@ -188,9 +186,11 @@ impl RootKey {
                     .collect(),
             ));
         }
-        let used = self.block_log + bl;
-        if self.dense.log_n > used {
-            f.push(Factor::Eq(vec![F128::ZERO; self.dense.log_n - used]));
+        if self.dense.log_n > self.total_log {
+            f.push(Factor::Eq(vec![
+                F128::ZERO;
+                self.dense.log_n - self.total_log
+            ]));
         }
         TensorBasis::new(F128::ONE, f)
     }
@@ -207,6 +207,7 @@ impl RootKey {
         let t_all = std::time::Instant::now();
         let n = self.tables.len();
         if vks.len() != n
+            || self.offsets.len() != n
             || proof.folds.len() != n
             || proof.jagged.len() != n
             || claims.iter().any(|(t, _)| *t >= n)
@@ -332,17 +333,27 @@ impl RootKeyTables {
         }
         let (tables, q): (Vec<StructureShape>, Vec<Vec<F128>>) =
             uniq.iter().map(|c| StructureShape::of(c)).unzip();
-        let block_log = tables.iter().map(|t| t.m).max()?;
-        let blocks = tables.len().next_power_of_two();
-        let mut vals = vec![F128::ZERO; blocks << block_log];
-        for (b, qb) in q.iter().enumerate() {
-            vals[b << block_log..][..qb.len()].copy_from_slice(qb);
+        let max_m = tables.iter().map(|t| t.m).max()?;
+        let mut order: Vec<usize> = (0..tables.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(tables[i].m));
+        let mut offsets = vec![0; tables.len()];
+        let mut at = 0usize;
+        for &i in &order {
+            offsets[i] = at;
+            at += 1 << tables[i].m;
         }
-        let dense = DenseTable::new(&vals, block_log)?;
+        let total_log = log2_ceil(at);
+        let mut vals = vec![F128::ZERO; 1 << total_log];
+        for (b, qb) in q.iter().enumerate() {
+            vals[offsets[b]..][..qb.len()].copy_from_slice(qb);
+        }
+        let dense = DenseTable::new(&vals, max_m)?;
+        drop(vals);
         Some(Self {
             key: RootKey {
                 tables,
-                block_log,
+                offsets,
+                total_log,
                 dense: dense.key.clone(),
             },
             structures: uniq,

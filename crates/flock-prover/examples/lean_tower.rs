@@ -1014,18 +1014,6 @@ fn main() {
                         r.discharge_ms,
                         t.elapsed().as_secs_f64(),
                     );
-                    if !o.key_claims.is_empty() && std::env::var_os("LEAN_KEY_PROBE").is_some() {
-                        let b = prove_root_key_batch(o.key_tables.clone(), &o.key_claims);
-                        println!(
-                            "segment {s}: root key probe: {} tables, {} sigma claims; key {:.0} ms, prove {:.0} ms, proof {} KiB, verify {:.1} ms",
-                            b.tables,
-                            b.claims,
-                            b.key_ms,
-                            b.prove_ms,
-                            b.proof_bytes / 1024,
-                            b.verify_ms
-                        );
-                    }
                     if !o.key_claims.is_empty() {
                         fs::write(
                             format!("{}.key", file(s)),
@@ -1040,6 +1028,18 @@ fn main() {
                         }
                     }
                     fs::write(file(s), bincode::serialize(&k).unwrap()).unwrap();
+                    if !o.key_claims.is_empty() && std::env::var_os("LEAN_KEY_PROBE").is_some() {
+                        let b = prove_root_key_batch(o.key_tables.clone(), &o.key_claims);
+                        println!(
+                            "segment {s}: root key probe: {} tables, {} sigma claims; key {:.0} ms, prove {:.0} ms, proof {} KiB, verify {:.1} ms",
+                            b.tables,
+                            b.claims,
+                            b.key_ms,
+                            b.prove_ms,
+                            b.proof_bytes / 1024,
+                            b.verify_ms
+                        );
+                    }
                     println!(
                         "segment {s} of {s_n} proved: leaves {a}..{b}; proof {} KiB; verify {:.1} ms + {:.1} ms; {:.0} s",
                         r.root_proof_bytes / 1024,
