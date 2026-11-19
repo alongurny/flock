@@ -1806,6 +1806,265 @@ impl FoldMatrix for CircuitStructureMatrix<'_> {
     }
 }
 
+/// A circuit's structure table ([`SigmaAssertion::matrix`]) as owned data:
+/// what a verification key keeps of a circuit. Without `sigma` it is the
+/// verifier's part (every plane but sigma, `O(slots + rows · columns)`
+/// words); with it, the prover's. Equal, entry for entry, to
+/// [`CircuitStructureMatrix`] (tested), so the key needs no circuit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructureTable {
+    pub digest: [u8; 32],
+    /// Row bits.
+    pub nu: usize,
+    /// Columns per plane.
+    pub base: usize,
+    /// Live rows per cell slot.
+    pub counts: Vec<usize>,
+    /// Per Boolean slot with a constant pin, its live rows.
+    pub pins: Vec<(usize, usize)>,
+    /// Element planes: `(column, entry)`, the same on every row.
+    pub element: Vec<(usize, F128)>,
+    /// Bus and public columns: `(column, entry per row)`.
+    pub columns: Vec<(usize, Vec<F128>)>,
+    /// The live cells' sigma, slot after slot (prover only).
+    pub sigma: Option<Vec<u32>>,
+}
+
+impl StructureTable {
+    pub fn from_circuit(circuit: &Circuit, with_sigma: bool) -> Self {
+        let m = CircuitStructureMatrix::new(circuit);
+        let base = m.base_cols();
+        let nu = circuit.cells().nu();
+        let n_rows = 1usize << nu;
+        let cell_cols = 1usize << (circuit.cells().mu() - nu);
+        let counts: Vec<usize> = (0..cell_cols.min(base))
+            .map(|s| m.mask.counts.get(s).map_or(0, |&c| c.min(n_rows)))
+            .collect();
+        let registry = circuit.registry();
+        let pins = (0..registry.num_boolean().min(base))
+            .filter(|&s| registry.boolean_types()[s].const_pin.is_some())
+            .map(|s| (s, circuit.counts()[s].min(n_rows)))
+            .filter(|&(_, c)| c > 0)
+            .collect();
+        let element = [
+            SigmaAssertion::ELEMENT_A_PLANE,
+            SigmaAssertion::ELEMENT_B_PLANE,
+        ]
+        .iter()
+        .flat_map(|&p| (0..base).map(move |s| p * base + s))
+        .map(|c| (c, m.entry(0, c)))
+        .filter(|(_, e)| !e.is_zero())
+        .collect();
+        let mut columns = Vec::new();
+        for (p, n) in [
+            (SigmaAssertion::BUS_PLANE, m.bus_cols.len()),
+            (SigmaAssertion::PUBLIC_COLUMN_PLANE, m.public_cols.len()),
+        ] {
+            for slot in 0..n.min(base) {
+                let c = p * base + slot;
+                let col: Vec<F128> = (0..n_rows).map(|r| m.entry(r, c)).collect();
+                if col.iter().any(|e| !e.is_zero()) {
+                    columns.push((c, col));
+                }
+            }
+        }
+        let sigma = with_sigma.then(|| {
+            let s = circuit.sigma();
+            let mut out = Vec::with_capacity(counts.iter().sum());
+            for (slot, &cnt) in counts.iter().enumerate() {
+                let row0 = slot << nu;
+                out.extend(
+                    s[row0..row0 + cnt]
+                        .iter()
+                        .map(|&x| u32::try_from(x).expect("a 32-bit cell index")),
+                );
+            }
+            out
+        });
+        Self {
+            digest: circuit.digest(),
+            nu,
+            base,
+            counts,
+            pins,
+            element,
+            columns,
+            sigma,
+        }
+    }
+
+    /// The verifier's part.
+    pub fn without_sigma(&self) -> Self {
+        Self {
+            sigma: None,
+            ..self.clone()
+        }
+    }
+
+    /// Where each slot's sigma entries start in [`Self::sigma`].
+    fn sigma_starts(&self) -> Vec<usize> {
+        let mut at = 0;
+        self.counts
+            .iter()
+            .map(|&c| {
+                let s = at;
+                at += c;
+                s
+            })
+            .collect()
+    }
+}
+
+impl FoldMatrix for StructureTable {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        use rayon::prelude::*;
+        assert_eq!(n_rows, 1usize << self.nu);
+        assert_eq!(w.len(), 8 * self.base);
+        let base = self.base;
+        let nu = self.nu;
+        let fx = |x: usize| F128::new(x as u64, 0);
+        let plane = |p: usize, slot: usize| w[p * base + slot];
+        let mut d_const = vec![F128::ZERO; n_rows + 1];
+        let mut d_f = vec![F128::ZERO; n_rows + 1];
+        for (slot, &cnt) in self.counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let wid = plane(SigmaAssertion::MASKED_ID_PLANE, slot);
+            let c = wid * fx(slot << nu) + plane(SigmaAssertion::LIVE_PLANE, slot);
+            d_const[0] += c;
+            d_const[cnt] += c;
+            d_f[0] += wid;
+            d_f[cnt] += wid;
+        }
+        for &(slot, cnt) in &self.pins {
+            let wp = plane(SigmaAssertion::BOOLEAN_PIN_PLANE, slot);
+            d_const[0] += wp;
+            d_const[cnt] += wp;
+        }
+        let el = self
+            .element
+            .iter()
+            .fold(F128::ZERO, |a, &(c, e)| a + w[c] * e);
+        let mut out = vec![F128::ZERO; n_rows];
+        let (mut rc, mut rf) = (F128::ZERO, F128::ZERO);
+        for (r, dst) in out.iter_mut().enumerate() {
+            rc += d_const[r];
+            rf += d_f[r];
+            *dst = rc + rf * fx(r) + el;
+        }
+        let any_sigma =
+            (0..self.counts.len()).any(|slot| !plane(SigmaAssertion::SIGMA_PLANE, slot).is_zero());
+        if any_sigma {
+            let sigma = self
+                .sigma
+                .as_ref()
+                .expect("the sigma plane is weighted: the prover's table");
+            let starts = self.sigma_starts();
+            let sig = (0..self.counts.len())
+                .into_par_iter()
+                .fold(
+                    || vec![F128::ZERO; n_rows],
+                    |mut acc, slot| {
+                        let ws = plane(SigmaAssertion::SIGMA_PLANE, slot);
+                        if !ws.is_zero() {
+                            let s = &sigma[starts[slot]..starts[slot] + self.counts[slot]];
+                            for (a, &x) in acc.iter_mut().zip(s) {
+                                *a += ws * fx(x as usize);
+                            }
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![F128::ZERO; n_rows],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(&b) {
+                            *x += *y;
+                        }
+                        a
+                    },
+                );
+            for (x, y) in out.iter_mut().zip(&sig) {
+                *x += *y;
+            }
+        }
+        for (c, col) in &self.columns {
+            let wc = w[*c];
+            if wc.is_zero() {
+                continue;
+            }
+            for (dst, &e) in out.iter_mut().zip(col) {
+                *dst += wc * e;
+            }
+        }
+        out
+    }
+
+    fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        use rayon::prelude::*;
+        let n_rows = 1usize << self.nu;
+        assert_eq!(w.len(), n_rows);
+        assert_eq!(n_cols, 8 * self.base);
+        let base = self.base;
+        let fx = |x: usize| F128::new(x as u64, 0);
+        let mut pw = vec![F128::ZERO; n_rows + 1];
+        let mut pf = vec![F128::ZERO; n_rows + 1];
+        for r in 0..n_rows {
+            pw[r + 1] = pw[r] + w[r];
+            pf[r + 1] = pf[r] + w[r] * fx(r);
+        }
+        let mut out = vec![F128::ZERO; n_cols];
+        let sigma = self.sigma.as_ref().expect("the prover's table");
+        let starts = self.sigma_starts();
+        let sig: Vec<F128> = (0..self.counts.len())
+            .into_par_iter()
+            .map(|slot| {
+                let s = &sigma[starts[slot]..starts[slot] + self.counts[slot]];
+                s.iter()
+                    .zip(w)
+                    .fold(F128::ZERO, |a, (&x, &wr)| a + wr * fx(x as usize))
+            })
+            .collect();
+        for (slot, &cnt) in self.counts.iter().enumerate() {
+            out[SigmaAssertion::MASKED_ID_PLANE * base + slot] =
+                fx(slot << self.nu) * pw[cnt] + pf[cnt];
+            out[SigmaAssertion::LIVE_PLANE * base + slot] = pw[cnt];
+            out[SigmaAssertion::SIGMA_PLANE * base + slot] = sig[slot];
+        }
+        for &(c, e) in &self.element {
+            out[c] = e * pw[n_rows];
+        }
+        for &(slot, cnt) in &self.pins {
+            out[SigmaAssertion::BOOLEAN_PIN_PLANE * base + slot] = pw[cnt];
+        }
+        let cols: Vec<(usize, F128)> = self
+            .columns
+            .par_iter()
+            .map(|(c, col)| {
+                (
+                    *c,
+                    col.iter()
+                        .zip(w)
+                        .fold(F128::ZERO, |a, (&e, &wr)| a + wr * e),
+                )
+            })
+            .collect();
+        for (c, v) in cols {
+            out[c] = v;
+        }
+        out
+    }
+
+    fn n_rows(&self) -> usize {
+        1usize << self.nu
+    }
+
+    fn n_cols(&self) -> usize {
+        8 * self.base
+    }
+}
+
 /// [`verify_wiring`] with the sigma evaluation DEFERRED (sigma v2 route B):
 /// the batched GKR verifies TRUSTING the proof's claimed `s_sigma_eval`,
 /// and the claim exits as a [`SigmaAssertion`] for the accumulator — a
@@ -2578,6 +2837,23 @@ mod tests {
             mc.value,
             "the MatrixClaim form discharges — the accumulator's path"
         );
+        // The owned table (a key's data) agrees with the circuit's.
+        use crate::matrix_fold::FoldMatrix as _;
+        let st = crate::circuit::StructureTable::from_circuit(&circuit, true);
+        assert_eq!(bilinear(&mc.row, &mc.col, &st), mc.value, "the owned table");
+        {
+            let mut rng = Rng::new(9);
+            let mut f = || F128::new(rng.next_u64(), rng.next_u64());
+            let wr: Vec<F128> = (0..crate::matrix_fold::FoldMatrix::n_rows(&m))
+                .map(|_| f())
+                .collect();
+            let wc: Vec<F128> = (0..crate::matrix_fold::FoldMatrix::n_cols(&m))
+                .map(|_| f())
+                .collect();
+            let (nr, nc) = (wr.len(), wc.len());
+            assert_eq!(st.row_marginal(&wc, nr), m.row_marginal(&wc, nr));
+            assert_eq!(st.col_marginal(&wr, nc), m.col_marginal(&wr, nc));
+        }
         // The materialized table and a verification key over it agree.
         let dense = m.materialize();
         assert_eq!(

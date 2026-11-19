@@ -401,6 +401,29 @@ pub(super) fn discharge_outer(
     passenger: &[([F128; 2], MatrixClaim)],
     expect_passenger: bool,
 ) -> Result<(), RootDischargeFailure> {
+    discharge_outer_with(
+        fl_lo,
+        root_lo,
+        base,
+        main,
+        passenger,
+        expect_passenger,
+        true,
+    )
+}
+
+/// [`discharge_outer`], with the sigma (structure-table) claims left to a
+/// verification key when `check_sigma` is false: their caller proves them
+/// by openings ([`super::root_key`]).
+pub(super) fn discharge_outer_with(
+    fl_lo: &LeafOuter,
+    root_lo: &LeafOuter,
+    base: Option<&NodeOut>,
+    main: &Accumulator,
+    passenger: &[([F128; 2], MatrixClaim)],
+    expect_passenger: bool,
+    check_sigma: bool,
+) -> Result<(), RootDischargeFailure> {
     use RootDischargeFailure::*;
     // (3) the main fold vs the outer tables.
     let tr = std::time::Instant::now();
@@ -446,7 +469,7 @@ pub(super) fn discharge_outer(
         );
     }
     let tr = std::time::Instant::now();
-    if !main.discharge_sigma(&circuits) {
+    if check_sigma && !main.discharge_sigma(&circuits) {
         return Err(Sigma);
     }
     if std::env::var_os("ROOT_KEY_TRACE").is_some() {
@@ -484,7 +507,7 @@ pub(super) fn discharge_outer(
             jagged: vec![(base_d, passenger[1].1.clone())],
         };
         let jp = base_jp.as_ref().expect("computed with the base");
-        if !pacc.discharge_sigma(&[&base.lo.shape.circuit])
+        if (check_sigma && !pacc.discharge_sigma(&[&base.lo.shape.circuit]))
             || !pacc.discharge_jagged(&[(base_d, jp)])
         {
             return Err(Passenger);

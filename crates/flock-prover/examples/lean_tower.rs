@@ -26,7 +26,8 @@ use flock_prover::{
     },
     tower::{
         LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root,
-        lean_segments_root, prove_lean_segment, prove_lean_tower_streaming, segments_balanced,
+        lean_segments_root, prove_lean_segment, prove_lean_tower_streaming, prove_root_key_batch,
+        segments_balanced,
     },
 };
 
@@ -125,6 +126,11 @@ fn build(side: usize, n: usize, out: &str) -> LeanCircuit {
 }
 
 /// Where a shared chunk's rows are kept (`lean_tower shared` writes them).
+fn structure_file(out: &str, d: &[u8; 32]) -> String {
+    let hex: String = d[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{out}/structure-{hex}.bin")
+}
+
 fn chunk_file(out: &str, s: usize, ch: usize) -> String {
     format!("{out}/shared/{s}-{ch}.bin")
 }
@@ -1008,6 +1014,31 @@ fn main() {
                         r.discharge_ms,
                         t.elapsed().as_secs_f64(),
                     );
+                    if !o.key_claims.is_empty() && std::env::var_os("LEAN_KEY_PROBE").is_some() {
+                        let b = prove_root_key_batch(o.key_tables.clone(), &o.key_claims);
+                        println!(
+                            "segment {s}: root key probe: {} tables, {} sigma claims; key {:.0} ms, prove {:.0} ms, proof {} KiB, verify {:.1} ms",
+                            b.tables,
+                            b.claims,
+                            b.key_ms,
+                            b.prove_ms,
+                            b.proof_bytes / 1024,
+                            b.verify_ms
+                        );
+                    }
+                    if !o.key_claims.is_empty() {
+                        fs::write(
+                            format!("{}.key", file(s)),
+                            bincode::serialize(&o.key_claims).unwrap(),
+                        )
+                        .unwrap();
+                        for t in &o.key_tables {
+                            let p = structure_file(&out, &t.digest);
+                            if !Path::new(&p).exists() {
+                                fs::write(&p, bincode::serialize(t).unwrap()).unwrap();
+                            }
+                        }
+                    }
                     fs::write(file(s), bincode::serialize(&k).unwrap()).unwrap();
                     println!(
                         "segment {s} of {s_n} proved: leaves {a}..{b}; proof {} KiB; verify {:.1} ms + {:.1} ms; {:.0} s",
@@ -1033,6 +1064,30 @@ fn main() {
                         recv: F128::new(k.4.0, k.4.1),
                     })
                     .collect();
+                if std::env::var_os("LEAN_ROOT_KEY").is_some() {
+                    // THE ONE BATCH: every segment's sigma claims at once.
+                    let mut kc: Vec<([u8; 32], flock_core::matrix_fold::MatrixClaim)> = Vec::new();
+                    for s in 0..s_n {
+                        let v: Vec<([u8; 32], flock_core::matrix_fold::MatrixClaim)> =
+                            read(format!("{}.key", file(s)));
+                        kc.extend(v);
+                    }
+                    let mut ds: Vec<[u8; 32]> = kc.iter().map(|(d, _)| *d).collect();
+                    ds.sort();
+                    ds.dedup();
+                    let tables: Vec<flock_core::circuit::StructureTable> =
+                        ds.iter().map(|d| read(structure_file(&out, d))).collect();
+                    let b = prove_root_key_batch(tables, &kc);
+                    println!(
+                        "root key at the join: {} tables, {} sigma claims from {s_n} segments; key {:.0} ms, prove {:.0} ms, proof {} KiB, verify {:.1} ms",
+                        b.tables,
+                        b.claims,
+                        b.key_ms,
+                        b.prove_ms,
+                        b.proof_bytes / 1024,
+                        b.verify_ms
+                    );
+                }
                 let balanced = segments_balanced(&all, &claims, &statement);
                 println!("the segments joined: {balanced:?}");
                 assert_eq!(

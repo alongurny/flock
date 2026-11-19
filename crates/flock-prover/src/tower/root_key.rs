@@ -19,7 +19,7 @@
 
 use flock_core::{
     challenger::{Challenger, FsChallenger},
-    circuit::{Circuit, SigmaAssertion},
+    circuit::{Circuit, SigmaAssertion, StructureTable},
     matrix_fold::{FoldMatrix, FoldProof, MatrixClaim, prove_fold, verify_fold},
     pcs::jagged::{self, JaggedAssistProof, JaggedParams, JaggedSumcheckProof},
     table_key::{DenseKey, DenseOpening, DenseTable, Factor, TensorBasis, verify_dense_bases},
@@ -57,36 +57,20 @@ pub struct StructureShape {
 }
 
 impl StructureShape {
-    fn of(c: &Circuit) -> (Self, Vec<F128>) {
-        let s = SigmaAssertion::matrix(c);
-        let base = s.n_cols() >> PLANES_LOG;
-        let nu = c.cells().nu();
-        let cell_cols = 1usize << (c.cells().mu() - nu);
-        let live = c.live_mask();
-        let heights: Vec<u64> = (0..base)
-            .map(|y| {
-                if y < cell_cols {
-                    live.counts[y] as u64
-                } else {
-                    0
-                }
-            })
+    fn of(t: &StructureTable) -> (Self, Vec<F128>) {
+        let heights: Vec<u64> = (0..t.base)
+            .map(|y| t.counts.get(y).map_or(0, |&c| c as u64))
             .collect();
         let area: u64 = heights.iter().sum();
         let m = log2_ceil(area as usize).max(1);
-        let sigma = c.sigma();
-        let mut q = Vec::with_capacity(1 << m);
-        for (y, &h) in heights.iter().enumerate() {
-            for r in 0..h as usize {
-                q.push(enc(sigma[(y << nu) | r]));
-            }
-        }
+        let sigma = t.sigma.as_ref().expect("the prover's table");
+        let mut q: Vec<F128> = sigma.iter().map(|&x| enc(x as usize)).collect();
         q.resize(1 << m, F128::ZERO);
         (
             Self {
-                digest: c.digest(),
-                nu,
-                slots_log: log2_ceil(base),
+                digest: t.digest,
+                nu: t.nu,
+                slots_log: log2_ceil(t.base),
                 heights,
                 m,
             },
@@ -110,9 +94,9 @@ pub struct RootKey {
 }
 
 /// The prover's side.
-pub struct RootKeyTables<'a> {
+pub struct RootKeyTables {
     pub key: RootKey,
-    circuits: Vec<&'a Circuit>,
+    structures: Vec<StructureTable>,
     q: Vec<Vec<F128>>,
     dense: DenseTable,
 }
@@ -138,8 +122,7 @@ struct Split {
 
 /// Split `c` on `circuit`'s structure table. `None` unless both weights are
 /// plain (`low` of length one) and match the table's shape.
-fn split(circuit: &Circuit, shape: &StructureShape, c: &MatrixClaim) -> Option<Split> {
-    let m = SigmaAssertion::matrix(circuit);
+fn split(m: &StructureTable, shape: &StructureShape, c: &MatrixClaim) -> Option<Split> {
     if c.row.low.len() != 1
         || c.col.low.len() != 1
         || c.row.point.len() != shape.nu
@@ -212,33 +195,34 @@ impl RootKey {
         TensorBasis::new(F128::ONE, f)
     }
 
-    /// Check every `(table index, claim)`. `circuits[i]` is table `i`'s
-    /// circuit, whose counts and constants give the non-sigma planes; its
-    /// sigma is never read.
+    /// Check every `(table index, claim)`. `vks[i]` is table `i`'s structure
+    /// without sigma ([`StructureTable::without_sigma`]): its counts and
+    /// constants give the non-sigma planes.
     pub fn verify(
         &self,
-        circuits: &[&Circuit],
+        vks: &[StructureTable],
         claims: &[(usize, MatrixClaim)],
         proof: &RootKeyProof,
     ) -> bool {
         let t_all = std::time::Instant::now();
         let n = self.tables.len();
-        if circuits.len() != n
+        if vks.len() != n
             || proof.folds.len() != n
             || proof.jagged.len() != n
             || claims.iter().any(|(t, _)| *t >= n)
         {
             return false;
         }
-        for (shape, c) in self.tables.iter().zip(circuits) {
-            let live = c.live_mask();
-            if c.digest() != shape.digest
-                || c.cells().nu() != shape.nu
+        for (shape, c) in self.tables.iter().zip(vks) {
+            if c.digest != shape.digest
+                || c.nu != shape.nu
+                || 1usize << shape.slots_log != c.base
+                || shape.heights.len() != c.base
                 || shape
                     .heights
                     .iter()
                     .enumerate()
-                    .any(|(y, &h)| h != live.counts.get(y).map_or(0, |&x| x as u64))
+                    .any(|(y, &h)| h != c.counts.get(y).map_or(0, |&x| x as u64))
             {
                 return false;
             }
@@ -272,7 +256,7 @@ impl RootKey {
                 (None, None) => {}
                 (Some(c), jp) => {
                     let t_split = std::time::Instant::now();
-                    let Some(s) = split(circuits[i], shape, &c) else {
+                    let Some(s) = split(&vks[i], shape, &c) else {
                         return false;
                     };
                     let sig = c.value + s.rest; // characteristic 2
@@ -325,14 +309,25 @@ impl RootKey {
     }
 }
 
-impl<'a> RootKeyTables<'a> {
+impl RootKeyTables {
     /// Build the key over the circuits' structure tables (a circuit named
     /// twice is kept once).
-    pub fn new(circuits: &[&'a Circuit]) -> Option<Self> {
-        let mut uniq: Vec<&'a Circuit> = Vec::new();
-        for &c in circuits {
-            if !uniq.iter().any(|u| u.digest() == c.digest()) {
-                uniq.push(c);
+    pub fn new(circuits: &[&Circuit]) -> Option<Self> {
+        Self::from_tables(
+            circuits
+                .iter()
+                .map(|c| StructureTable::from_circuit(c, true))
+                .collect(),
+        )
+    }
+
+    /// Build the key over prover's structure tables (with sigma); a digest
+    /// named twice is kept once.
+    pub fn from_tables(tables: Vec<StructureTable>) -> Option<Self> {
+        let mut uniq: Vec<StructureTable> = Vec::new();
+        for t in tables {
+            if !uniq.iter().any(|u| u.digest == t.digest) {
+                uniq.push(t);
             }
         }
         let (tables, q): (Vec<StructureShape>, Vec<Vec<F128>>) =
@@ -350,15 +345,18 @@ impl<'a> RootKeyTables<'a> {
                 block_log,
                 dense: dense.key.clone(),
             },
-            circuits: uniq,
+            structures: uniq,
             q,
             dense,
         })
     }
 
-    /// The circuits in key order (what [`RootKey::verify`] takes).
-    pub fn circuits(&self) -> &[&'a Circuit] {
-        &self.circuits
+    /// The verifier's tables in key order (what [`RootKey::verify`] takes).
+    pub fn vks(&self) -> Vec<StructureTable> {
+        self.structures
+            .iter()
+            .map(StructureTable::without_sigma)
+            .collect()
     }
 
     /// The index of the table with this circuit digest.
@@ -381,7 +379,7 @@ impl<'a> RootKeyTables<'a> {
                 .filter(|(t, _)| *t == i)
                 .map(|(_, c)| c.clone())
                 .collect();
-            let m = SigmaAssertion::matrix(self.circuits[i]);
+            let m = &self.structures[i];
             let one = match group.len() {
                 0 => continue,
                 1 => group[0].clone(),
@@ -390,13 +388,13 @@ impl<'a> RootKeyTables<'a> {
                         .iter()
                         .map(|c| m.col_marginal(&c.row.materialize(), m.n_cols()))
                         .collect();
-                    let (p, c) = prove_fold(&m, &combs, &group, &mut ch);
+                    let (p, c) = prove_fold(m, &combs, &group, &mut ch);
                     folds[i] = Some(p);
                     c
                 }
             };
             let shape = &self.key.tables[i];
-            let s = split(self.circuits[i], shape, &one)?;
+            let s = split(m, shape, &one)?;
             let sig = one.value + s.rest; // characteristic 2
             if s.scale.is_zero() {
                 if !sig.is_zero() {

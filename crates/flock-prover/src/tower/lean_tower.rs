@@ -116,6 +116,18 @@ pub fn prove_lean_tower_streaming(
     mut progress: impl FnMut(&str),
 ) -> LeanTowerReport {
     let s = prove_lean_segment(cfg, words, 0, None, piece, env, &mut progress);
+    if !s.key_claims.is_empty() {
+        let b = prove_root_key_batch(s.key_tables.clone(), &s.key_claims);
+        progress(&format!(
+            "root key: {} tables, {} sigma claims; key {:.0} ms, prove {:.0} ms, proof {} KiB, verify {:.1} ms",
+            b.tables,
+            b.claims,
+            b.key_ms,
+            b.prove_ms,
+            b.proof_bytes / 1024,
+            b.verify_ms
+        ));
+    }
     let balanced = match segments_balanced(&s.root, &[s.claim()], statement) {
         Ok(b) => b,
         Err(e) => {
@@ -149,6 +161,10 @@ pub struct LeanSegmentOut {
     pub seed: [u8; 32],
     pub send: F128,
     pub recv: F128,
+    /// With a root key: the sigma claims the segment left to it, and the
+    /// structure tables (with sigma) of the circuits they name.
+    pub key_claims: Vec<([u8; 32], flock_core::matrix_fold::MatrixClaim)>,
+    pub key_tables: Vec<flock_core::circuit::StructureTable>,
 }
 
 impl LeanSegmentOut {
@@ -440,20 +456,17 @@ pub fn prove_lean_segment(
     assert_ne!(p[a + 4], F128::ZERO, "a nonzero product");
     let lane_acc = root.lane_acc.as_ref().expect("the lane accumulator");
     let leaf_circuit = &shape0.circuit;
+    // THE ROOT KEY (LEAN_ROOT_KEY=1): the structure-table (sigma) claims
+    // are not read off the wiring here; the segment hands them out, with
+    // its circuits' tables, and the join proves them all in one batch
+    // against a committed key ([`prove_root_key_batch`]).
+    let keyed = std::env::var_os("LEAN_ROOT_KEY").is_some();
+    // Wake the thread pool first: an idle pool's first call costs ~20 ms,
+    // which is not the check's.
+    rayon::broadcast(|_| ());
     let tm = Instant::now();
     assert!(lane_acc.discharge(&family.mats), "the lane's boolean class");
     let t_bool = tm.elapsed().as_secs_f64() * 1e3;
-    if std::env::var_os("ROOT_KEY_TRACE").is_some() {
-        let tm = Instant::now();
-        let _ = lane_acc.discharge(&family.mats);
-        let t2 = tm.elapsed().as_secs_f64() * 1e3;
-        let w = &lane_acc.per_type[0].0;
-        eprintln!(
-            "lane boolean again {t2:.2} ms; row weight low {} point {}",
-            w.row.low.len(),
-            w.row.point.len()
-        );
-    }
     let tm = Instant::now();
     assert!(
         lane_acc.discharge_element(&el_mats),
@@ -462,7 +475,7 @@ pub fn prove_lean_segment(
     let t_el = tm.elapsed().as_secs_f64() * 1e3;
     let tm = Instant::now();
     assert!(
-        lane_acc.discharge_sigma(&[leaf_circuit]),
+        keyed || lane_acc.discharge_sigma(&[leaf_circuit]),
         "the lane's sigma"
     );
     let t_sigma = tm.elapsed().as_secs_f64() * 1e3;
@@ -473,95 +486,66 @@ pub fn prove_lean_segment(
     );
     let t_jagged = tm.elapsed().as_secs_f64() * 1e3;
     let tm = Instant::now();
-    discharge_outer(
+    super::driver::discharge_outer_with(
         &fl0.lo,
         &root.lo,
         base.as_ref(),
         &root.acc,
         &root.block.passenger,
         k >= 4,
+        !keyed,
     )
     .expect("the main fold and passenger discharge");
     let t_outer = tm.elapsed().as_secs_f64() * 1e3;
     let discharge_ms = t.elapsed().as_secs_f64() * 1e3;
     progress(&format!(
-        "root-side checks: boolean {t_bool:.1} ms, element {t_el:.1} ms, sigma {t_sigma:.1} ms, jagged {t_jagged:.1} ms, main fold and passenger {t_outer:.1} ms"
+        "root-side checks{}: boolean {t_bool:.1} ms, element {t_el:.1} ms, sigma {t_sigma:.1} ms, jagged {t_jagged:.1} ms, main fold and passenger {t_outer:.1} ms",
+        if keyed {
+            " (sigma left to the key)"
+        } else {
+            ""
+        }
     ));
-    // ---- THE ROOT KEY (LEAN_ROOT_KEY=1): the structure-table (sigma)
-    // claims, proved by openings against a committed key instead of read
-    // off the wiring. Measured beside the direct checks above. ----
-    if std::env::var_os("LEAN_ROOT_KEY").is_some() {
-        use super::root_key::{RootKeyTables, describe};
-        use flock_core::circuit::Circuit;
+    let mut key_claims = Vec::new();
+    let mut key_tables = Vec::new();
+    if keyed {
+        use flock_core::circuit::{Circuit, StructureTable};
+        let lane_digest = leaf_circuit.digest();
         let mut circs: Vec<&Circuit> =
             vec![leaf_circuit, &fl0.lo.shape.circuit, &root.lo.shape.circuit];
         if let Some(b) = base.as_ref() {
             circs.push(&b.lo.shape.circuit);
         }
-        print!("{}", describe(&circs));
-        if std::env::var_os("ROOT_KEY_TRACE").is_some() {
-            let nnz = |m: &flock_core::r1cs::SparseBinaryMatrix| {
-                m.rows.iter().map(|r| r.len()).sum::<usize>()
-            };
-            for (a, b) in family.mats.iter() {
-                eprintln!(
-                    "lane boolean: {}x{} nnz {} + {}",
-                    a.num_rows,
-                    a.num_cols,
-                    nnz(a),
-                    nnz(b)
-                );
-            }
-            for (a, b) in super::query::leaf_boolean_mats(&fl0.lo) {
-                eprintln!(
-                    "main boolean: {}x{} nnz {} + {} at {:p}",
-                    a.num_rows,
-                    a.num_cols,
-                    nnz(a),
-                    nnz(b),
-                    a
-                );
-            }
+        print!("{}", super::root_key::describe(&circs));
+        // Every sigma claim must name one of these circuits: the lane's the
+        // leaf's, the main fold's the FL's, the root's or the base's.
+        let known = |d: &[u8; 32]| circs.iter().any(|c| c.digest() == *d);
+        for (d, c) in &lane_acc.sigma {
+            assert!(*d == lane_digest, "the lane's sigma names the leaf");
+            key_claims.push((*d, c.clone()));
         }
-        let tk = Instant::now();
-        let keys = RootKeyTables::new(&circs).expect("the root key");
-        let key_ms = tk.elapsed().as_secs_f64() * 1e3;
-        let idx = |d: &[u8; 32]| keys.index(d).expect("a keyed circuit");
-        let mut claims = Vec::new();
-        for acc in [lane_acc, &root.acc] {
-            for (d, c) in &acc.sigma {
-                claims.push((idx(d), c.clone()));
-            }
+        for (d, c) in &root.acc.sigma {
+            assert!(known(d), "the main fold's sigma names a known circuit");
+            key_claims.push((*d, c.clone()));
         }
         if let (Some(b), Some((_, c))) = (base.as_ref(), root.block.passenger.first()) {
             if super::node::entry_live(c) {
-                claims.push((idx(&b.lo.shape.circuit.digest()), c.clone()));
+                key_claims.push((b.lo.shape.circuit.digest(), c.clone()));
             }
         }
-        let tp = Instant::now();
-        let proof = keys.prove(&claims).expect("the root key proves");
-        let prove_ms = tp.elapsed().as_secs_f64() * 1e3;
-        let bytes = bincode::serialize(&proof)
-            .expect("a proof serializes")
-            .len();
-        let tv = Instant::now();
-        assert!(
-            keys.key.verify(keys.circuits(), &claims, &proof),
-            "the root key verifies"
-        );
-        let verify_ms = tv.elapsed().as_secs_f64() * 1e3;
-        // A wrong claim value is refused.
-        let mut bad = claims.clone();
-        bad[0].1.value += F128::ONE;
-        assert!(
-            !keys.key.verify(keys.circuits(), &bad, &proof),
-            "a tampered claim fails"
-        );
+        let tt = Instant::now();
+        let mut seen: Vec<[u8; 32]> = Vec::new();
+        for c in &circs {
+            if !seen.contains(&c.digest()) {
+                seen.push(c.digest());
+                key_tables.push(StructureTable::from_circuit(c, true));
+            }
+        }
         progress(&format!(
-            "root key: {} tables, {} sigma claims; key {key_ms:.0} ms, prove {prove_ms:.0} ms, proof {} KiB, verify {verify_ms:.1} ms",
-            keys.key.tables.len(),
-            claims.len(),
-            bytes / 1024
+            "root key part: {} sigma claims over {} tables ({:.0} ms to extract)",
+            key_claims.len(),
+            key_tables.len(),
+            tt.elapsed().as_secs_f64() * 1e3
         ));
     }
     set_envelope_override(None);
@@ -581,6 +565,8 @@ pub fn prove_lean_segment(
         seed,
         send,
         recv,
+        key_claims,
+        key_tables,
     }
 }
 
@@ -699,5 +685,63 @@ fn lean_tower_spine() {
 fn release_pool() {
     if std::env::var_os("LEAN_KEEP_POOL").is_none() {
         flock_core::scratch::clear();
+    }
+}
+
+/// What the join's root-key batch measured.
+#[derive(Clone, Debug)]
+pub struct RootKeyBatch {
+    pub tables: usize,
+    pub claims: usize,
+    pub key_ms: f64,
+    pub prove_ms: f64,
+    pub proof_bytes: usize,
+    pub verify_ms: f64,
+}
+
+/// THE JOIN'S ONE BATCH: every segment's sigma claims, proved together by
+/// openings against one key over the circuits' structure tables, then
+/// verified against the tables without sigma (the verification key) — the
+/// verifier never reads a wiring. Tables are deduplicated by digest;
+/// claims on one table are folded into one. Panics if a claim is false or
+/// names no table, or if a tampered claim would pass.
+pub fn prove_root_key_batch(
+    tables: Vec<flock_core::circuit::StructureTable>,
+    claims: &[([u8; 32], flock_core::matrix_fold::MatrixClaim)],
+) -> RootKeyBatch {
+    use super::root_key::RootKeyTables;
+    let tk = Instant::now();
+    let keys = RootKeyTables::from_tables(tables).expect("the root key");
+    let key_ms = tk.elapsed().as_secs_f64() * 1e3;
+    let indexed: Vec<(usize, flock_core::matrix_fold::MatrixClaim)> = claims
+        .iter()
+        .map(|(d, c)| (keys.index(d).expect("a keyed circuit"), c.clone()))
+        .collect();
+    let tp = Instant::now();
+    let proof = keys.prove(&indexed).expect("the root key proves");
+    let prove_ms = tp.elapsed().as_secs_f64() * 1e3;
+    let proof_bytes = bincode::serialize(&proof)
+        .expect("a proof serializes")
+        .len();
+    let vks = keys.vks();
+    let tv = Instant::now();
+    assert!(
+        keys.key.verify(&vks, &indexed, &proof),
+        "the root key verifies"
+    );
+    let verify_ms = tv.elapsed().as_secs_f64() * 1e3;
+    let mut bad = indexed.clone();
+    bad[0].1.value += F128::ONE;
+    assert!(
+        !keys.key.verify(&vks, &bad, &proof),
+        "a tampered claim fails"
+    );
+    RootKeyBatch {
+        tables: keys.key.tables.len(),
+        claims: indexed.len(),
+        key_ms,
+        prove_ms,
+        proof_bytes,
+        verify_ms,
     }
 }
