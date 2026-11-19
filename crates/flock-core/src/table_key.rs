@@ -115,6 +115,11 @@ impl DenseTable {
         })
     }
 
+    /// Entry `i` of the committed (padded) vector.
+    pub fn val(&self, i: usize) -> F128 {
+        self.vals[i]
+    }
+
     /// Prove `claim` against the key. `None` if the claim's weights do not
     /// fit the table or the claim is false.
     pub fn open<Ch: Challenger>(&self, claim: &MatrixClaim, ch: &mut Ch) -> Option<DenseOpening> {
@@ -235,7 +240,7 @@ fn bind<Ch: Challenger>(ch: &mut Ch, key: &DenseKey, claims: &[MatrixClaim]) -> 
 
 /// One factor of a tensor weight, over consecutive index bits.
 #[derive(Clone, Debug)]
-enum Factor {
+pub(crate) enum Factor {
     /// An explicit table over `log2(len)` bits.
     Explicit(Vec<F128>),
     /// `eq(point, ·)` over `point.len()` bits.
@@ -253,14 +258,14 @@ impl Factor {
 
 /// The basis `b` on the committed vector: `scale · ⊗ factors`, LSB first.
 #[derive(Clone, Debug)]
-struct TensorBasis {
+pub(crate) struct TensorBasis {
     scale: F128,
     factors: Vec<Factor>,
 }
 
 impl TensorBasis {
     /// The weight `row ⊗ col` restricted to the table, zero on padding.
-    fn of(key: &DenseKey, claim: &MatrixClaim) -> Option<Self> {
+    pub(crate) fn of(key: &DenseKey, claim: &MatrixClaim) -> Option<Self> {
         let mut scale = F128::ONE;
         let mut factors = Vec::new();
         for (w, bits) in [(&claim.row, key.rows_log), (&claim.col, key.cols_log)] {
@@ -278,7 +283,7 @@ impl TensorBasis {
         Some(Self { scale, factors })
     }
 
-    fn materialize(&self) -> Vec<F128> {
+    pub(crate) fn materialize(&self) -> Vec<F128> {
         let mut out = vec![self.scale];
         for f in &self.factors {
             let t = match f {
@@ -297,7 +302,35 @@ impl TensorBasis {
     }
 
     /// `b(prefix, y)` for every `y` over the last `residual_log` bits.
-    fn fold_residual(&self, prefix: &[F256], residual_log: usize) -> Vec<F256> {
+    /// The basis MLE at a full point `z` (LSB first).
+    pub(crate) fn eval_at(&self, z: &[F128]) -> F128 {
+        let mut acc = self.scale;
+        let mut at = 0usize;
+        for f in &self.factors {
+            let bits = f.bits();
+            let zs = &z[at..at + bits];
+            acc *= match f {
+                Factor::Explicit(v) => {
+                    let mut vals = v.clone();
+                    for &r in zs {
+                        vals = (0..vals.len() / 2)
+                            .map(|i| vals[2 * i] + r * (vals[2 * i] + vals[2 * i + 1]))
+                            .collect();
+                    }
+                    vals[0]
+                }
+                Factor::Eq(p) => p
+                    .iter()
+                    .zip(zs)
+                    .fold(F128::ONE, |a, (&q, &r)| a * (F128::ONE + q + r)),
+            };
+            at += bits;
+        }
+        assert_eq!(at, z.len(), "the point covers the basis");
+        acc
+    }
+
+    pub(crate) fn fold_residual(&self, prefix: &[F256], residual_log: usize) -> Vec<F256> {
         let total: usize = self.factors.iter().map(Factor::bits).sum();
         assert_eq!(prefix.len() + residual_log, total, "prefix and residual cover b");
         let mut scale = F256::from(self.scale);
