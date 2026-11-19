@@ -164,6 +164,7 @@ mod lean_tower;
 mod node;
 mod online;
 mod query;
+mod root_key;
 mod real_walker;
 mod tape;
 mod verify;

@@ -466,6 +466,85 @@ pub fn prove_lean_segment(
     progress(&format!(
         "root-side checks: boolean {t_bool:.1} ms, element {t_el:.1} ms, sigma {t_sigma:.1} ms, jagged {t_jagged:.1} ms, main fold and passenger {t_outer:.1} ms"
     ));
+    // ---- THE ROOT KEY (LEAN_ROOT_KEY=1): the same matrix and structure
+    // claims, proved by openings against a committed key instead of read
+    // off the tables. Measured beside the direct checks above. ----
+    if std::env::var_os("LEAN_ROOT_KEY").is_some() {
+        use super::root_key::{RootKeyTables, Table};
+        use flock_core::circuit::Circuit;
+        let tk = Instant::now();
+        let main = &root.acc;
+        let fl_bool = super::query::leaf_boolean_mats(&fl0.lo);
+        let fl_el: Vec<_> = fl0
+            .lo
+            .shape
+            .registry
+            .element_types()
+            .iter()
+            .map(|t| {
+                let e = t.element_type().expect("element table");
+                (e.a_0(), e.b_0())
+            })
+            .collect();
+        let mut circs: Vec<&Circuit> = vec![leaf_circuit, &fl0.lo.shape.circuit, &root.lo.shape.circuit];
+        if let Some(b) = base.as_ref() {
+            circs.push(&b.lo.shape.circuit);
+        }
+        let mut tables = Vec::new();
+        for &(a, b) in family.mats.iter().chain(fl_bool.iter()) {
+            tables.push(Table::Boolean(a));
+            tables.push(Table::Boolean(b));
+        }
+        for &(a, b) in el_mats.iter().chain(fl_el.iter()) {
+            tables.push(Table::Element(a));
+            tables.push(Table::Element(b));
+        }
+        for &c in &circs {
+            tables.push(Table::Structure(c));
+        }
+        print!("{}", super::root_key::describe(&tables));
+        if std::env::var_os("LEAN_ROOT_KEY_DESCRIBE").is_some() {
+            std::process::exit(0);
+        }
+        let keys = RootKeyTables::new(&tables).expect("the root key");
+        let key_ms = tk.elapsed().as_secs_f64() * 1e3;
+        let idx = |t: Table<'_>| keys.index(&t).expect("a table in the key");
+        let circ = |d: &[u8; 32]| *circs.iter().find(|c| c.digest() == *d).expect("a keyed circuit");
+        let mut claims = Vec::new();
+        for (acc, bools, els) in [(lane_acc, &family.mats[..], &el_mats[..]), (main, &fl_bool[..], &fl_el[..])] {
+            assert_eq!(acc.per_type.len(), bools.len(), "a claim pair per boolean type");
+            assert_eq!(acc.per_element.len(), els.len(), "a claim pair per element type");
+            for ((ca, cb), &(a, b)) in acc.per_type.iter().zip(bools) {
+                claims.push((idx(Table::Boolean(a)), ca.clone()));
+                claims.push((idx(Table::Boolean(b)), cb.clone()));
+            }
+            for ((ca, cb), &(a, b)) in acc.per_element.iter().zip(els) {
+                claims.push((idx(Table::Element(a)), ca.clone()));
+                claims.push((idx(Table::Element(b)), cb.clone()));
+            }
+            for (d, c) in &acc.sigma {
+                claims.push((idx(Table::Structure(circ(d))), c.clone()));
+            }
+        }
+        if let (Some(b), Some((_, c))) = (base.as_ref(), root.block.passenger.first()) {
+            if super::node::entry_live(c) {
+                claims.push((idx(Table::Structure(&b.lo.shape.circuit)), c.clone()));
+            }
+        }
+        let tp = Instant::now();
+        let proof = keys.prove(&claims).expect("the root key proves");
+        let prove_ms = tp.elapsed().as_secs_f64() * 1e3;
+        let bytes = bincode::serialize(&proof).expect("a proof serializes").len();
+        let tv = Instant::now();
+        assert!(keys.key.verify(&claims, &proof), "the root key verifies");
+        let verify_ms = tv.elapsed().as_secs_f64() * 1e3;
+        progress(&format!(
+            "root key: {} tables, {} claims; key {key_ms:.0} ms, prove {prove_ms:.0} ms, proof {} KiB, verify {verify_ms:.1} ms",
+            keys.key.shapes.len(),
+            claims.len(),
+            bytes / 1024
+        ));
+    }
     set_envelope_override(None);
     flock_core::scratch::set_byte_budget(None);
     LeanSegmentOut {
