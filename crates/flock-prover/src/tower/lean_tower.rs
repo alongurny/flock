@@ -430,19 +430,28 @@ pub fn prove_lean_segment(
     assert_ne!(p[a + 4], F128::ZERO, "a nonzero product");
     let lane_acc = root.lane_acc.as_ref().expect("the lane accumulator");
     let leaf_circuit = &shape0.circuit;
+    let tm = Instant::now();
     assert!(lane_acc.discharge(&family.mats), "the lane's boolean class");
+    let t_bool = tm.elapsed().as_secs_f64() * 1e3;
+    let tm = Instant::now();
     assert!(
         lane_acc.discharge_element(&el_mats),
         "the lane's element class"
     );
+    let t_el = tm.elapsed().as_secs_f64() * 1e3;
+    let tm = Instant::now();
     assert!(
         lane_acc.discharge_sigma(&[leaf_circuit]),
         "the lane's sigma"
     );
+    let t_sigma = tm.elapsed().as_secs_f64() * 1e3;
+    let tm = Instant::now();
     assert!(
         lane_acc.discharge_jagged(&[(leaf_circuit.digest(), &jp)]),
         "the lane's jagged entry"
     );
+    let t_jagged = tm.elapsed().as_secs_f64() * 1e3;
+    let tm = Instant::now();
     discharge_outer(
         &fl0.lo,
         &root.lo,
@@ -452,7 +461,11 @@ pub fn prove_lean_segment(
         k >= 4,
     )
     .expect("the main fold and passenger discharge");
+    let t_outer = tm.elapsed().as_secs_f64() * 1e3;
     let discharge_ms = t.elapsed().as_secs_f64() * 1e3;
+    progress(&format!(
+        "root-side checks: boolean {t_bool:.1} ms, element {t_el:.1} ms, sigma {t_sigma:.1} ms, jagged {t_jagged:.1} ms, main fold and passenger {t_outer:.1} ms"
+    ));
     set_envelope_override(None);
     flock_core::scratch::set_byte_budget(None);
     LeanSegmentOut {
