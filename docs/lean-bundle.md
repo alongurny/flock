@@ -53,6 +53,15 @@ LeanVk {
     fl, base, steady: OuterVk,                 // first-level node, base, spine node
     layout:           AccLayout,               // where the root publishes its accumulators
     app_base:         usize,                   // where the root's statement words start
+    params:           Option<LeanKeyParams>,   // what the key is made from (format 2)
+}
+
+LeanKeyParams {
+    nu:         usize,      // rows of a leaf slot: 2^nu
+    slots:      Vec<usize>, // the Lean checker's table in each leaf slot
+    mult_bits:  Vec<usize>, // per table, the width of its multiplicities
+    body_extra: usize,      // extra public words every outer pads to
+    leaves:     u64,        // 6, or 8 for any longer segment
 }
 
 OuterVk { circuit: CircuitRecipe, pcs: PcsParams, m: usize }
@@ -67,9 +76,14 @@ LeanSegmentProof {
 }
 ```
 
-A key file is the 16 bytes `cas-lean-vkey001` followed by the
+A key file is the 16 bytes `cas-lean-vkey002` followed by the
 [zstd](https://facebook.github.io/zstd/) compression of the bincode encoding
-of a `LeanVk`.
+of a `LeanVk`. Format 1 (`cas-lean-vkey001`) had no `params`; it is still
+read, its fingerprint is the hash of its own bytes, and it cannot be made
+again (below). The leaf's bus in a key carries no challenges (`shared` is
+`None`): they come from the cone's commitment root, and the first-level
+circuit checks the bus under the seed the root publishes, so one key serves
+every cone at its parameters.
 
 `CircuitRecipe` holds the inputs of a circuit's validating constructors
 (registry types and their matrices, gate counts, fixed public words, the
@@ -124,10 +138,20 @@ differs in anything above. For the shuffle paper's cone, about 155 000
 facts (148 000 terms of 4.2 million). Format 1 (`cas-lean-bundle1`) had no
 facts; it is still read, and says so.
 
-## What it does not check yet
+## Making a key again
 
-The circuits in a key are rebuilt and checked for consistency, but nothing
-in the file says they are *the* Lean checker's circuits: a key is trusted by
-its fingerprint. Compare the printed fingerprint with the one published for
-the prover version that made the proof. Regenerating a key from the prover's
-code and parameters is the next step.
+`verify` rebuilds a key's circuits and checks them for consistency, but
+nothing in the key itself says they are *the* Lean checker's circuits.
+`lean_tower keygen KEY ...` (and `cas-lean keygen`) says that: from the
+key's parameters alone it builds a segment of `leaves` leaves whose slots
+are all padding, with this code's Lean tables (`regenerate_lean_vk`,
+`lean_tower.rs`), proves it, and compares the key it saves with the given
+one. Every circuit of a Lean tower is the same whatever its leaves hold, so
+an equal fingerprint means the key holds the circuits this code makes at
+those parameters. It costs a short proof of that many leaves (about two
+minutes at nu 8, 6.5 GB). Any parameters are sound: they only decide how
+many rows of each table a leaf holds.
+
+Tested on the cone of `Nat.add_comm` from Lean's `Init` (v4.25.0) at nu 8,
+52 slots: the key of a 16-leaf segment and the key made again from 8 empty
+leaves are one fingerprint.

@@ -242,9 +242,26 @@ pub fn prove_lean_segment(
     words: &[[u8; 32]],
     first: usize,
     challenge_root: Option<[u8; 32]>,
+    piece: impl FnMut(usize) -> Piece,
+    env: LeanEnvelope,
+    progress: impl FnMut(&str),
+) -> LeanSegmentOut {
+    prove_lean_segment_keyed(cfg, words, first, challenge_root, piece, env, progress, None)
+}
+
+/// [`prove_lean_segment`], writing `params` (the leaves' profile and
+/// widths; its depth class is set here) into the saved key, so the key can
+/// be made again from them ([`regenerate_lean_vk`]).
+#[allow(clippy::too_many_arguments)]
+pub fn prove_lean_segment_keyed(
+    cfg: TowerConfig,
+    words: &[[u8; 32]],
+    first: usize,
+    challenge_root: Option<[u8; 32]>,
     mut piece: impl FnMut(usize) -> Piece,
     env: LeanEnvelope,
     mut progress: impl FnMut(&str),
+    params: Option<super::lean_verify::LeanKeyParams>,
 ) -> LeanSegmentOut {
     let mut piece = |i: usize| piece(first + i);
     let tag = |i: usize| ((first + i) as u64).to_le_bytes();
@@ -570,9 +587,18 @@ pub fn prove_lean_segment(
             pcs: lo.pcs.clone(),
             m: lo.commitment.params.m,
         };
+        // The leaf's bus challenges come from this cone's commitment root:
+        // they are the cone's, not the key's (the digest leaves the bus out,
+        // and the first-level circuit checks the bus under the seed the
+        // root publishes), so the key holds the bus without them and is
+        // the same for every cone at its parameters.
+        let mut leaf_recipe = CircuitRecipe::of(leaf_circuit);
+        if let Some(bus) = leaf_recipe.bus.as_mut() {
+            bus.shared = None;
+        }
         let vk = LeanVk {
             envelope: (env.nu, env.lanes, env.m),
-            leaf: CircuitRecipe::of(leaf_circuit),
+            leaf: leaf_recipe,
             leaf_full_height,
             leaf_m,
             fl: outer(&fl0.lo),
@@ -584,6 +610,11 @@ pub fn prove_lean_segment(
                 &root,
             ),
             app_base: a,
+            params: params.map(|p| super::lean_verify::LeanKeyParams {
+                leaves: if n == 6 { 6 } else { 8 },
+                body_extra: super::envelope::lean_body_extra(),
+                ..p
+            }),
         };
         let proof = LeanSegmentProof {
             vk: 0,
@@ -824,4 +855,72 @@ pub fn prove_root_key_batch(
         proof_bytes,
         verify_ms,
     }
+}
+
+/// A segment's verification key made again from the prover's code and the
+/// key's parameters alone: a segment of `params.leaves` empty leaves (every
+/// slot padding) is proved at the envelope, and its saved key returned.
+/// Every circuit of a Lean tower is the same whatever its leaves hold, so a
+/// key equal to it (one fingerprint) holds the circuits this code makes.
+/// It costs a short proof of that many leaves.
+pub fn regenerate_lean_vk(
+    envelope: (usize, usize, usize),
+    params: &super::lean_verify::LeanKeyParams,
+    mut progress: impl FnMut(&str),
+) -> Result<super::lean_verify::LeanVk, String> {
+    use crate::lean_rows::{LeanCircuit, Profile, Rows, Side, leaf, set_mult_bits};
+    let p = params;
+    if p.leaves != 6 && p.leaves != 8 {
+        return Err(format!("a key's depth class is 6 or 8 leaves, not {}", p.leaves));
+    }
+    if p.slots.is_empty() {
+        return Err("a key's leaf has no slots".into());
+    }
+    set_mult_bits(Some(p.mult_bits.clone()));
+    super::envelope::set_lean_body_extra(Some(p.body_extra));
+    let out = (|| {
+        let (proto, _) = LeanCircuit::build_side(
+            &Rows::default(),
+            &Rows::default(),
+            Side::Batch,
+            1 << 20,
+            &std::collections::HashMap::new(),
+        )?;
+        let n_tables = proto.mult_bits().len();
+        if let Some(&s) = p.slots.iter().find(|&&s| s >= n_tables) {
+            return Err(format!("a slot names table {s} of {n_tables}"));
+        }
+        let profile = Profile {
+            nu: p.nu,
+            slots: p.slots.clone(),
+        };
+        let empty = vec![None; p.slots.len()];
+        let piece = |i: usize| leaf(&proto, &profile, &empty, i);
+        let n = p.leaves as usize;
+        let mut words = Vec::with_capacity(n);
+        for i in 0..n {
+            words.push(leaf_word(&piece(i)?));
+            progress(&format!("empty leaf {i} committed"));
+        }
+        let o = prove_lean_segment_keyed(
+            TowerConfig::Chain128,
+            &words,
+            0,
+            None,
+            |i| piece(i).expect("an empty leaf builds"),
+            LeanEnvelope {
+                nu: envelope.0,
+                lanes: envelope.1,
+                m: envelope.2,
+            },
+            &mut progress,
+            Some(p.clone()),
+        );
+        o.saved
+            .map(|s| s.0)
+            .ok_or_else(|| "the empty segment saved no key".to_string())
+    })();
+    set_mult_bits(None);
+    super::envelope::set_lean_body_extra(None);
+    out
 }

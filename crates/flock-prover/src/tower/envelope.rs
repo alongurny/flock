@@ -293,6 +293,24 @@ pub(super) fn set_envelope_override(o: Option<(usize, usize, usize)>) {
     *ENVELOPE_OVERRIDE.lock().unwrap() = o;
 }
 
+static BODY_EXTRA_OVERRIDE: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+/// The extra public body a Lean envelope pads to: set by
+/// [`set_lean_body_extra`] (a key regenerated at its parameters), else
+/// `LEAN_BODY_EXTRA`, else 0.
+pub fn lean_body_extra() -> usize {
+    BODY_EXTRA_OVERRIDE.lock().unwrap().unwrap_or_else(|| {
+        std::env::var("LEAN_BODY_EXTRA")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+pub fn set_lean_body_extra(x: Option<usize>) {
+    *BODY_EXTRA_OVERRIDE.lock().unwrap() = x;
+}
+
 /// The dense floor m* every envelope outer commits at (one m for every
 /// node kind, so a parent's walk of the child's PCS is one shape).
 pub(super) fn envelope_floor_m() -> usize {
@@ -315,10 +333,7 @@ pub(super) fn envelope_shape_with_lane(acc_chain_words: usize) -> EnvShape {
         // A leaf of many slots has more public words (a chunk word per
         // slot, the range tables' values): LEAN_BODY_EXTRA widens the
         // public body every outer pads to.
-        env.publics += std::env::var("LEAN_BODY_EXTRA")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
+        env.publics += lean_body_extra();
     }
     env
 }

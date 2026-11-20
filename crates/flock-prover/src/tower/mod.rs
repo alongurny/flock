@@ -43,7 +43,8 @@ use {
 #[cfg(not(target_arch = "aarch64"))]
 pub use crate::tower::lean_tower::{
     LeanEnvelope, LeanSegmentOut, LeanStatement, LeanTowerReport, SegmentClaim, leaf_word,
-    lean_segment_root, lean_segments_root, prove_lean_segment, prove_lean_tower,
+    lean_segment_root, lean_segments_root, prove_lean_segment, prove_lean_segment_keyed,
+    prove_lean_tower, regenerate_lean_vk,
     prove_lean_tower_streaming, prove_root_key_batch, segments_balanced,
 };
 pub use crate::tower::{

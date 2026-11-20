@@ -26,9 +26,9 @@ use flock_prover::{
     },
     tower::{
         LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root,
-        lean_segments_root, prove_lean_segment, prove_lean_tower_streaming, prove_root_key_batch,
-        segments_balanced,
-        lean_verify::{LeanBundle, LeanSegmentProof, LeanVk, verify_lean_bundle},
+        lean_segments_root, prove_lean_segment_keyed, prove_lean_tower_streaming,
+        prove_root_key_batch, regenerate_lean_vk, segments_balanced,
+        lean_verify::{LeanBundle, LeanKeyParams, LeanSegmentProof, LeanVk, verify_lean_bundle},
     },
 };
 
@@ -454,6 +454,79 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+mod erased {
+    pub trait Ser {
+        fn bytes(&self) -> Vec<u8>;
+    }
+    impl<T: serde::Serialize> Ser for T {
+        fn bytes(&self) -> Vec<u8> {
+            bincode::serialize(self).unwrap()
+        }
+    }
+}
+
+/// `lean_tower keygen KEY ...`: make each key again from this code and
+/// its parameters, and say whether it is the same key (one fingerprint).
+/// True when every key is.
+pub fn keygen_main(keys: &[LeanVk]) -> bool {
+    let mut all = true;
+    for (i, vk) in keys.iter().enumerate() {
+        let f = vk.fingerprint();
+        let Some(p) = &vk.params else {
+            println!(
+                "key {i} blake3:{}: format 1, no parameters to make it from",
+                hex(&f)
+            );
+            all = false;
+            continue;
+        };
+        let t = Instant::now();
+        println!(
+            "key {i} blake3:{}: making it from {} slots at nu {}, {} leaves",
+            hex(&f),
+            p.slots.len(),
+            p.nu,
+            p.leaves
+        );
+        match regenerate_lean_vk(vk.envelope, p, |l| eprintln!("key {i}: {l}")) {
+            Ok(k) if k.fingerprint() == f => println!(
+                "key {i} blake3:{}: REGENERATED, the same key ({:.0} s)",
+                hex(&f),
+                t.elapsed().as_secs_f64()
+            ),
+            Ok(k) => {
+                println!(
+                    "key {i} blake3:{}: DIFFERS: this code makes blake3:{}",
+                    hex(&f),
+                    hex(&k.fingerprint())
+                );
+                let b = |x: &dyn erased::Ser| x.bytes();
+                for (what, x, y) in [
+                    ("envelope", b(&vk.envelope), b(&k.envelope)),
+                    ("leaf", b(&vk.leaf), b(&k.leaf)),
+                    ("leaf full height", b(&vk.leaf_full_height), b(&k.leaf_full_height)),
+                    ("leaf m", b(&vk.leaf_m), b(&k.leaf_m)),
+                    ("first-level", b(&vk.fl), b(&k.fl)),
+                    ("base", b(&vk.base), b(&k.base)),
+                    ("steady", b(&vk.steady), b(&k.steady)),
+                    ("app base", b(&vk.app_base), b(&k.app_base)),
+                    ("params", b(&vk.params), b(&k.params)),
+                ] {
+                    if x != y {
+                        println!("  the {what} differs");
+                    }
+                }
+                all = false;
+            }
+            Err(e) => {
+                println!("key {i} blake3:{}: not made: {e}", hex(&f));
+                all = false;
+            }
+        }
+    }
+    all
+}
+
 /// `lean_tower verify BUNDLE [KEY ...]`: check a cone's bundle against
 /// its verification keys (by default the `vk-<fingerprint>.vk` files beside
 /// it), reading nothing else.
@@ -532,6 +605,45 @@ pub fn main() {
     }
     if a.first().is_some_and(|x| x == "verify") {
         verify_main(&a[1], &a[2..]);
+        return;
+    }
+    if a.first().is_some_and(|x| x == "leafdiff") {
+        // The key's leaf against an empty leaf this code makes at its parameters.
+        use flock_core::circuit::recipe::CircuitRecipe;
+        let vk = LeanVk::from_bytes(&fs::read(&a[1]).unwrap()).unwrap();
+        let p = vk.params.clone().expect("a key with parameters");
+        flock_prover::lean_rows::set_mult_bits(Some(p.mult_bits.clone()));
+        let (proto, _) = LeanCircuit::build_side(&Rows::default(), &Rows::default(), Side::Batch, 1 << 20, &HashMap::new()).unwrap();
+        let profile = Profile { nu: p.nu, slots: p.slots.clone() };
+        let piece = leaf(&proto, &profile, &vec![None; p.slots.len()], 0).unwrap();
+        let r = CircuitRecipe::of(&piece.shape().circuit);
+        let b = |x: &dyn erased::Ser| x.bytes();
+        let (x, y) = (&vk.leaf, &r);
+        for (what, u, v) in [
+            ("registry", b(&x.registry), b(&y.registry)),
+            ("counts", b(&x.counts), b(&y.counts)),
+            ("fixed_public", b(&x.fixed_public), b(&y.fixed_public)),
+            ("wires", x.wires.clone(), y.wires.clone()),
+            ("flags", b(&(x.pruned, x.public_columns, x.packed)), b(&(y.pruned, y.public_columns, y.packed))),
+            ("bus", b(&x.bus), b(&y.bus)),
+        ] {
+            println!("{what}: {} vs {} bytes, {}", u.len(), v.len(), if u == v { "same" } else { "DIFFERS" });
+        }
+        if x.fixed_public != y.fixed_public {
+            for (i, (u, v)) in x.fixed_public.iter().zip(&y.fixed_public).enumerate() {
+                if u != v { println!("  fixed public {i}: {u:?} vs {v:?}"); }
+            }
+        }
+        return;
+    }
+    if a.first().is_some_and(|x| x == "keygen") {
+        let keys: Vec<LeanVk> = a[1..]
+            .iter()
+            .map(|p| LeanVk::from_bytes(&fs::read(p).unwrap_or_else(|e| panic!("{p}: {e}"))).unwrap())
+            .collect();
+        if !keygen_main(&keys) {
+            std::process::exit(1);
+        }
         return;
     }
     let num = |i: usize| a[i].parse::<usize>().unwrap();
@@ -782,7 +894,8 @@ pub fn main() {
                     }
                     plan.push(leaf);
                 }
-                while (plan.len() - n_common) % 2 == 1 || plan.len() - n_common < 4 {
+                // Six at least: a segment of four leaves has no spine, so no saved proof.
+                while (plan.len() - n_common) % 2 == 1 || plan.len() - n_common < 6 {
                     plan.push(vec![None; width]);
                 }
                 profiles.resize(plan.len(), rare_profile);
@@ -1094,7 +1207,14 @@ pub fn main() {
                     }
                     let (a, b) = bounds[s];
                     let t = Instant::now();
-                    let o = prove_lean_segment(
+                    let params = LeanKeyParams {
+                        nu: profiles[a].nu,
+                        slots: profiles[a].slots.clone(),
+                        mult_bits: read_bits(&out),
+                        body_extra: 0,
+                        leaves: 0,
+                    };
+                    let o = prove_lean_segment_keyed(
                         TowerConfig::Chain128,
                         &words[a..b],
                         a,
@@ -1108,6 +1228,7 @@ pub fn main() {
                                 rss()
                             )
                         },
+                        Some(params),
                     );
                     let r = &o.report;
                     let k: Kept = (

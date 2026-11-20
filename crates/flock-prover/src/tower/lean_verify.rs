@@ -66,9 +66,43 @@ pub struct LeanVk {
     pub(super) layout: AccLayout,
     /// Where the root's statement words start in its publics.
     pub app_base: usize,
+    /// What the key is made from besides the prover's code, so anyone can
+    /// make it again ([`super::lean_tower::regenerate_lean_vk`]); `None`
+    /// in a key of format 1, which can only be trusted by its fingerprint.
+    pub params: Option<LeanKeyParams>,
 }
 
-const VK_MAGIC: &[u8; 16] = b"cas-lean-vkey001";
+/// The parameters of a segment's key. The leaf circuit is the Lean
+/// checker's tables (code) placed in `slots` (a table index per slot, each
+/// of `2^nu` rows) with the multiplicity widths `mult_bits`; the outer
+/// circuits follow from it, the envelope and `body_extra`, and from the
+/// segment's depth class: `leaves` is 6 (the root is the first spine node)
+/// or 8 (it stands for any longer segment, whose root is the steady node).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeanKeyParams {
+    pub nu: usize,
+    pub slots: Vec<usize>,
+    pub mult_bits: Vec<usize>,
+    pub body_extra: usize,
+    pub leaves: u64,
+}
+
+/// A key of format 1: no parameters.
+#[derive(Deserialize)]
+struct LeanVkV1 {
+    envelope: (usize, usize, usize),
+    leaf: CircuitRecipe,
+    leaf_full_height: bool,
+    leaf_m: usize,
+    fl: OuterVk,
+    base: OuterVk,
+    steady: OuterVk,
+    layout: AccLayout,
+    app_base: usize,
+}
+
+const VK_MAGIC: &[u8; 16] = b"cas-lean-vkey002";
+const VK_MAGIC_V1: &[u8; 16] = b"cas-lean-vkey001";
 
 impl LeanVk {
     /// A key file: the 16 bytes `cas-lean-vkey001`, then the key's bincode
@@ -81,18 +115,45 @@ impl LeanVk {
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Self, String> {
-        let body = b
-            .strip_prefix(VK_MAGIC.as_slice())
-            .ok_or("not a Lean verification key (bad header)")?;
+        let (v1, body) = match b.strip_prefix(VK_MAGIC.as_slice()) {
+            Some(body) => (false, body),
+            None => (
+                true,
+                b.strip_prefix(VK_MAGIC_V1.as_slice())
+                    .ok_or("not a Lean verification key (bad header)")?,
+            ),
+        };
         let mut raw = Vec::new();
         zstd::stream::copy_decode(body, &mut raw)
             .map_err(|e| format!("the key does not decompress: {e}"))?;
-        bincode::deserialize(&raw).map_err(|e| format!("the key does not decode: {e}"))
+        let bad = |e: bincode::Error| format!("the key does not decode: {e}");
+        if !v1 {
+            return bincode::deserialize(&raw).map_err(bad);
+        }
+        let k: LeanVkV1 = bincode::deserialize(&raw).map_err(bad)?;
+        Ok(LeanVk {
+            envelope: k.envelope,
+            leaf: k.leaf,
+            leaf_full_height: k.leaf_full_height,
+            leaf_m: k.leaf_m,
+            fl: k.fl,
+            base: k.base,
+            steady: k.steady,
+            layout: k.layout,
+            app_base: k.app_base,
+            params: None,
+        })
     }
 
     /// The BLAKE3 hash of the VK's bytes.
     pub fn fingerprint(&self) -> [u8; 32] {
-        *blake3::hash(&bincode::serialize(self).expect("a VK serializes")).as_bytes()
+        let mut b = bincode::serialize(self).expect("a VK serializes");
+        if self.params.is_none() {
+            // Format 1's bytes: the same fields without the parameters
+            // (bincode writes `None` as one trailing zero byte).
+            b.pop();
+        }
+        *blake3::hash(&b).as_bytes()
     }
 }
 
