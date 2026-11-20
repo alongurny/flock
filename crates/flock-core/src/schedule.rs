@@ -307,6 +307,14 @@ impl TableType {
         self.useful_bits.div_ceil(128)
     }
 
+    /// Nonzeros of `A_0`, `B_0` and `C_0` together.
+    pub fn nonzeros(&self) -> usize {
+        [&self.a_0, &self.b_0, &self.c_0]
+            .iter()
+            .map(|m| m.rows.iter().map(Vec::len).sum::<usize>())
+            .sum()
+    }
+
     /// The element payload, or `None` for a boolean type.
     pub fn element_type(&self) -> Option<&ElementTableType> {
         match &self.class {
@@ -384,6 +392,123 @@ pub struct Registry {
     /// immutable after construction, so the cache can never go stale and the
     /// derived `Clone` may carry it.
     digest_cache: OnceLock<[u8; 32]>,
+}
+
+/// A boolean type at least this large starts a cached digest prefix
+/// ([`Registry::digest`]).
+const DIGEST_PREFIX_NONZEROS: usize = 1 << 20;
+
+/// What a type is to the digest, with its matrices by identity: the `Arc`s
+/// are held, so an address is never reused while its entry lives.
+struct TypeKey {
+    k_log: usize,
+    useful_bits: usize,
+    const_pin: Option<usize>,
+    mats: [(usize, usize, Arc<Vec<Vec<usize>>>); 3],
+    io_schema: Vec<IoWord>,
+    zeroed_word_cols: Vec<usize>,
+}
+
+impl TypeKey {
+    fn of(t: &TableType) -> Self {
+        let m = |m: &SparseBinaryMatrix| (m.num_rows, m.num_cols, m.rows.clone());
+        Self {
+            k_log: t.k_log,
+            useful_bits: t.useful_bits,
+            const_pin: t.const_pin,
+            mats: [m(&t.a_0), m(&t.b_0), m(&t.c_0)],
+            io_schema: t.io_schema.clone(),
+            zeroed_word_cols: t.zeroed_word_cols.clone(),
+        }
+    }
+
+    fn is(&self, t: &TableType) -> bool {
+        let same = |k: &(usize, usize, Arc<Vec<Vec<usize>>>), m: &SparseBinaryMatrix| {
+            k.0 == m.num_rows && k.1 == m.num_cols && Arc::ptr_eq(&k.2, &m.rows)
+        };
+        !t.is_element()
+            && self.k_log == t.k_log
+            && self.useful_bits == t.useful_bits
+            && self.const_pin == t.const_pin
+            && same(&self.mats[0], &t.a_0)
+            && same(&self.mats[1], &t.b_0)
+            && same(&self.mats[2], &t.c_0)
+            && self.io_schema == t.io_schema
+            && self.zeroed_word_cols == t.zeroed_word_cols
+    }
+}
+
+/// The digest's hasher after the header of a registry of `n` types at `nu`
+/// and the boolean types `prefix`, from a cache of the last few.
+fn prefix_state(nu: usize, n: usize, prefix: &[TableType]) -> Hasher {
+    type Entry = (usize, usize, Vec<TypeKey>, Hasher);
+    static CACHE: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
+    let hit = |e: &Entry| {
+        e.0 == nu
+            && e.1 == n
+            && e.2.len() == prefix.len()
+            && e.2.iter().zip(prefix).all(|(k, t)| k.is(t))
+    };
+    if let Some(e) = CACHE.lock().unwrap().iter().find(|e| hit(e)) {
+        return e.3.clone();
+    }
+    let mut h = digest_header(nu, n);
+    for ty in prefix {
+        absorb_type(&mut h, ty);
+    }
+    let mut cache = CACHE.lock().unwrap();
+    if cache.len() >= 32 {
+        cache.remove(0);
+    }
+    cache.push((nu, n, prefix.iter().map(TypeKey::of).collect(), h.clone()));
+    h
+}
+
+/// [`Registry::digest`]'s absorption before the first of `n` types.
+fn digest_header(nu: usize, n: usize) -> Hasher {
+    let mut h = Hasher::new();
+    h.update(b"flock-registry-v1");
+    h.update(&[1u8]);
+    h.update(&(nu as u32).to_le_bytes());
+    h.update(&(n as u32).to_le_bytes());
+    h
+}
+
+/// One type's part of [`Registry::digest`].
+fn absorb_type(h: &mut Hasher, ty: &TableType) {
+    h.update(&(ty.k_log as u32).to_le_bytes());
+    h.update(&(ty.useful_bits as u64).to_le_bytes());
+    let (present, value) = match ty.const_pin {
+        Some(col) => (1u8, col as u64),
+        None => (0u8, 0u64),
+    };
+    h.update(&[present]);
+    h.update(&value.to_le_bytes());
+    absorb_matrix(h, &ty.a_0);
+    absorb_matrix(h, &ty.b_0);
+    absorb_matrix(h, &ty.c_0);
+    // Element payload appends ONLY when present — see above.
+    if let Some(el) = ty.element_type() {
+        h.update(ELEMENT_CLASS_LABEL);
+        h.update(&el.digest());
+    }
+    // IO schema appends ONLY when non-empty — see above.
+    if !ty.io_schema.is_empty() {
+        h.update(IO_SCHEMA_LABEL);
+        h.update(&(ty.io_schema.len() as u32).to_le_bytes());
+        for w in &ty.io_schema {
+            h.update(&(w.word_col as u32).to_le_bytes());
+            h.update(&[w.dir.code()]);
+        }
+    }
+    // Zeroed words append ONLY when non-empty — see above.
+    if !ty.zeroed_word_cols.is_empty() {
+        h.update(ZEROED_WORDS_LABEL);
+        h.update(&(ty.zeroed_word_cols.len() as u32).to_le_bytes());
+        for &w in &ty.zeroed_word_cols {
+            h.update(&(w as u32).to_le_bytes());
+        }
+    }
 }
 
 impl Registry {
@@ -655,45 +780,25 @@ impl Registry {
     /// subsequent calls are essentially free.
     pub fn digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
-            let mut h = Hasher::new();
-            h.update(b"flock-registry-v1");
-            h.update(&[1u8]);
-            h.update(&(self.nu as u32).to_le_bytes());
-            h.update(&(self.types.len() as u32).to_le_bytes());
-            for ty in &self.types {
-                h.update(&(ty.k_log as u32).to_le_bytes());
-                h.update(&(ty.useful_bits as u64).to_le_bytes());
-                let (present, value) = match ty.const_pin {
-                    Some(col) => (1u8, col as u64),
-                    None => (0u8, 0u64),
-                };
-                h.update(&[present]);
-                h.update(&value.to_le_bytes());
-                absorb_matrix(&mut h, &ty.a_0);
-                absorb_matrix(&mut h, &ty.b_0);
-                absorb_matrix(&mut h, &ty.c_0);
-                // Element payload appends ONLY when present — see above.
-                if let Some(el) = ty.element_type() {
-                    h.update(ELEMENT_CLASS_LABEL);
-                    h.update(&el.digest());
-                }
-                // IO schema appends ONLY when non-empty — see above.
-                if !ty.io_schema.is_empty() {
-                    h.update(IO_SCHEMA_LABEL);
-                    h.update(&(ty.io_schema.len() as u32).to_le_bytes());
-                    for w in &ty.io_schema {
-                        h.update(&(w.word_col as u32).to_le_bytes());
-                        h.update(&[w.dir.code()]);
-                    }
-                }
-                // Zeroed words append ONLY when non-empty — see above.
-                if !ty.zeroed_word_cols.is_empty() {
-                    h.update(ZEROED_WORDS_LABEL);
-                    h.update(&(ty.zeroed_word_cols.len() as u32).to_le_bytes());
-                    for &w in &ty.zeroed_word_cols {
-                        h.update(&(w as u32).to_le_bytes());
-                    }
-                }
+            // The types up to the last large boolean one are absorbed once
+            // per process and their hasher state reused (`prefix_state`):
+            // BLAKE3's table alone is ~20M nonzeros, ~125 ms to absorb, and a
+            // caller that builds many circuits from the same gates (cas
+            // proves one circuit per commit) would pay it for every one. The
+            // bytes absorbed, and so the digest, are unchanged.
+            let big = self
+                .types
+                .iter()
+                .rposition(|t| !t.is_element() && t.nonzeros() >= DIGEST_PREFIX_NONZEROS);
+            let (mut h, rest) = match big {
+                Some(j) => (
+                    prefix_state(self.nu, self.types.len(), &self.types[..=j]),
+                    &self.types[j + 1..],
+                ),
+                None => (digest_header(self.nu, self.types.len()), &self.types[..]),
+            };
+            for ty in rest {
+                absorb_type(&mut h, ty);
             }
             *h.finalize().as_bytes()
         })
@@ -1240,6 +1345,66 @@ mod tests {
             "identically constructed registries must agree"
         );
         assert_eq!(d, a.clone().digest(), "clone must carry the same digest");
+    }
+
+    /// A registry whose first type is large takes its digest prefix from a
+    /// cache keyed by the matrices' identity; the digest is the same as
+    /// absorbing every type, whether the cache hits, misses, or holds a
+    /// different registry with the same large type.
+    #[test]
+    fn registry_digest_prefix_cache_is_exact() {
+        let big = TableType {
+            k_log: 14,
+            useful_bits: 15_000,
+            a_0: SparseBinaryMatrix::new(
+                1 << 14,
+                1 << 14,
+                (0..1usize << 14)
+                    .map(|i| (0..64).map(|j| (i * 7 + j * 131) % (1 << 14)).collect())
+                    .collect(),
+            ),
+            b_0: stub(),
+            c_0: stub(),
+            const_pin: Some(1),
+            class: TableClass::Boolean,
+            io_schema: Vec::new(),
+            zeroed_word_cols: Vec::new(),
+        };
+        assert!(big.nonzeros() >= super::DIGEST_PREFIX_NONZEROS);
+        let small = |entry: usize| TableType {
+            k_log: 9,
+            useful_bits: 300,
+            a_0: matrix(vec![vec![0, entry], vec![7]]),
+            b_0: stub(),
+            c_0: stub(),
+            const_pin: Some(2),
+            class: TableClass::Boolean,
+            io_schema: vec![IoWord::input(0)],
+            zeroed_word_cols: Vec::new(),
+        };
+        let reference = |r: &Registry| {
+            let mut h = super::digest_header(r.nu, r.types.len());
+            for t in &r.types {
+                super::absorb_type(&mut h, t);
+            }
+            *h.finalize().as_bytes()
+        };
+        let a = Registry::new(vec![big.clone(), small(3)], 3);
+        assert_eq!(a.digest(), reference(&a), "a miss");
+        let b = Registry::new(vec![big.clone(), small(3)], 3);
+        assert_eq!(b.digest(), a.digest(), "a hit");
+        let c = Registry::new(vec![big.clone(), small(4)], 3);
+        assert_eq!(c.digest(), reference(&c), "a hit, another rest");
+        assert_ne!(c.digest(), a.digest());
+        let deep = TableType {
+            a_0: SparseBinaryMatrix::new(1 << 14, 1 << 14, big.a_0.rows.as_ref().clone()),
+            ..big.clone()
+        };
+        let d = Registry::new(vec![deep, small(3)], 3);
+        assert_eq!(d.digest(), a.digest(), "equal matrices, other storage");
+        let e = Registry::new(vec![big.clone(), small(3)], 4);
+        assert_eq!(e.digest(), reference(&e), "another nu");
+        assert_ne!(e.digest(), a.digest());
     }
 
     /// Every absorbed component moves the digest: nu, a single matrix

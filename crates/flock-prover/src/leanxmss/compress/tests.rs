@@ -183,3 +183,11 @@ fn kernel_packing_matches_the_walk() {
         }
     }
 }
+
+/// [`PAD`] is what probing finds, so [`compress_circuit`] compiles once.
+#[test]
+fn the_known_padding_is_the_probed_one() {
+    assert_eq!(PAD, probe_pad());
+    let (circuit, operations) = compress_circuit();
+    assert_eq!(rounds_end(circuit, operations) % 128, 0);
+}

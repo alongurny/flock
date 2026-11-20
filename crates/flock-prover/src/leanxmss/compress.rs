@@ -142,23 +142,42 @@ fn compile(pad: usize) -> (BooleanCircuit, Vec<SchemaOperation>) {
     (compiled.circuit().clone(), compiled.operations().to_vec())
 }
 
-/// The compression row's circuit and its operation. Built once without
-/// padding to find where the rounds end, then with the padding that puts
-/// that end on a word boundary.
+/// The padding that puts the end of the rounds on a word boundary, as
+/// [`probe_pad`] finds it. Compiling the row takes ~2.2 s, so
+/// [`compress_circuit`] compiles once with this padding and probes only if
+/// the rounds then do not end on a boundary (the test
+/// `the_known_padding_is_the_probed_one` keeps it current).
+const PAD: usize = 70;
+
+/// Where the rounds of a compiled row end, in bits.
+fn rounds_end(circuit: &BooleanCircuit, operations: &[SchemaOperation]) -> usize {
+    let layout = circuit.layout().expect("the compression row lays out");
+    let columns = &operations
+        .iter()
+        .find(|op| op.kind == OPERATION)
+        .expect("the compression is an operation")
+        .columns;
+    let last_round = columns[columns.len() - 257];
+    layout.value_position(last_round).expect("placed") + 1
+}
+
+/// The padding found by compiling the row without any.
+fn probe_pad() -> usize {
+    let (probe, operations) = compile(0);
+    (128 - rounds_end(&probe, &operations) % 128) % 128
+}
+
+/// The compression row's circuit and its operation, with the padding that
+/// puts the end of the rounds on a word boundary.
 pub fn compress_circuit() -> &'static (BooleanCircuit, Vec<SchemaOperation>) {
     static CIRCUIT: std::sync::OnceLock<(BooleanCircuit, Vec<SchemaOperation>)> =
         std::sync::OnceLock::new();
     CIRCUIT.get_or_init(|| {
-        let (probe, operations) = compile(0);
-        let layout = probe.layout().expect("the compression row lays out");
-        let columns = &operations
-            .iter()
-            .find(|op| op.kind == OPERATION)
-            .expect("the compression is an operation")
-            .columns;
-        let last_round = columns[columns.len() - 257];
-        let end = layout.value_position(last_round).expect("placed") + 1;
-        compile((128 - end % 128) % 128)
+        let (circuit, operations) = compile(PAD);
+        if rounds_end(&circuit, &operations) % 128 == 0 {
+            return (circuit, operations);
+        }
+        compile(probe_pad())
     })
 }
 
