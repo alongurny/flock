@@ -76,7 +76,13 @@ fn stmt_de((chunk_words, keys, prims, arith): StmtS) -> LeanStatement {
                 out: f(out),
             })
             .collect(),
+        facts: Vec::new(),
     }
+}
+
+/// What the declarations are (`lean_tower shared` writes it).
+fn facts_path(out: &str) -> String {
+    format!("{out}/facts.bin")
 }
 
 /// `lean_dump`'s LEAN_DUMP_NAT file: the kernel's constants by key
@@ -622,6 +628,7 @@ pub fn main() {
             // few, and building the side takes minutes and gigabytes.
             flock_prover::lean_rows::set_mult_bits(Some(read_bits(&out)));
             let c = build(0, n, &out);
+            fs::write(facts_path(&out), bincode::serialize(&c.stmt_facts).unwrap()).unwrap();
             fs::create_dir_all(format!("{out}/shared")).unwrap();
             let mut k = 0;
             for (s, ch, _) in c.chunks() {
@@ -979,6 +986,14 @@ pub fn main() {
                 .unwrap();
                 let _ = fs::remove_file(&part_file);
             }
+            // What the declarations are, from the shared side.
+            statement.facts = fs::read(facts_path(&out))
+                .map(|b| bincode::deserialize(&b).expect("a facts file of this version"))
+                .unwrap_or_else(|e| panic!("{}: {e} (run `lean_tower shared`)", facts_path(&out)));
+            println!(
+                "statement: {} facts about the declarations,",
+                statement.facts.len()
+            );
             println!(
                 "statement: {} chunk words, {} checked keys, {} steps of arithmetic",
                 statement.chunk_words.len(),

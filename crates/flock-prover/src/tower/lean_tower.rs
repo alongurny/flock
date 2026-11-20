@@ -95,6 +95,8 @@ pub struct LeanStatement {
     /// The steps of arithmetic on literals the rules read from the
     /// verifier, per reading row ([`crate::lean_rows::arith_product`]).
     pub arith: Vec<crate::lean_rows::Arith>,
+    /// What the declarations are ([`crate::lean_rows::facts_product`]).
+    pub facts: Vec<crate::lean_rows::Tuple>,
 }
 
 /// A leaf's word in the commitment tree: its publics digest chained with
@@ -221,7 +223,8 @@ pub fn segments_balanced(
     if segments.iter().any(|s| s.seed != seed) {
         return Err("a segment used other challenges".into());
     }
-    let st = crate::lean_rows::statement_product(&ch, &statement.chunk_words, &statement.keys)?;
+    let st = crate::lean_rows::statement_product(&ch, &statement.chunk_words, &statement.keys)?
+        * crate::lean_rows::facts_product(&ch, &statement.facts);
     let prims = crate::lean_rows::prims_product(&ch, &statement.prims)?;
     let (arith, _) = crate::lean_rows::arith_product(&ch, &statement.arith)?;
     let send = segments.iter().fold(prims * arith, |a, s| a * s.send);

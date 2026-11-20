@@ -34,7 +34,11 @@
 //! checked: a pi's universe, level equivalence, and the rules of
 //! inductive types, projections, literals and quotients.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -345,6 +349,17 @@ pub struct Rows {
     /// to put them in a cone's shared numbering.
     #[serde(skip)]
     local: Local,
+}
+
+impl Rows {
+    /// Term rows (all, and those reached from the declarations' types, the
+    /// values of declarations other than theorems and the recursors' rules)
+    /// and declaration rows: the size of a statement that binds the
+    /// declarations to their text.
+    pub fn statement_census(&self) -> (usize, usize, usize) {
+        let seen = reached_terms(self);
+        (self.terms.len(), seen.iter().filter(|x| **x).count(), self.decls.len())
+    }
 }
 
 #[derive(Default)]
@@ -4360,6 +4375,9 @@ pub struct LeanCircuit {
     /// `(chunk_base[s] + c)·2^32 + j`.
     chunk_base: Vec<usize>,
     pub build_ms: f64,
+    /// The shared side's tuples the verifier receives to learn what the
+    /// declarations are ([`facts_product`]).
+    pub stmt_facts: Vec<Tuple>,
 }
 
 /// Some chunks of a [`LeanCircuit`] as one circuit: a piece of a proof
@@ -4950,6 +4968,38 @@ impl LeanCircuit {
                 }
             }
         }
+        // What the declarations are, for the verifier to compare with
+        // their text: it receives, once each, the row of every declaration
+        // (its key and what the reduction rules read of it) and of every
+        // recursor rule, and the rows of the terms, levels and lists their
+        // types, the values of those other than theorems and the rules'
+        // right-hand sides reach. Their rows send them once more.
+        let mut stmt_facts: Vec<Tuple> = Vec::new();
+        if side == Side::Shared {
+            let reached = reached_terms(g);
+            let tags = [TAG_TERM, TAG_LVL, TAG_LIST, TAG_DECL, TAG_KEY, TAG_INFO, TAG_RULE].map(int);
+            for (s, sp) in specs.iter().enumerate() {
+                let decl = matches!(
+                    ofs[s],
+                    Of::DeclChecked | Of::DeclBlock | Of::DeclFree | Of::RecRule
+                );
+                if !decl && !matches!(ofs[s], Of::Term(_)) {
+                    continue;
+                }
+                for p in sp.ports.iter().filter(|p| p.send && !p.preset) {
+                    if !matches!(p.t[0], T::K(t) if tags.contains(&t)) {
+                        continue;
+                    }
+                    for (j, z) in tables[s].iter().enumerate() {
+                        if decl || reached[members[s][j]] {
+                            let t = tuple(&p.t, z, s, j);
+                            *asked.entry(t).or_default() += 1;
+                            stmt_facts.push(t);
+                        }
+                    }
+                }
+            }
+        }
         // A rule's fact goes to its own row, once.
         for (s, sp) in specs.iter().enumerate() {
             for p in sp.ports.iter().filter(|p| p.send && p.preset) {
@@ -5028,6 +5078,7 @@ impl LeanCircuit {
                 tables,
                 chunk_base,
                 build_ms: t0.elapsed().as_secs_f64() * 1e3,
+                stmt_facts,
             },
             asked,
         ))
@@ -5825,6 +5876,42 @@ pub fn leaf_statement(
         }
     }
     (words, keys)
+}
+
+/// The term rows (levels and lists among them) reached from the
+/// declarations' types, the values of those other than theorems, and the
+/// right-hand sides of the recursors' rules.
+fn reached_terms(g: &Rows) -> Vec<bool> {
+    let mut seen = vec![false; g.terms.len()];
+    let mut stack: Vec<usize> = g.rules.iter().map(|r| r.rhs).collect();
+    for d in &g.decls {
+        stack.extend(d.ty);
+        if d.kind != 3 {
+            stack.extend(d.value);
+        }
+    }
+    while let Some(t) = stack.pop() {
+        if t >= seen.len() || seen[t] {
+            continue;
+        }
+        seen[t] = true;
+        stack.extend(g.terms[t].child.iter().flatten());
+    }
+    seen
+}
+
+/// The verifier's receives of what the declarations are: one per tuple of
+/// [`LeanCircuit::stmt_facts`].
+pub fn facts_product(ch: &SharedChallenges, facts: &[Tuple]) -> F128 {
+    let mut p = F128::ONE;
+    for t in facts {
+        let mut acc = ch.beta;
+        for (x, &g) in t.iter().zip(&ch.gamma) {
+            acc += g * F128::new(x.0, x.1);
+        }
+        p *= acc;
+    }
+    p
 }
 
 /// The verifier's side of the statement on the bus: one receive per chunk
@@ -7184,5 +7271,252 @@ impl Cone {
             d.iter().filter(|d| !d.checked && d.kind >= 5).count(),
             d.iter().filter(|d| !d.checked && d.kind < 5).count(),
         )
+    }
+}
+
+/// What [`check_facts`] found: how many declarations, terms (with levels
+/// and lists) and recursor rules of the statement it compared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FactsChecked {
+    pub decls: usize,
+    pub terms: usize,
+    pub rules: usize,
+}
+
+/// Checks that a cone's facts ([`LeanCircuit::stmt_facts`]) say what the
+/// declarations of `text` say. `text` is the declarations as rows (a
+/// derivation's `D`, `I`, `R` lines and the terms they reach, no
+/// judgements). Every declaration row of the facts must be one of `text`'s,
+/// by key, with its unfolding, level count, type, value (when it unfolds and
+/// is not a theorem), what the reduction rules read of it and its
+/// recursor's rules as `text` has them; terms are compared by structure,
+/// whatever ids the cone gave them. So a cone that checks a declaration of
+/// some name checks the declaration of that name `text` has.
+pub fn check_facts(facts: &[Tuple], text: &Rows) -> Result<FactsChecked, String> {
+    type Id = (u64, u64);
+    let f = |x: (u64, u64)| F128::new(x.0, x.1);
+    let tag = |t: &Tuple| t[0];
+    let mut by: HashMap<(u64, Id), &Tuple> = HashMap::new();
+    let mut rules: HashMap<Id, Vec<&Tuple>> = HashMap::new();
+    for t in facts {
+        let tg = tag(t);
+        if tg.1 != 0 {
+            return Err("a fact with a bad tag".into());
+        }
+        match tg.0 {
+            TAG_RULE => rules.entry(t[1]).or_default().push(t),
+            TAG_TERM | TAG_LVL | TAG_LIST | TAG_DECL | TAG_KEY | TAG_INFO => {
+                if let Some(old) = by.insert((tg.0, t[1]), t) {
+                    if old != t {
+                        return Err(format!("two facts of tag {} for one row", tg.0));
+                    }
+                }
+            }
+            x => return Err(format!("a fact of tag {x}")),
+        }
+    }
+    let get = |tg: u64, id: Id, what: &str| -> Result<&Tuple, String> {
+        by.get(&(tg, id)).copied().ok_or_else(|| format!("no fact for the {what} {id:?}"))
+    };
+    let want_key = |id: Id, k: (u64, u64)| -> Result<(), String> {
+        let t = get(TAG_KEY, id, "declaration")?;
+        if f(t[2]) != int(k.0) || f(t[3]) != int(k.1) {
+            return Err("a constant names another declaration than the text's".into());
+        }
+        Ok(())
+    };
+    let by_key: HashMap<(u64, u64), usize> =
+        text.decls.iter().enumerate().map(|(i, d)| (d.key, i)).collect();
+    let mut done: HashSet<(Id, usize)> = HashSet::new();
+    let mut stack: Vec<(Id, usize)> = Vec::new();
+    let mut out = FactsChecked::default();
+    let ne = |a: (u64, u64), b: F128, what: &str| -> Result<(), String> {
+        if f(a) != b {
+            Err(format!("the {what} is not the text's"))
+        } else {
+            Ok(())
+        }
+    };
+    // Every declaration the cone has.
+    let mut decl_ids: Vec<Id> = by.keys().filter(|(tg, _)| *tg == TAG_KEY).map(|k| k.1).collect();
+    decl_ids.sort_unstable();
+    for id in decl_ids {
+        let k = get(TAG_KEY, id, "declaration")?;
+        let key = (k[2].0, k[3].0);
+        if k[2].1 != 0 || k[3].1 != 0 {
+            return Err("a key word out of range".into());
+        }
+        let &e = by_key
+            .get(&key)
+            .ok_or_else(|| format!("the cone has a declaration (key {key:x?}) the text does not"))?;
+        let d = &text.decls[e];
+        let name = format!("declaration {key:x?}");
+        let row = get(TAG_DECL, id, "declaration")?;
+        ne(row[2], int(d.unfold), &format!("unfolding of the {name}"))?;
+        ne(row[3], gp(d.levels as i64), &format!("level count of the {name}"))?;
+        stack.push((row[5], d.ty.ok_or("a declaration of the text without a type")?));
+        // A value the cone never unfolds is not on its row (0: no row has
+        // id 0); a theorem's is a proof, which is not part of what it says.
+        if d.unfold == 1 && d.kind != 3 && row[4] != (0, 0) {
+            let v = d.value.ok_or_else(|| format!("the {name} unfolds and the text has no value"))?;
+            stack.push((row[4], v));
+        } else if d.unfold == 0 && row[4] != (0, 0) {
+            return Err(format!("the {name} has a value and does not unfold"));
+        }
+        // What the reduction rules read of it.
+        let info = get(TAG_INFO, id, "declaration")?;
+        let i = &d.info;
+        ne(info[2], int(i.what), &format!("kind of information of the {name}"))?;
+        ne(info[4], gp(i.a as i64), &format!("information of the {name}"))?;
+        ne(info[5], gp(i.b as i64), &format!("information of the {name}"))?;
+        match i.what {
+            2 => want_key(info[3], i.key)?,
+            1 if i.key != (0, 0) => want_key(info[3], i.key)?,
+            _ => ne(info[3], F128::ZERO, &format!("information of the {name}"))?,
+        }
+        // Its recursor rules: those of the text, each once.
+        let mut mine: Vec<&RuleRec> = text.rules.iter().filter(|r| r.rec == e).collect();
+        let theirs = rules.remove(&id).unwrap_or_default();
+        if mine.len() != theirs.len() {
+            return Err(format!("the {name} has {} rules, the text {}", theirs.len(), mine.len()));
+        }
+        for t in theirs {
+            let ctor = get(TAG_KEY, t[2], "constructor")?;
+            let ck = (ctor[2].0, ctor[3].0);
+            let at = mine
+                .iter()
+                .position(|r| r.ctor == ck && int(r.fields) == f(t[3]) || r.ctor == ck && gp(r.fields as i64) == f(t[3]))
+                .ok_or_else(|| format!("a rule of the {name} the text does not have"))?;
+            let r = mine.remove(at);
+            stack.push((t[4], r.rhs));
+            out.rules += 1;
+        }
+        out.decls += 1;
+    }
+    if !rules.is_empty() {
+        return Err("a rule of a recursor the facts do not declare".into());
+    }
+    // Terms, levels and lists, by structure.
+    while let Some((id, i)) = stack.pop() {
+        if !done.insert((id, i)) {
+            continue;
+        }
+        out.terms += 1;
+        let e = &text.terms[i];
+        let ch = |c: usize| e.child[c].ok_or("a term without its part");
+        match e.kind {
+            K_LLEAF | K_LSUCC | K_LMAX | K_LIMAX => {
+                let t = get(TAG_LVL, id, "level")?;
+                ne(t[2], int(e.kind), "kind of a level")?;
+                if e.kind == K_LLEAF {
+                    ne(t[3], e.x[0].f, "level")?;
+                } else {
+                    stack.push((t[3], ch(0)?));
+                    if e.kind != K_LSUCC {
+                        stack.push((t[4], ch(1)?));
+                    }
+                }
+            }
+            K_NIL => {
+                let t = get(TAG_LIST, id, "level list")?;
+                if t[2] != (0, 0) || t[3] != (0, 0) || f(t[4]) != F128::ONE {
+                    return Err("a level list is not the text's".into());
+                }
+            }
+            K_CONS => {
+                let t = get(TAG_LIST, id, "level list")?;
+                if t[2] == (0, 0) {
+                    return Err("a level list is not the text's".into());
+                }
+                stack.push((t[2], ch(0)?));
+                stack.push((t[3], ch(1)?));
+            }
+            K_CTX0 | K_CTX | K_FVAR => return Err("a declaration's term has a free variable".into()),
+            _ => {
+                let t = get(TAG_TERM, id, "term")?;
+                ne(t[2], int(e.kind), "kind of a term")?;
+                match e.kind {
+                    K_BVAR => ne(t[3], e.x[0].f, "bound variable")?,
+                    K_LEAF => {
+                        ne(t[3], e.x[0].f, "kind of a leaf")?;
+                        let sub = e.x[0].f;
+                        if sub == int(SUB_SORT) {
+                            stack.push((t[4], ch(1)?));
+                        } else if sub == int(SUB_CONST) {
+                            want_key(t[4], text.decls[e.x[1].f.lo as usize].key)?;
+                            stack.push((t[5], ch(2)?));
+                        } else if sub == int(SUB_LIT) || sub == int(SUB_STR) {
+                            ne(t[4], e.x[1].f, "literal")?;
+                            ne(t[5], e.x[2].f, "literal")?;
+                        } else {
+                            return Err("a leaf of another kind".into());
+                        }
+                    }
+                    K_APP | K_LAM | K_PI => {
+                        stack.push((t[3], ch(0)?));
+                        stack.push((t[4], ch(1)?));
+                    }
+                    K_LET => {
+                        stack.push((t[3], ch(0)?));
+                        stack.push((t[4], ch(1)?));
+                        stack.push((t[5], ch(2)?));
+                    }
+                    K_PROJ => {
+                        want_key(t[3], text.decls[e.x[0].f.lo as usize].key)?;
+                        ne(t[4], e.x[1].f, "field of a projection")?;
+                        stack.push((t[5], ch(2)?));
+                    }
+                    k => return Err(format!("a term of kind {k}")),
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod facts_tests {
+    use super::*;
+
+    const AND_RIGHT: &str = include_str!("../tests-data/And.right.rows");
+    const PI_HAS_LE: &str = include_str!("../tests-data/Pi.hasLe.rows");
+
+    fn cone() -> Rows {
+        let mut c = Cone::new();
+        let mut batch = Rows::default();
+        for t in [AND_RIGHT, PI_HAS_LE] {
+            c.add(Rows::parse(t).unwrap(), &mut batch).unwrap();
+        }
+        c.finish()
+    }
+
+    #[test]
+    fn the_facts_say_what_the_declarations_are() {
+        let g = cone();
+        let (c, _) =
+            LeanCircuit::build_side(&g, &Rows::default(), Side::Shared, SHARED_BASE, &HashMap::new())
+                .unwrap();
+        assert!(!c.stmt_facts.is_empty());
+        let ok = check_facts(&c.stmt_facts, &g).unwrap();
+        assert_eq!(ok.decls, g.decls.len());
+        assert!(ok.terms > 0);
+        // A text whose declaration has another type is refused.
+        let mut bad = cone();
+        let d = (0..bad.decls.len()).find(|&i| bad.decls[i].ty.is_some()).unwrap();
+        let other = (0..bad.decls.len())
+            .filter_map(|i| bad.decls[i].ty)
+            .find(|&t| Some(t) != bad.decls[d].ty)
+            .unwrap();
+        bad.decls[d].ty = Some(other);
+        assert!(check_facts(&c.stmt_facts, &bad).is_err());
+        // So is a text without one of the cone's declarations.
+        let mut bad = cone();
+        bad.decls[d].key.0 ^= 1;
+        assert!(check_facts(&c.stmt_facts, &bad).is_err());
+        // And facts with a term changed.
+        let mut facts = c.stmt_facts.clone();
+        let k = facts.iter().position(|t| t[0] == (TAG_TERM, 0) && t[2] == (K_APP, 0)).unwrap();
+        facts[k].swap(3, 4);
+        assert!(check_facts(&facts, &g).is_err());
     }
 }

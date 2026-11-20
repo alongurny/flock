@@ -1,4 +1,4 @@
-# The Lean cone bundle, format 1
+# The Lean cone bundle, format 3
 
 A **bundle** is one file that proves a Lean cone: the statement it proves, the
 fingerprints of the verification keys its proofs are checked against, and one
@@ -12,7 +12,7 @@ nothing else. Code: `crates/flock-prover/src/tower/lean_verify.rs`
 
 ## Encoding
 
-The file is the 16 bytes `cas-lean-bundle1` followed by the
+The file is the 16 bytes `cas-lean-bundle3` followed by the
 [bincode 1.3](https://docs.rs/bincode/1.3) encoding (its default
 configuration) of a `LeanBundle`:
 
@@ -42,6 +42,7 @@ LeanStatementWire {                 // what the verifier sends on the shared bus
     keys:        Vec<[F128; 2]>,    // the keys of the declarations checked
     prims:       Vec<(u64, [F128; 2])>,              // constant number, its key
     arith:       Vec<(u64, [F128; 2], u64, u64, [F128; 2])>, // op, op key, x, y, out
+    facts:       Vec<[(u64, u64); 11]>, // what the declarations are (below)
 }
 
 LeanVk {
@@ -105,6 +106,23 @@ base and spine circuits (wiring included). Segments must cover the leaves in
 order. Over all segments: the challenge root is the hash of the segments'
 roots, every segment drew its challenges from it, and the shared bus
 balances against the statement.
+
+## What the declarations are
+
+A checked declaration is named by its key, which is a hash of its name. So
+that the proof says what the declarations *are*, the verifier also receives
+`facts`: the tuples the shared side's rows send for every declaration (its
+row: unfolding, level count, value and type ids; its key; what the
+reduction rules read of it), every recursor rule, and every term, level and
+level list the declarations' types, the values of those other than theorems
+and the rules' right-hand sides reach. Those rows send each once more, so
+the bus balances only if the cone's rows are these. `check_facts`
+(`lean_rows.rs`) compares them, by structure and whatever the ids, with the
+declarations' text: cas-lean turns the declarations of its bundle into rows
+and refuses a cone that has a declaration its text does not, or one that
+differs in anything above. For the shuffle paper's cone, about 155 000
+facts (148 000 terms of 4.2 million). Format 1 (`cas-lean-bundle1`) had no
+facts; it is still read, and says so.
 
 ## What it does not check yet
 

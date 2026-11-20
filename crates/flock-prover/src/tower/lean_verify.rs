@@ -128,6 +128,25 @@ pub struct LeanStatementWire {
     pub prims: Vec<(u64, [F128; 2])>,
     /// `(op, op key, x, y, out)` per step.
     pub arith: Vec<(u64, [F128; 2], u64, u64, [F128; 2])>,
+    /// What the declarations are: the shared rows' tuples the verifier
+    /// receives ([`crate::lean_rows::LeanCircuit::stmt_facts`]).
+    pub facts: Vec<crate::lean_rows::Tuple>,
+}
+
+/// Format 1's statement, before it said what the declarations are.
+#[derive(Deserialize)]
+struct LeanStatementWireV1 {
+    chunk_words: Vec<u64>,
+    keys: Vec<[F128; 2]>,
+    prims: Vec<(u64, [F128; 2])>,
+    arith: Vec<(u64, [F128; 2], u64, u64, [F128; 2])>,
+}
+
+#[derive(Deserialize)]
+struct LeanBundleV1 {
+    statement: LeanStatementWireV1,
+    vks: Vec<[u8; 32]>,
+    segments: Vec<LeanSegmentProof>,
 }
 
 impl From<&LeanStatement> for LeanStatementWire {
@@ -137,6 +156,7 @@ impl From<&LeanStatement> for LeanStatementWire {
             keys: s.keys.clone(),
             prims: s.prims.clone(),
             arith: s.arith.iter().map(|a| (a.op, a.key, a.x, a.y, a.out)).collect(),
+            facts: s.facts.clone(),
         }
     }
 }
@@ -152,6 +172,7 @@ impl LeanStatementWire {
                 .iter()
                 .map(|&(op, key, x, y, out)| crate::lean_rows::Arith { op, key, x, y, out })
                 .collect(),
+            facts: self.facts.clone(),
         }
     }
 
@@ -173,7 +194,8 @@ pub struct LeanBundle {
     pub segments: Vec<LeanSegmentProof>,
 }
 
-const BUNDLE_MAGIC: &[u8; 16] = b"cas-lean-bundle1";
+const BUNDLE_MAGIC: &[u8; 16] = b"cas-lean-bundle3";
+const BUNDLE_MAGIC_V1: &[u8; 16] = b"cas-lean-bundle1";
 
 impl LeanBundle {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -183,6 +205,22 @@ impl LeanBundle {
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Self, String> {
+        if let Some(body) = b.strip_prefix(BUNDLE_MAGIC_V1.as_slice()) {
+            let v: LeanBundleV1 =
+                bincode::deserialize(body).map_err(|e| format!("the bundle does not decode: {e}"))?;
+            let s = v.statement;
+            return Ok(LeanBundle {
+                statement: LeanStatementWire {
+                    chunk_words: s.chunk_words,
+                    keys: s.keys,
+                    prims: s.prims,
+                    arith: s.arith,
+                    facts: Vec::new(),
+                },
+                vks: v.vks,
+                segments: v.segments,
+            });
+        }
         let body = b
             .strip_prefix(BUNDLE_MAGIC.as_slice())
             .ok_or("not a Lean cone bundle (bad header)")?;
