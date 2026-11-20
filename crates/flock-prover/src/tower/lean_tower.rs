@@ -165,6 +165,10 @@ pub struct LeanSegmentOut {
     /// structure tables (with sigma) of the circuits they name.
     pub key_claims: Vec<([u8; 32], flock_core::matrix_fold::MatrixClaim)>,
     pub key_tables: Vec<flock_core::circuit::StructureTable>,
+    /// The segment's root proof and the VK it is checked against (a
+    /// spine root: at least three leaf pairs), checked here once from
+    /// bytes as a verifier would ([`super::lean_verify`]).
+    pub saved: Option<(super::lean_verify::LeanVk, super::lean_verify::LeanSegmentProof)>,
 }
 
 impl LeanSegmentOut {
@@ -287,6 +291,8 @@ pub fn prove_lean_segment(
         leaf0.commitment.params.m - LOG_PACKING,
     );
     drop(u);
+    let leaf_full_height = leaf0.full_height;
+    let leaf_m = leaf0.commitment.params.m;
     drop(leaf0);
     drop(piece0);
     progress("leaf 0's shape kept, its proof dropped");
@@ -548,6 +554,72 @@ pub fn prove_lean_segment(
             tt.elapsed().as_secs_f64() * 1e3
         ));
     }
+    // ---- THE SAVED PROOF: the root and its VK, checked from bytes ----
+    let saved = base.as_ref().map(|b| {
+        use super::lean_verify::{LeanSegmentProof, LeanVk, OuterVk, check_segment};
+        use flock_core::circuit::recipe::CircuitRecipe;
+        let tv = Instant::now();
+        let outer = |lo: &super::query::LeafOuter| OuterVk {
+            circuit: CircuitRecipe::of_with(
+                &lo.shape.circuit,
+                &super::lean_verify::outer_namer(lo.shape.registry.nu()),
+            ),
+            pcs: lo.pcs.clone(),
+            m: lo.commitment.params.m,
+        };
+        let vk = LeanVk {
+            envelope: (env.nu, env.lanes, env.m),
+            leaf: CircuitRecipe::of(leaf_circuit),
+            leaf_full_height,
+            leaf_m,
+            fl: outer(&fl0.lo),
+            base: outer(&b.lo),
+            steady: outer(&root.lo),
+            layout: super::verify::AccLayout::from_parts(
+                &super::envelope::envelope_shape_with_lane(block_words),
+                claims_base,
+                &root,
+            ),
+            app_base: a,
+        };
+        let proof = LeanSegmentProof {
+            vk: 0,
+            first_leaf: first as u64,
+            leaves: n as u64,
+            public: root.lo.public.clone(),
+            proof: root.lo.proof.clone(),
+            commitment: root.lo.commitment.clone(),
+        };
+        for (what, r, c) in [
+            ("leaf", &vk.leaf, leaf_circuit),
+            ("first-level", &vk.fl.circuit, &fl0.lo.shape.circuit),
+            ("base", &vk.base.circuit, &b.lo.shape.circuit),
+            ("steady", &vk.steady.circuit, &root.lo.shape.circuit),
+        ] {
+            let d = r
+                .rebuild_with(&super::lean_verify::resolve)
+                .unwrap_or_else(|e| panic!("the {what} recipe does not rebuild: {e:?}"))
+                .digest();
+            assert_eq!(d, c.digest(), "the {what} recipe rebuilds another circuit");
+        }
+        let vk_bytes = bincode::serialize(&vk).expect("a VK serializes");
+        let proof_bytes = bincode::serialize(&proof).expect("a proof serializes");
+        let vk2: LeanVk = bincode::deserialize(&vk_bytes).expect("a VK decodes");
+        let proof2: LeanSegmentProof = bincode::deserialize(&proof_bytes).expect("a proof decodes");
+        let c = check_segment(&vk2, &proof2).expect("the saved segment verifies from bytes");
+        assert!(
+            c.root == root_digest && c.seed == seed && c.send == send && c.recv == recv,
+            "the saved segment claims what the prover claimed"
+        );
+        progress(&format!(
+            "saved: VK blake3:{} ({} KiB), proof {} KiB, checked from bytes in {:.0} ms",
+            hex(&vk2.fingerprint()),
+            vk_bytes.len() / 1024,
+            proof_bytes.len() / 1024,
+            tv.elapsed().as_secs_f64() * 1e3
+        ));
+        (vk2, proof2)
+    });
     set_envelope_override(None);
     flock_core::scratch::set_byte_budget(None);
     LeanSegmentOut {
@@ -567,7 +639,12 @@ pub fn prove_lean_segment(
         recv,
         key_claims,
         key_tables,
+        saved,
     }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Probe: eight leaves, four first-level nodes, a base and two spine

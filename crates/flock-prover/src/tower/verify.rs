@@ -77,6 +77,7 @@ pub enum TowerVerifyError {
 /// the VK's reference tower. `read_acc_entry` replays exactly the wire
 /// format the builders pin (`check_fold_publics`), so this is the whole
 /// layout a consumer needs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct AccLayout {
     main_base: usize,
     lane_base: usize,
@@ -95,6 +96,10 @@ pub(super) struct AccLayout {
     /// The lane's linear-identity entries (shared-binding lanes), after the
     /// pairs.
     lane_linear: Vec<(usize, usize)>,
+    /// The lane's element pairs (a Lean lane folds element types), after
+    /// the linear entries.
+    #[serde(default)]
+    lane_element: Vec<(usize, usize)>,
     lane_sigma_w: (usize, usize),
     lane_jagged_w: (usize, usize),
 }
@@ -121,6 +126,11 @@ impl AccLayout {
             lane_unkeyed.push(w(b));
         }
         let lane_linear: Vec<(usize, usize)> = lane.per_linear.iter().map(w).collect();
+        let mut lane_element = Vec::new();
+        for (a, b) in &lane.per_element {
+            lane_element.push(w(a));
+            lane_element.push(w(b));
+        }
         AccLayout {
             main_base: env_acc_main_base(env),
             lane_base,
@@ -132,6 +142,7 @@ impl AccLayout {
             pass_w: [w(&root.block.passenger[0].1), w(&root.block.passenger[1].1)],
             lane_unkeyed,
             lane_linear,
+            lane_element,
             lane_sigma_w: w(&lane.sigma[0].1),
             lane_jagged_w: w(&lane.jagged[0].1),
         }
@@ -219,11 +230,33 @@ pub(super) fn reassemble_parts(
     base_lo: &LeafOuter,
     leaf: &CircuitShape,
 ) -> Result<(Accumulator, Vec<([F128; 2], MatrixClaim)>, Accumulator), TowerVerifyError> {
-    let known: [[u8; 32]; 3] = [
-        fl_lo.shape.circuit.digest(),
-        steady_lo.shape.circuit.digest(),
-        base_lo.shape.circuit.digest(),
-    ];
+    reassemble_named(
+        public,
+        l,
+        [
+            fl_lo.shape.circuit.digest(),
+            steady_lo.shape.circuit.digest(),
+            base_lo.shape.circuit.digest(),
+        ],
+        &steady_lo.shape.registry,
+        leaf.circuit.digest(),
+        leaf.registry.digest(),
+    )
+}
+
+/// [`reassemble_parts`] over the material owners' identities alone: the
+/// digests of FL 0, the steady root and the base (`known`, the circuits a
+/// live keyed slot may name), the steady root's registry, and the leaf
+/// circuit's and registry's digests.
+#[allow(clippy::type_complexity)]
+pub(super) fn reassemble_named(
+    public: &[F128],
+    l: &AccLayout,
+    known: [[u8; 32]; 3],
+    steady_registry: &Registry,
+    chain_d: [u8; 32],
+    leaf_registry_digest: [u8; 32],
+) -> Result<(Accumulator, Vec<([F128; 2], MatrixClaim)>, Accumulator), TowerVerifyError> {
     let name = |key: [F128; 2]| -> Result<[u8; 32], TowerVerifyError> {
         known
             .iter()
@@ -260,9 +293,16 @@ pub(super) fn reassemble_parts(
             jagged.push((name(k)?, c));
         }
     }
-    assert_outer_drops_nothing(&steady_lo.shape.registry);
+    if !steady_registry
+        .types()
+        .iter()
+        .all(|ty| ty.zeroed_word_cols.is_empty())
+    {
+        // The main accumulator has no linear group to discharge.
+        return Err(TowerVerifyError::Geometry);
+    }
     let main = Accumulator {
-        registry_digest: steady_lo.shape.registry.digest(),
+        registry_digest: steady_registry.digest(),
         per_type,
         per_element,
         per_linear: Vec::new(),
@@ -280,7 +320,6 @@ pub(super) fn reassemble_parts(
         .collect();
 
     // ---- ACC_CHAIN: the lane's un-keyed layout, key implied ----
-    let chain_d = leaf.circuit.digest();
     let mut p = l.lane_base;
     let mut lflat: Vec<MatrixClaim> = Vec::with_capacity(l.lane_unkeyed.len());
     for &(kc, kr) in &l.lane_unkeyed {
@@ -298,12 +337,23 @@ pub(super) fn reassemble_parts(
         .iter()
         .map(|&(kc, kr)| read_acc_entry(public, &mut p, false, kc, kr).1)
         .collect();
+    let lel: Vec<MatrixClaim> = l
+        .lane_element
+        .iter()
+        .map(|&(kc, kr)| read_acc_entry(public, &mut p, false, kc, kr).1)
+        .collect();
+    let lane_per_element: Vec<_> = lel
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[a, b]| (a.clone(), b.clone()))
+        .collect();
     let (_, lsig) = read_acc_entry(public, &mut p, false, l.lane_sigma_w.0, l.lane_sigma_w.1);
     let (_, ljag) = read_acc_entry(public, &mut p, false, l.lane_jagged_w.0, l.lane_jagged_w.1);
     let lane = Accumulator {
-        registry_digest: leaf.registry.digest(),
+        registry_digest: leaf_registry_digest,
         per_type: lane_per_type,
-        per_element: Vec::new(),
+        per_element: lane_per_element,
         per_linear: lane_linear,
         sigma: vec![(chain_d, lsig)],
         jagged: vec![(chain_d, ljag)],

@@ -127,6 +127,7 @@ use crate::{
 pub mod boolean;
 pub mod builder;
 pub mod bus;
+pub mod recipe;
 
 /// Domain label of the circuit digest — versioned, since the digest covers the
 /// whole circuit encoding (cell-slot enumeration, counts, wiring, public
@@ -3726,5 +3727,36 @@ mod tests {
         );
         let mut ch = FsChallenger::new(b"circuit-unit");
         verify_wiring(&free, &public, &proof, &mut ch).expect("the plain verify");
+    }
+
+    #[test]
+    fn a_recipe_rebuilds_the_same_circuit() {
+        use super::recipe::CircuitRecipe;
+        let nu = 3;
+        let reg = mixed_registry(nu);
+        let wires = vec![
+            vec![Cell::new(2, 0), Cell::new(0, 1), Cell::new(8, 2)],
+            vec![Cell::new(5, 1), Cell::new(7, 2)],
+            vec![Cell::new(8, 0), Cell::new(6, 3)],
+        ];
+        let plain = Circuit::new(&reg, vec![5, 4, 6], 9, wires).unwrap();
+        let packed = plain.clone().with_unwired_pruned().with_live_slots_packed();
+        let bussed = bus_circuit(&reg, F128::new(7, 0)).with_unwired_pruned();
+        for c in [plain, packed, bussed] {
+            let r = CircuitRecipe::of(&c);
+            let back: CircuitRecipe = bincode::deserialize(&bincode::serialize(&r).unwrap()).unwrap();
+            let d = back.rebuild().expect("a recipe rebuilds");
+            assert_eq!(d.digest(), c.digest());
+            assert_eq!(d.sigma(), c.sigma());
+            // Trailing bytes in the wiring are refused.
+            let mut bad = back.clone();
+            bad.wires.push(0);
+            assert!(bad.rebuild().is_err());
+            // A claimed step that does nothing is refused.
+            let mut bad = back.clone();
+            bad.packed = !bad.packed;
+            let rebuilt = bad.rebuild();
+            assert!(rebuilt.is_err() || rebuilt.unwrap().digest() != c.digest());
+        }
     }
 }

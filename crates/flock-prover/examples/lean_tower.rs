@@ -28,6 +28,7 @@ use flock_prover::{
         LeanEnvelope, LeanStatement, SegmentClaim, TowerConfig, leaf_word, lean_segment_root,
         lean_segments_root, prove_lean_segment, prove_lean_tower_streaming, prove_root_key_batch,
         segments_balanced,
+        lean_verify::{LeanBundle, LeanSegmentProof, LeanVk, verify_lean_bundle},
     },
 };
 
@@ -443,8 +444,90 @@ fn rss() -> String {
     )
 }
 
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// `lean_tower verify BUNDLE [KEY ...]`: check a cone's bundle against
+/// its verification keys (by default the `vk-<fingerprint>.vk` files beside
+/// it), reading nothing else.
+fn verify_main(bundle: &str, keys: &[String]) {
+    let t = Instant::now();
+    let bytes = fs::read(bundle).unwrap_or_else(|e| panic!("{bundle}: {e}"));
+    let b = LeanBundle::from_bytes(&bytes).unwrap_or_else(|e| {
+        println!("REFUSED: {e}");
+        std::process::exit(1)
+    });
+    let dir = Path::new(bundle).parent().unwrap_or(Path::new("."));
+    let files: Vec<std::path::PathBuf> = if keys.is_empty() {
+        b.vks
+            .iter()
+            .map(|f| dir.join(format!("vk-{}.vk", hex(f))))
+            .collect()
+    } else {
+        keys.iter().map(std::path::PathBuf::from).collect()
+    };
+    let vks: Vec<LeanVk> = files
+        .iter()
+        .map(|p| {
+            let k = fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+            LeanVk::from_bytes(&k).unwrap_or_else(|e| {
+                println!("REFUSED: {}: {e}", p.display());
+                std::process::exit(1)
+            })
+        })
+        .collect();
+    println!("read the bundle and {} keys in {:.0} ms", vks.len(), t.elapsed().as_secs_f64() * 1e3);
+    match verify_lean_bundle(&b, &vks) {
+        Ok(v) => {
+            println!("VERIFIED in {:.0} ms", v.verify_ms);
+            println!("bundle blake3:{}", hex(blake3::hash(&bytes).as_bytes()));
+            println!(
+                "statement blake3:{}: {} checked declaration keys, {} chunk words",
+                hex(&v.statement),
+                b.statement.keys.len(),
+                b.statement.chunk_words.len()
+            );
+            println!(
+                "{} segments, {} leaves, challenge root blake3:{}",
+                v.segments,
+                v.leaves,
+                hex(&v.challenge_root)
+            );
+            for (i, (f, _)) in v.vks.iter().enumerate() {
+                println!("verification key {i}: blake3:{}", hex(f));
+            }
+        }
+        Err(e) => {
+            println!("REFUSED: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
+    if a.first().is_some_and(|x| x == "vk-sizes") {
+        let vk = LeanVk::from_bytes(&fs::read(&a[1]).unwrap()).unwrap();
+        for (what, r) in [("leaf", &vk.leaf), ("fl", &vk.fl.circuit), ("base", &vk.base.circuit), ("steady", &vk.steady.circuit)] {
+            let reg = bincode::serialize(&r.registry).unwrap().len();
+            let types: Vec<usize> = r.registry.types.iter().map(|t| bincode::serialize(t).unwrap().len()).collect();
+            println!(
+                "{what}: registry {} KiB ({} types, largest {:?} KiB), wires {} KiB, fixed publics {}, bus {} KiB",
+                reg / 1024,
+                types.len(),
+                { let mut t = types.clone(); t.sort(); t.iter().rev().take(5).map(|x| x / 1024).collect::<Vec<_>>() },
+                r.wires.len() / 1024,
+                r.fixed_public.len(),
+                bincode::serialize(&r.bus).unwrap().len() / 1024
+            );
+        }
+        return;
+    }
+    if a.first().is_some_and(|x| x == "verify") {
+        verify_main(&a[1], &a[2..]);
+        return;
+    }
     let num = |i: usize| a[i].parse::<usize>().unwrap();
     let (n, out) = (num(1), a[2].clone());
     let t0 = Instant::now();
@@ -708,9 +791,13 @@ fn main() {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(index.len() / 2)
                     & !1;
-                index = index[at..at + 4].to_vec();
-                plan = plan[at..at + 4].to_vec();
-                profiles = profiles[at..at + 4].to_vec();
+                let len = std::env::var("LEAN_PROBE_N")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4usize);
+                index = index[at..at + len].to_vec();
+                plan = plan[at..at + len].to_vec();
+                profiles = profiles[at..at + len].to_vec();
             }
             let full: usize = plan.iter().flatten().flatten().count();
             println!(
@@ -971,7 +1058,12 @@ fn main() {
                     .iter()
                     .map(|(a, b)| lean_segment_root(&words[*a..*b]))
                     .collect();
-                let all = lean_segments_root(&roots);
+                // One segment draws its challenges from its own root.
+                let all = if s_n == 1 {
+                    roots[0]
+                } else {
+                    lean_segments_root(&roots)
+                };
                 let only = std::env::var("LEAN_SEGMENT")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok());
@@ -1026,6 +1118,20 @@ fn main() {
                                 fs::write(&p, bincode::serialize(t).unwrap()).unwrap();
                             }
                         }
+                    }
+                    if let Some((vk, proof)) = &o.saved {
+                        let f = vk.fingerprint();
+                        let kp = format!("{out}/vk-{}.vk", hex(&f));
+                        if !Path::new(&kp).exists() {
+                            let kb = vk.to_bytes();
+                            println!("segment {s}: verification key {kp}: {} KiB", kb.len() / 1024);
+                            fs::write(&kp, kb).unwrap();
+                        }
+                        fs::write(
+                            format!("{}.proof", file(s)),
+                            bincode::serialize(&(f, proof)).unwrap(),
+                        )
+                        .unwrap();
                     }
                     fs::write(file(s), bincode::serialize(&k).unwrap()).unwrap();
                     if !o.key_claims.is_empty() && std::env::var_os("LEAN_KEY_PROBE").is_some() {
@@ -1087,6 +1193,42 @@ fn main() {
                         b.proof_bytes / 1024,
                         b.verify_ms
                     );
+                }
+                // THE BUNDLE: every segment's saved proof, their VKs once each.
+                let saved: Option<Vec<([u8; 32], LeanSegmentProof)>> = (0..s_n)
+                    .map(|s| {
+                        fs::read(format!("{}.proof", file(s)))
+                            .ok()
+                            .and_then(|b| bincode::deserialize(&b).ok())
+                    })
+                    .collect();
+                match saved {
+                    None => println!("not every segment saved its proof: no bundle"),
+                    Some(saved) => {
+                        let mut bundle = LeanBundle {
+                            statement: (&statement).into(),
+                            vks: Vec::new(),
+                            segments: Vec::new(),
+                        };
+                        for (f, mut proof) in saved {
+                            let i = bundle.vks.iter().position(|p| *p == f).unwrap_or_else(|| {
+                                bundle.vks.push(f);
+                                bundle.vks.len() - 1
+                            });
+                            proof.vk = i as u32;
+                            bundle.segments.push(proof);
+                        }
+                        let path = format!("{out}/cone-{slots}-{}.bundle", index.len());
+                        let bytes = bundle.to_bytes();
+                        fs::write(&path, &bytes).unwrap();
+                        println!(
+                            "bundle {path}: blake3:{}, {} bytes ({} verification keys, {} segments)",
+                            hex(blake3::hash(&bytes).as_bytes()),
+                            bytes.len(),
+                            bundle.vks.len(),
+                            bundle.segments.len()
+                        );
+                    }
                 }
                 let balanced = segments_balanced(&all, &claims, &statement);
                 println!("the segments joined: {balanced:?}");

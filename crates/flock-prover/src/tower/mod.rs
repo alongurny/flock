@@ -162,6 +162,7 @@ mod gkr;
 mod lean_leaf;
 #[cfg(not(target_arch = "aarch64"))]
 mod lean_tower;
+pub mod lean_verify;
 mod node;
 mod online;
 mod query;
