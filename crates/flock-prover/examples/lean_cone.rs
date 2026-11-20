@@ -131,7 +131,7 @@ fn names(n: usize) -> Vec<String> {
         .collect()
 }
 
-fn main() {
+pub fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let n = |i: usize| a[i].parse::<usize>().unwrap();
     match a[0].as_str() {

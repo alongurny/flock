@@ -505,7 +505,7 @@ fn verify_main(bundle: &str, keys: &[String]) {
     }
 }
 
-fn main() {
+pub fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     if a.first().is_some_and(|x| x == "vk-sizes") {
         let vk = LeanVk::from_bytes(&fs::read(&a[1]).unwrap()).unwrap();
